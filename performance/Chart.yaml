@@ -1,0 +1,11 @@
+#
+# SPDX-FileCopyrightText: 2026 OpenLakestream contributors <https://openlakestream.org>
+# SPDX-License-Identifier: Apache-2.0
+#
+
+apiVersion: v2
+name: performance
+description: A Helm chart for Ursa Storage performance testing
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

@@ -1,0 +1,22 @@
+/*
+ * SPDX-FileCopyrightText: 2026 OpenLakestream contributors <https://openlakestream.org>
+ * SPDX-License-Identifier: Apache-2.0
+ */
+syntax = "proto3";
+
+import "NestedTestProto.proto";
+
+package io.lakestream.ursa.kafka.serde.protobuf.test;
+
+option java_package = "io.lakestream.ursa.kafka.serde.protobuf.test";
+option java_outer_classname = "EnumUnionOuter";
+option java_multiple_files = false;
+
+message EnumUnion {
+    oneof some_val {
+        string one_id = 1;
+        int32 other_id = 2;
+        Status some_status = 3;
+    }
+    Status status = 4;
+}

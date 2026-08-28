@@ -1,0 +1,240 @@
+#
+# SPDX-FileCopyrightText: 2026 OpenLakestream contributors <https://openlakestream.org>
+# SPDX-License-Identifier: Apache-2.0
+#
+
+name: Cherry Pick Release PR
+
+on:
+  pull_request_target:
+    types:
+      - closed
+      - labeled
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  cherry-pick:
+    name: Cherry pick merged PR
+    if: ${{ github.event.pull_request.merged == true }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Resolve release label
+        id: release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const labels = context.payload.pull_request.labels.map((label) => label.name);
+            const releaseLabel = labels.find((label) => /^release\/\d+\.\d+\.\d+\.\d+$/.test(label));
+
+            if (!releaseLabel) {
+              core.info('No release/x.y.z.m label found. Nothing to cherry-pick.');
+              core.setOutput('should_run', 'false');
+              return;
+            }
+
+            const match = releaseLabel.match(/^release\/(\d+)\.(\d+)\.\d+\.\d+$/);
+            const targetBranch = `branch-${match[1]}.${match[2]}`;
+            const pr = context.payload.pull_request;
+            const defaultBranch = context.payload.repository.default_branch;
+            const doneLabel = `cherry-picked/${targetBranch}`;
+
+            if (pr.base.ref !== defaultBranch) {
+              core.info(`PR #${pr.number} was merged into ${pr.base.ref}, not ${defaultBranch}. Nothing to cherry-pick.`);
+              core.setOutput('should_run', 'false');
+              return;
+            }
+
+            if (labels.includes(doneLabel)) {
+              core.info(`PR #${pr.number} is already labeled ${doneLabel}. Nothing to cherry-pick.`);
+              core.setOutput('should_run', 'false');
+              return;
+            }
+
+            const shortSha = pr.merge_commit_sha.substring(0, 12);
+            const headBranch = `cherry-pick/pr-${pr.number}-to-${targetBranch}-${shortSha}`;
+
+            core.setOutput('should_run', 'true');
+            core.setOutput('release_label', releaseLabel);
+            core.setOutput('done_label', doneLabel);
+            core.setOutput('target_branch', targetBranch);
+            core.setOutput('head_branch', headBranch);
+            core.setOutput('merge_commit_sha', pr.merge_commit_sha);
+            core.setOutput('short_sha', shortSha);
+            core.setOutput('base_branch', pr.base.ref);
+
+      - name: Wait for previous cherry-pick runs
+        if: ${{ steps.release.outputs.should_run == 'true' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const workflowId = 'cherry-pick-release-pr.yml';
+            const currentRunId = Number(process.env.GITHUB_RUN_ID);
+            const currentRunNumber = Number(process.env.GITHUB_RUN_NUMBER);
+            const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+            while (true) {
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: workflowId,
+                per_page: 100,
+              });
+
+              const previousRuns = data.workflow_runs
+                .filter((run) =>
+                  run.id !== currentRunId &&
+                  run.run_number < currentRunNumber
+                )
+                .sort((a, b) => b.run_number - a.run_number)
+                .slice(0, 10);
+
+              const runningPreviousRun = previousRuns.find((run) =>
+                ['queued', 'in_progress'].includes(run.status)
+              );
+
+              if (!runningPreviousRun) {
+                core.info('No running cherry-pick workflow found in the previous 10 runs.');
+                break;
+              }
+
+              core.info(`Waiting for run #${runningPreviousRun.run_number}: ${runningPreviousRun.html_url}`);
+              await wait(30000);
+            }
+
+      - name: Checkout target branch
+        if: ${{ steps.release.outputs.should_run == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release.outputs.target_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        if: ${{ steps.release.outputs.should_run == 'true' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Cherry pick merged commit
+        if: ${{ steps.release.outputs.should_run == 'true' }}
+        id: cherry-pick
+        continue-on-error: true
+        run: |
+          git fetch origin "${BASE_BRANCH}"
+          git checkout -B "${TARGET_BRANCH}"
+          if git log --grep="cherry picked from commit ${MERGE_COMMIT_SHA}" --fixed-strings -n 1 --format=%H | grep -q .; then
+            echo "Commit ${MERGE_COMMIT_SHA} has already been cherry-picked to ${TARGET_BRANCH}."
+            exit 0
+          fi
+          parent_count="$(git rev-list --parents -n 1 "${MERGE_COMMIT_SHA}" | wc -w | tr -d ' ')"
+          if [ "${parent_count}" -gt 2 ]; then
+            git cherry-pick -m 1 -x "${MERGE_COMMIT_SHA}"
+          else
+            git cherry-pick -x "${MERGE_COMMIT_SHA}"
+          fi
+        env:
+          TARGET_BRANCH: ${{ steps.release.outputs.target_branch }}
+          MERGE_COMMIT_SHA: ${{ steps.release.outputs.merge_commit_sha }}
+          BASE_BRANCH: ${{ steps.release.outputs.base_branch }}
+
+      - name: Prepare failed cherry-pick branch
+        if: ${{ steps.release.outputs.should_run == 'true' && steps.cherry-pick.outcome == 'failure' }}
+        run: |
+          git status --short > /tmp/cherry-pick-status.txt
+          git cherry-pick --abort || true
+          git checkout -B "${HEAD_BRANCH}" "${TARGET_BRANCH}"
+          git commit --allow-empty -m "Failed cherry-pick of PR #${PR_NUMBER} to ${TARGET_BRANCH}"
+        env:
+          HEAD_BRANCH: ${{ steps.release.outputs.head_branch }}
+          TARGET_BRANCH: ${{ steps.release.outputs.target_branch }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+
+      - name: Push successful cherry-pick
+        if: ${{ steps.release.outputs.should_run == 'true' && steps.cherry-pick.outcome == 'success' }}
+        run: git push origin "HEAD:${TARGET_BRANCH}"
+        env:
+          TARGET_BRANCH: ${{ steps.release.outputs.target_branch }}
+
+      - name: Label original PR
+        if: ${{ steps.release.outputs.should_run == 'true' && steps.cherry-pick.outcome == 'success' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = '${{ steps.release.outputs.done_label }}';
+            try {
+              await github.rest.issues.getLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: label,
+              });
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: label,
+                color: '0e8a16',
+                description: 'Cherry-picked to a release branch',
+              });
+            }
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              labels: [label],
+            });
+
+      - name: Push failed cherry-pick branch
+        if: ${{ steps.release.outputs.should_run == 'true' && steps.cherry-pick.outcome == 'failure' }}
+        run: git push --force-with-lease origin "${HEAD_BRANCH}"
+        env:
+          HEAD_BRANCH: ${{ steps.release.outputs.head_branch }}
+
+      - name: Create failed cherry-pick PR
+        if: ${{ steps.release.outputs.should_run == 'true' && steps.cherry-pick.outcome == 'failure' }}
+        run: |
+          {
+            echo "Cherry-pick of #${PR_NUMBER} to \`${TARGET_BRANCH}\` failed and needs manual resolution."
+            echo
+            echo "Original PR: ${PR_URL}"
+            echo "Failed commit: ${MERGE_COMMIT_SHA}"
+            echo "Release label: \`${RELEASE_LABEL}\`"
+            echo
+            echo "Conflict summary from the failed cherry-pick:"
+            echo
+            echo '```'
+            cat /tmp/cherry-pick-status.txt
+            echo '```'
+          } > /tmp/cherry-pick-pr-body.md
+
+          existing_pr="$(gh pr list --head "${HEAD_BRANCH}" --base "${TARGET_BRANCH}" --state open --json number --jq '.[0].number')"
+          if [ -n "${existing_pr}" ]; then
+            gh pr edit "${existing_pr}" --title "Failed cherry-pick #${PR_NUMBER} to ${TARGET_BRANCH}" --body-file /tmp/cherry-pick-pr-body.md
+          else
+            gh pr create \
+              --draft \
+              --base "${TARGET_BRANCH}" \
+              --head "${HEAD_BRANCH}" \
+              --title "Failed cherry-pick #${PR_NUMBER} to ${TARGET_BRANCH}" \
+              --body-file /tmp/cherry-pick-pr-body.md
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_BRANCH: ${{ steps.release.outputs.head_branch }}
+          TARGET_BRANCH: ${{ steps.release.outputs.target_branch }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          MERGE_COMMIT_SHA: ${{ steps.release.outputs.merge_commit_sha }}
+          RELEASE_LABEL: ${{ steps.release.outputs.release_label }}

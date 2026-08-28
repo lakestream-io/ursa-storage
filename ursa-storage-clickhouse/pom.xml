@@ -1,0 +1,234 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+
+    SPDX-FileCopyrightText: 2026 OpenLakestream contributors <https://openlakestream.org>
+    SPDX-License-Identifier: Apache-2.0
+
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>io.lakestream</groupId>
+    <artifactId>ursa-storage</artifactId>
+    <version>1.0.0</version>
+  </parent>
+
+  <artifactId>ursa-storage-clickhouse</artifactId>
+  <name>Lakestream :: Ursa Storage :: ClickHouse</name>
+
+  <properties>
+    <maven.compiler.source>17</maven.compiler.source>
+    <maven.compiler.target>17</maven.compiler.target>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <!--
+      clickhouse-jdbc is not covered by a focused upstream BOM; pin a stable release
+      directly. The com.clickhouse:clickhouse-jdbc:*:all coordinate still bundles the
+      driver and protocol implementation in a single jar on this line. 0.9.x ships the
+      client-v2 JDBC driver (com.clickhouse.jdbc.Driver) alongside the legacy
+      com.clickhouse.jdbc.ClickHouseDriver; both register for jdbc:clickhouse: URLs and
+      the sink drives them through the standard java.sql API.
+    -->
+    <clickhouse-jdbc.version>0.6.5</clickhouse-jdbc.version>
+    <!--
+      The default surefire run skips @Tag("clickhouse") integration tests so the
+      unit-test suite stays Docker-free. Opt in by overriding the property
+      explicitly via `-DexcludeGroups=` (parent pom propagates this value to the
+      `<excludedGroups>` surefire config) together with `-Dgroups=clickhouse`.
+    -->
+    <excludeGroups>clickhouse</excludeGroups>
+  </properties>
+
+  <dependencies>
+
+    <dependency>
+      <groupId>io.lakestream</groupId>
+      <artifactId>lakestream-api</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>io.lakestream</groupId>
+      <artifactId>ursa-storage-common</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>io.lakestream</groupId>
+      <artifactId>ursa-storage-materialization</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+
+    <!--
+      ursa-storage-core is required transitively by GenericEntry (which wraps
+      io.lakestream.ursa.storage.Entry). Mirror the materialization module's
+      provided scope so we don't drag the storage engine into runtime
+      classpaths of dependents.
+    -->
+    <dependency>
+      <groupId>io.lakestream</groupId>
+      <artifactId>ursa-storage-core</artifactId>
+      <version>${project.version}</version>
+      <scope>provided</scope>
+      <exclusions>
+        <exclusion>
+          <artifactId>jackson-core</artifactId>
+          <groupId>com.fasterxml.jackson.core</groupId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+
+    <!--
+      The schema-aware encoder path builds an EntryEncoderContext, whose Variant helpers
+      reference org.apache.iceberg.variants.* (supplied by iceberg-core). Mirror the
+      materialization module's provided scope; the compaction host provides it at runtime.
+    -->
+    <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-core</artifactId>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.clickhouse</groupId>
+      <artifactId>clickhouse-jdbc</artifactId>
+      <version>${clickhouse-jdbc.version}</version>
+      <classifier>all</classifier>
+      <exclusions>
+        <!--
+          The shaded "all" classifier pulls a fat jar; exclude transitive
+          loggers/test scopes that conflict with the project's SLF4J/Log4j2
+          stack.
+        -->
+        <exclusion>
+          <groupId>org.slf4j</groupId>
+          <artifactId>slf4j-log4j12</artifactId>
+        </exclusion>
+        <exclusion>
+          <groupId>log4j</groupId>
+          <artifactId>log4j</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+
+    <dependency>
+      <groupId>org.projectlombok</groupId>
+      <artifactId>lombok</artifactId>
+      <scope>provided</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+
+    <!-- Test dependencies -->
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter-api</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter-engine</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter-params</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.assertj</groupId>
+      <artifactId>assertj-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.mockito</groupId>
+      <artifactId>mockito-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.mockito</groupId>
+      <artifactId>mockito-inline</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.mockito</groupId>
+      <artifactId>mockito-junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-api</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-slf4j2-impl</artifactId>
+      <scope>test</scope>
+    </dependency>
+
+    <!--
+      Testcontainers stack — only consumed by @Tag("clickhouse") integration tests
+      under src/test/java. Versions are managed by the root pom's
+      testcontainers-bom import.
+    -->
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>clickhouse</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <!--
+      The production `clickhouse-jdbc:0.6.5:all` artifact pulls only the
+      JDBC surface + shaded helper classes; the actual HTTP transport lives in
+      `clickhouse-http-client` which is consumed via reflection at driver init.
+      Add it test-only so the real driver can connect to a live ClickHouse
+      instance from the integration tests without bloating production
+      classpaths (the production driver is constructed by callers from outside
+      this module that already ship the transport jar).
+    -->
+    <dependency>
+      <groupId>com.clickhouse</groupId>
+      <artifactId>clickhouse-http-client</artifactId>
+      <version>${clickhouse-jdbc.version}</version>
+      <classifier>shaded</classifier>
+      <scope>test</scope>
+      <exclusions>
+        <exclusion>
+          <groupId>org.slf4j</groupId>
+          <artifactId>slf4j-log4j12</artifactId>
+        </exclusion>
+        <exclusion>
+          <groupId>log4j</groupId>
+          <artifactId>log4j</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+  </dependencies>
+</project>

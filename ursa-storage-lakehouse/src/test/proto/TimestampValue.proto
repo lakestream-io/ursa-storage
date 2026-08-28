@@ -1,0 +1,15 @@
+/*
+ * SPDX-FileCopyrightText: 2026 OpenLakestream contributors <https://openlakestream.org>
+ * SPDX-License-Identifier: Apache-2.0
+ */
+syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
+
+option java_package = "io.lakestream.ursa.kafka.serde.protobuf.test";
+
+// Wrapper message for `Timestamp`.
+message TimestampValue {
+  // The bytes value.
+  google.protobuf.Timestamp value = 1;
+}

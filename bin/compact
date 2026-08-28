@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+
+
+#
+# SPDX-FileCopyrightText: 2026 OpenLakestream contributors <https://openlakestream.org>
+# SPDX-License-Identifier: Apache-2.0
+#
+
+
+BINDIR=`dirname "$0"`
+COMPACT_HOME=`cd -P $BINDIR/..;pwd`
+COMPACT_LOG_DIR=${COMPACT_LOG_DIR:-"$COMPACT_HOME/logs"}
+
+DEFAULT_CONF=$COMPACT_HOME/conf/ursa_storage.conf
+DEFAULT_LOG_CONF=$COMPACT_HOME/conf/log4j2.yaml
+
+# Check for the java to use
+if [[ -z $JAVA_HOME ]]; then
+    JAVA=$(which java)
+    if [ $? = 0 ]; then
+        echo "JAVA_HOME not set, using java from PATH. ($JAVA)"
+    else
+        echo "Error: JAVA_HOME not set, and no java executable found in $PATH." 1>&2
+        exit 1
+    fi
+else
+    JAVA=$JAVA_HOME/bin/java
+fi
+
+# exclude tests jar
+RELEASE_JAR=`ls $COMPACT_HOME/ursa-storage-compact-*.jar 2> /dev/null | grep -v tests | tail -1`
+if [ $? == 0 ]; then
+    COMPACT_JAR=$RELEASE_JAR
+fi
+
+# exclude tests jar
+BUILT_JAR=`ls $COMPACT_HOME/ursa-storage-compact-*.jar 2> /dev/null | grep -v tests | tail -1`
+if [ $? != 0 ] && [ ! -e "$COMPACT_JAR" ]; then
+    echo "\nCouldn't find compact jar.";
+    echo "Make sure you've run 'mvn package'\n";
+    exit 1;
+elif [ -e "$BUILT_JAR" ]; then
+    COMPACT_JAR=$BUILT_JAR
+fi
+
+compact_help() {
+    cat <<EOF
+Usage: compact <command>
+where command is one of:
+    start              Run a compact server
+
+or command is the full name of a class with a defined main() method.
+
+Environment variables:
+   COMPACT_LOG_CONF        Log4j configuration file (default $DEFAULT_LOG_CONF)
+   COMPACT_CONF            Configuration file (default: $DEFAULT_CONF)
+   COMPACT_EXTRA_OPTS      Extra options to be passed to the jvm
+   COMPACT_EXTRA_CLASSPATH Add extra paths to the compact classpath
+
+EOF
+}
+
+for i in $COMPACT_HOME/lib/*.jar; do
+  COMPACT_CLASSPATH=$COMPACT_CLASSPATH:$i
+done
+
+# if no args specified, show usage
+if [ $# = 0 ]; then
+    compact_help;
+    exit 1;
+fi
+
+# get arguments
+COMMAND=$1
+shift
+
+if [ -z "$COMPACT_CONF" ]; then
+    COMPACT_CONF=$DEFAULT_CONF
+fi
+
+if [ -z "$COMPACT_LOG_CONF" ]; then
+    COMPACT_LOG_CONF=$DEFAULT_LOG_CONF
+fi
+
+COMPACT_CLASSPATH="$COMPACT_JAR:$COMPACT_CLASSPATH:$COMPACT_EXTRA_CLASSPATH"
+COMPACT_CLASSPATH="`dirname $COMPACT_LOG_CONF`:$COMPACT_CLASSPATH"
+OPTS="$OPTS -Dlog4j.configurationFile=`basename $COMPACT_LOG_CONF`"
+
+# Allow Netty to use reflection access
+OPTS="$OPTS -Dio.netty.tryReflectionSetAccessible=true"
+
+OPTS="-cp $COMPACT_CLASSPATH $OPTS"
+
+# Disable ipv6 as it can cause issues
+OPTS="$OPTS -Djava.net.preferIPv4Stack=true"
+OPTS="$OPTS -Dotel.exporter.prometheus.host=0.0.0.0"
+
+OPTS="$OPTS $COMPACT_MEM $COMPACT_GC $COMPACT_GC_LOG $COMPACT_EXTRA_OPTS"
+
+# log directory & file
+COMPACT_LOG_APPENDER=${COMPACT_LOG_APPENDER:-"Console"}
+COMPACT_LOG_LEVEL=${COMPACT_LOG_LEVEL:-"info"}
+
+COMPACT_LOG_FILE=${COMPACT_LOG_FILE:-"compact-server.log"}
+if [ ! -d "$COMPACT_LOG_DIR" ]; then
+  mkdir -p "$COMPACT_LOG_DIR"
+fi
+
+#Configure log configuration system properties
+OPTS="$OPTS -Dursa.log.appender=$COMPACT_LOG_APPENDER"
+OPTS="$OPTS -Dursa.log.level=$COMPACT_LOG_LEVEL"
+OPTS="$OPTS -Dursa.log.dir=$COMPACT_LOG_DIR"
+OPTS="$OPTS -Dursa.log.file=$COMPACT_LOG_FILE"
+OPTS="$OPTS -Dorg.xerial.snappy.use.systemlib=true"
+OPTS="$OPTS -Xlog:async -Xlog:gc*,safepoint:$COMPACT_LOG_DIR/compact_gc_%p.log:time,uptime,tags:filecount=10,filesize=20M"
+OPTS="$OPTS -XX:+DisableExplicitGC"
+OPTS="$OPTS -XX:-OmitStackTraceInFastThrow"
+OPTS="$OPTS -XX:+CrashOnOutOfMemoryError"
+OPTS="$OPTS -Dio.netty.leakDetectionLevel=disabled -Dio.netty.recycler.linkCapacity=1024 -Dio.netty.recycler.maxCapacityPerThread=1000"
+
+cd "$COMPACT_HOME"
+if [ $COMMAND == "start" ]; then
+    exec $JAVA $OPTS $JMX_ARGS io.lakestream.ursa.compact.CompactionMain --conf $COMPACT_CONF $@
+
+elif [ $COMMAND == "help" -o $COMMAND == "--help" -o $COMMAND == "-h" ]; then
+    compact_help;
+else
+    exec $JAVA $OPTS $COMMAND $@
+fi

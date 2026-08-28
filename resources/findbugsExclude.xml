@@ -1,0 +1,215 @@
+<!--
+
+    SPDX-FileCopyrightText: 2026 OpenLakestream contributors <https://openlakestream.org>
+    SPDX-License-Identifier: Apache-2.0
+
+-->
+<!--
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+
+-->
+<FindBugsFilter>
+    <!-- ================================================================== -->
+    <!-- Generated code: auto-generated, not hand-written                   -->
+    <!-- ================================================================== -->
+
+    <!-- LightProto generated code (core module) -->
+    <Match>
+        <Package name="~io\.lakestream\.ursa\.storage\.proto\..*"/>
+    </Match>
+    <!-- Protobuf generated code (lakehouse module) -->
+    <Match>
+        <Package name="~io\.lakestream\.ursa\.lakehouse\.serde\.proto\..*"/>
+    </Match>
+    <Match>
+        <Package name="~io\.lakestream\.ursa\.lakehouse\.v2\.serde\.proto\..*"/>
+    </Match>
+
+    <!-- ================================================================== -->
+    <!-- Vendor/patched upstream sources: do not modify for SpotBugs        -->
+    <!-- ================================================================== -->
+    <Match>
+        <Package name="~io\.delta\.kernel\..*"/>
+    </Match>
+    <Match>
+        <Package name="~org\.apache\.iceberg\.avro\..*"/>
+    </Match>
+
+    <!-- ================================================================== -->
+    <!-- Lombok false positives: @Data, @Getter, @Setter, @Builder          -->
+    <!-- generate getters/setters/constructors that trigger EI_EXPOSE_REP   -->
+    <!-- ================================================================== -->
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP,EI_EXPOSE_REP2"/>
+    </Match>
+
+    <!-- ================================================================== -->
+    <!-- Framework / style patterns excluded globally                       -->
+    <!-- ================================================================== -->
+
+    <!-- Anonymous inner classes: refactoring to static is style, not a bug -->
+    <Match>
+        <Bug pattern="SIC_INNER_SHOULD_BE_STATIC_ANON,SIC_INNER_SHOULD_BE_STATIC"/>
+    </Match>
+
+    <!-- Constructor-throws: common in builders and config classes -->
+    <Match>
+        <Bug pattern="CT_CONSTRUCTOR_THROW"/>
+    </Match>
+
+    <!-- Serialization: not used for Java serialization in this project -->
+    <Match>
+        <Bug pattern="SE_BAD_FIELD,SE_NO_SERIALVERSIONID,SING_SINGLETON_IMPLEMENTS_SERIALIZABLE,SING_SINGLETON_HAS_NONPRIVATE_CONSTRUCTOR"/>
+    </Match>
+
+    <!-- Overridable method in constructor: common pattern with framework classes -->
+    <Match>
+        <Bug pattern="MC_OVERRIDABLE_METHOD_CALL_IN_CONSTRUCTOR"/>
+    </Match>
+
+    <!-- Unused/unread fields: often from Lombok @Builder or framework wiring -->
+    <Match>
+        <Bug pattern="UUF_UNUSED_FIELD,UUF_UNUSED_PUBLIC_OR_PROTECTED_FIELD,URF_UNREAD_FIELD,URF_UNREAD_PUBLIC_OR_PROTECTED_FIELD"/>
+    </Match>
+
+    <!-- Field not initialized in constructor: Lombok @Builder pattern -->
+    <Match>
+        <Bug pattern="UWF_FIELD_NOT_INITIALIZED_IN_CONSTRUCTOR,UWF_NULL_FIELD"/>
+    </Match>
+
+    <!-- Redundant interfaces: inherited from upstream APIs -->
+    <Match>
+        <Bug pattern="RI_REDUNDANT_INTERFACES"/>
+    </Match>
+
+    <!-- Clone without Cloneable: upstream API conformance -->
+    <Match>
+        <Bug pattern="CN_IMPLEMENTS_CLONE_BUT_NOT_CLONEABLE"/>
+    </Match>
+
+    <!-- ================================================================== -->
+    <!-- Exception handling: intentional catch-all in error handlers         -->
+    <!-- ================================================================== -->
+    <Match>
+        <Bug pattern="REC_CATCH_EXCEPTION,DE_MIGHT_IGNORE"/>
+    </Match>
+
+    <!-- ================================================================== -->
+    <!-- Null-pointer analysis: high false-positive rate with Optional APIs  -->
+    <!-- and known-non-null framework methods                               -->
+    <!-- ================================================================== -->
+    <Match>
+        <Bug pattern="NP_NULL_ON_SOME_PATH_FROM_RETURN_VALUE,NP_NULL_ON_SOME_PATH,RCN_REDUNDANT_NULLCHECK_WOULD_HAVE_BEEN_A_NPE"/>
+    </Match>
+
+    <!-- ================================================================== -->
+    <!-- Static field exposure: similar to EI_EXPOSE_REP for static fields  -->
+    <!-- ================================================================== -->
+    <Match>
+        <Bug pattern="MS_EXPOSE_REP,EI_EXPOSE_STATIC_REP2"/>
+    </Match>
+
+    <!-- ================================================================== -->
+    <!-- Dead code / dead stores: from try-catch and auto-closeable patterns -->
+    <!-- ================================================================== -->
+    <Match>
+        <Bug pattern="DLS_DEAD_LOCAL_STORE,DLS_DEAD_LOCAL_STORE_SHADOWS_FIELD,UPM_UNCALLED_PRIVATE_METHOD,UC_USELESS_OBJECT"/>
+    </Match>
+
+    <!-- ================================================================== -->
+    <!-- Type casting: generic type erasure causes false positives           -->
+    <!-- ================================================================== -->
+    <Match>
+        <Bug pattern="BC_UNCONFIRMED_CAST_OF_RETURN_VALUE,BC_UNCONFIRMED_CAST,BX_UNBOXING_IMMEDIATELY_REBOXED"/>
+    </Match>
+
+    <!-- ================================================================== -->
+    <!-- Return value / array style preferences                             -->
+    <!-- ================================================================== -->
+    <Match>
+        <Bug pattern="PZLA_PREFER_ZERO_LENGTH_ARRAYS,RV_RETURN_VALUE_IGNORED_BAD_PRACTICE,RV_RETURN_VALUE_IGNORED"/>
+    </Match>
+
+    <!-- ================================================================== -->
+    <!-- Switch / branch: intentional fall-through and shared logic         -->
+    <!-- ================================================================== -->
+    <Match>
+        <Bug pattern="SF_SWITCH_NO_DEFAULT,DB_DUPLICATE_SWITCH_CLAUSES,DB_DUPLICATE_BRANCHES"/>
+    </Match>
+
+    <!-- ================================================================== -->
+    <!-- Equals / compareTo: inheritance patterns from upstream APIs         -->
+    <!-- ================================================================== -->
+    <Match>
+        <Bug pattern="EQ_DOESNT_OVERRIDE_EQUALS,EQ_OVERRIDING_EQUALS_NOT_SYMMETRIC,EQ_COMPARETO_USE_OBJECT_EQUALS"/>
+    </Match>
+
+    <!-- ================================================================== -->
+    <!-- Static usage / public fields                                       -->
+    <!-- ================================================================== -->
+    <Match>
+        <Bug pattern="SS_SHOULD_BE_STATIC,ST_WRITE_TO_STATIC_FROM_INSTANCE_METHOD,PA_PUBLIC_PRIMITIVE_ATTRIBUTE"/>
+    </Match>
+
+    <!-- ================================================================== -->
+    <!-- Concurrency: patterns used intentionally in async/reactive code    -->
+    <!-- ================================================================== -->
+    <Match>
+        <Bug pattern="JLM_JSR166_UTILCONCURRENT_MONITORENTER,SWL_SLEEP_WITH_LOCK_HELD,SSD_DO_NOT_USE_INSTANCE_LOCK_ON_SHARED_STATIC_DATA,IS2_INCONSISTENT_SYNC,AT_OPERATION_SEQUENCE_ON_CONCURRENT_ABSTRACTION,NO_NOTIFY_NOT_NOTIFYALL,NN_NAKED_NOTIFY,DC_DOUBLECHECK"/>
+    </Match>
+
+    <!-- ================================================================== -->
+    <!-- CLI tools: System.exit is intentional in command-line applications  -->
+    <!-- ================================================================== -->
+    <Match>
+        <Bug pattern="DM_EXIT"/>
+    </Match>
+
+    <!-- ================================================================== -->
+    <!-- Miscellaneous low-value findings                                   -->
+    <!-- ================================================================== -->
+    <Match>
+        <Bug pattern="SR_NOT_CHECKED,DP_DO_INSIDE_DO_PRIVILEGED"/>
+    </Match>
+
+    <!-- Lombok @With generates identity check (==) as optimization, not a bug -->
+    <Match>
+        <Class name="io.lakestream.ursa.materialization.serde.SchemaKey"/>
+        <Bug pattern="ES_COMPARING_PARAMETER_STRING_WITH_EQ"/>
+    </Match>
+
+    <!-- Protobuf generated code relocated to the shared serde module -->
+    <Match>
+        <Package name="~io\.lakestream\.ursa\.materialization\.serde\.proto\..*"/>
+    </Match>
+
+    <!-- ClickHouse requires generated DDL/DML because identifiers are runtime policy/schema data.
+         These methods quote every identifier with ClickHouseIdentifiers.quote(), validate type
+         strings with a strict allowlist, and bind all row values through JDBC placeholders. -->
+    <Match>
+        <Class name="io.lakestream.ursa.clickhouse.ClickHouseTableMaterializer"/>
+        <Method name="flush"/>
+        <Bug pattern="SQL_PREPARED_STATEMENT_GENERATED_FROM_NONCONSTANT_STRING"/>
+    </Match>
+    <Match>
+        <Class name="io.lakestream.ursa.clickhouse.ClickHouseTableSchemaService"/>
+        <Method name="createTable"/>
+        <Bug pattern="SQL_NONCONSTANT_STRING_PASSED_TO_EXECUTE"/>
+    </Match>
+    <Match>
+        <Class name="io.lakestream.ursa.clickhouse.ClickHouseTableSchemaService"/>
+        <Method name="addColumn"/>
+        <Bug pattern="SQL_NONCONSTANT_STRING_PASSED_TO_EXECUTE"/>
+    </Match>
+</FindBugsFilter>

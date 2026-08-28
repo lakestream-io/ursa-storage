@@ -1,0 +1,15 @@
+/*
+ * SPDX-FileCopyrightText: 2026 OpenLakestream contributors <https://openlakestream.org>
+ * SPDX-License-Identifier: Apache-2.0
+ */
+syntax = "proto3";
+
+import "google/type/date.proto";
+
+option java_package = "io.lakestream.ursa.kafka.serde.protobuf.test";
+
+// Wrapper message for `Date`.
+message DateValue {
+  // The bytes value.
+  google.type.Date value = 1;
+}

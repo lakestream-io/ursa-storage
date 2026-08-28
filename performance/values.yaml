@@ -1,0 +1,63 @@
+#
+# SPDX-FileCopyrightText: 2026 OpenLakestream contributors <https://openlakestream.org>
+# SPDX-License-Identifier: Apache-2.0
+#
+
+# Default values for performance testing
+
+# Oxia runs in standalone mode. It creates the "default" namespace automatically.
+# This deployment is intended for development and benchmark orchestration, not production.
+oxia:
+  image:
+    repository: oxia/oxia
+    tag: "0.16.7"
+    pullPolicy: IfNotPresent
+  shards: 8
+  resources:
+    limits:
+      cpu: 1
+      memory: 1Gi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClassName: ""
+
+# Ursa configurations
+ursa:
+  replicaCount: 1
+  image:
+    repository: ursa-storage-performance
+    # An empty tag uses Chart.appVersion. Override this for a published or locally loaded image.
+    tag: ""
+    pullPolicy: IfNotPresent
+  resources:
+    limits:
+      cpu: 4
+      memory: 16Gi
+    requests:
+      cpu: 4
+      memory: 16Gi
+  persistence:
+    enabled: true
+    size: 20Gi
+    storageClassName: ""
+  config:
+    # LOCAL keeps the default chart self-contained. Use an object-store backend for
+    # multi-pod or durable benchmarks and provide its properties below.
+    backendStorageType: LOCAL
+    storagePath: /var/lib/ursa/storage
+    extraProperties: {}
+    # Example S3 properties:
+    # extraProperties:
+    #   bucket: my-benchmark-bucket
+    #   prefix: ursa-performance
+    #   region: us-east-1
+    #   cloudStorageEndpoint: https://s3.us-east-1.amazonaws.com
+  env:
+    - name: URSA_STORAGE_MEM
+      value: "-Xmx5400m -Xms5400m -XX:MaxDirectMemorySize=10400m"
+    - name: OPTS
+      value: "-Dotel.sdk.disabled=false -Dotel.java.disabled.resource.providers=io.opentelemetry.instrumentation.resources.ProcessResourceProvider -Dotel.metrics.exporter=prometheus -Dotel.exporter.prometheus.port=9464"

@@ -1,0 +1,10 @@
+/*
+ * SPDX-FileCopyrightText: 2026 OpenLakestream contributors <https://openlakestream.org>
+ * SPDX-License-Identifier: Apache-2.0
+ */
+syntax = "proto3";
+
+import public "TestProto.proto";
+
+package io.lakestream.ursa.kafka.serde.protobuf.test;
+

@@ -1,0 +1,49 @@
+#
+# SPDX-FileCopyrightText: 2026 OpenLakestream contributors <https://openlakestream.org>
+# SPDX-License-Identifier: Apache-2.0
+#
+
+name: Trivy
+
+on:
+  pull_request:
+    branches:
+      - main
+      - branch-4.0
+      - branch-4.1
+  push:
+    branches:
+      - main
+      - branch-4.0
+      - branch-4.1
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: CVE Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner in fs mode
+        # Pinned to an immutable commit SHA (v0.36.0). Do NOT use @master:
+        # aquasecurity/trivy-action was supply-chain compromised twice in 2026
+        # (tags 0.0.1-0.34.2 on 2026-03-19), and @master also pulls unreleased
+        # Trivy builds that have caused deterministic "context canceled" crashes.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          scanners: 'vuln'
+          severity: 'CRITICAL,HIGH'
+          timeout: '15m'
+        env:
+          TRIVY_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-db
+          TRIVY_JAVA_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-java-db
+          # Cap Go heap below the runner's RAM so the GC reclaims aggressively
+          # instead of letting an analyzer goroutine OOM and cancel the scan.
+          GOMEMLIMIT: '5GiB'

@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<!--
+
+    SPDX-FileCopyrightText: 2026 OpenLakestream contributors <https://openlakestream.org>
+    SPDX-License-Identifier: Apache-2.0
+
+-->
+<configuration>
+  <property>
+    <name>foo</name>
+    <value>bar</value>
+  </property>
+</configuration>

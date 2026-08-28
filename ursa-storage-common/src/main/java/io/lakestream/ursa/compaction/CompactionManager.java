@@ -1,0 +1,412 @@
+/*
+ * SPDX-FileCopyrightText: 2026 OpenLakestream contributors <https://openlakestream.org>
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package io.lakestream.ursa.compaction;
+
+import io.lakestream.ursa.compaction.metrics.CompactionMetrics;
+import io.lakestream.ursa.compaction.task.CompactStreamTask;
+import io.lakestream.ursa.compaction.task.CompactedOffset;
+import io.lakestream.ursa.compaction.task.OffsetRange;
+import io.lakestream.ursa.compaction.task.PreparedCompactStreamTask;
+import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.api.common.Attributes;
+import io.oxia.client.api.exceptions.KeyAlreadyExistsException;
+import java.io.IOException;
+import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import lombok.extern.slf4j.Slf4j;
+
+@Slf4j
+public class CompactionManager {
+
+    public enum PublicationResult {
+        NO_TASK,
+        PUBLISHED
+    }
+
+    @FunctionalInterface
+    public interface PublicationTaskFactory {
+        Optional<PreparedCompactStreamTask> create(long lastPublishedOffset) throws Exception;
+    }
+
+    private final CompactTaskManager taskManager;
+    private final CompactionMetrics metrics;
+    private final Set<CompactTaskManager.PublicationLease> pendingPublicationLeaseReleases =
+            ConcurrentHashMap.newKeySet();
+
+    public CompactionManager(CompactTaskManager taskManager) {
+        this.taskManager = taskManager;
+        this.metrics = CompactionMetrics.NOOP;
+    }
+
+    public CompactionManager(CompactTaskManager taskManager, CompactionMetrics compactionMetrics) {
+        this.taskManager = taskManager;
+        this.metrics = compactionMetrics;
+    }
+
+    /**
+     * Attempts to open a long-lived, fenced publication session for one named stream incarnation.
+     *
+     * <p>The caller must retain the returned session for the lifetime of its publisher and close it
+     * when that publisher loses ownership. A fenced session is terminal and must not be reused or
+     * automatically reacquired by the same publisher instance.
+     */
+    public Optional<PublicationSession> tryOpenPublicationSession(String topicName, long streamId)
+            throws Exception {
+        retryPendingPublicationLeaseRelease(topicName);
+        Optional<CompactTaskManager.PublicationLease> lease =
+                taskManager.tryAcquirePublicationLease(topicName, streamId);
+        if (lease.isEmpty()) {
+            return Optional.empty();
+        }
+        try {
+            CompactTaskManager.PublishedOffsetClaim cursor =
+                    taskManager.claimPublishedOffset(lease.get());
+            return Optional.of(new PublicationSession(lease.get(), cursor));
+        } catch (Throwable error) {
+            CompactTaskManager.PublicationLease acquiredLease = lease.get();
+            pendingPublicationLeaseReleases.add(acquiredLease);
+            try {
+                retryPendingPublicationLeaseRelease(topicName);
+            } catch (Throwable releaseError) {
+                if (releaseError instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+                error.addSuppressed(releaseError);
+            }
+            throw error;
+        }
+    }
+
+    private void retryPendingPublicationLeaseRelease(String topicName) throws Exception {
+        for (CompactTaskManager.PublicationLease pending : pendingPublicationLeaseReleases) {
+            if (!topicName.equals(pending.name())) {
+                continue;
+            }
+            try {
+                // Both true (released by this call) and false (already absent or superseded) settle the
+                // exact lease. Only an exception leaves the handle pending for the next open attempt.
+                taskManager.releasePublicationLease(pending);
+                pendingPublicationLeaseReleases.remove(pending);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw interrupted;
+            }
+        }
+    }
+
+    /**
+     * A long-lived publication owner that serializes recovery, cursor selection and task publication.
+     */
+    public final class PublicationSession implements AutoCloseable {
+
+        private static final int MAX_PREPARED_CLAIM_RETRIES = 3;
+
+        private final CompactTaskManager.PublicationLease lease;
+        private final ReentrantReadWriteLock lifecycleLock = new ReentrantReadWriteLock();
+        private final ReentrantLock publicationLock = new ReentrantLock();
+        private CompactTaskManager.PublishedOffsetClaim cursor;
+        private volatile boolean closed;
+        private volatile boolean fenced;
+        private volatile boolean leaseReleaseSettled;
+
+        private PublicationSession(
+                CompactTaskManager.PublicationLease lease,
+                CompactTaskManager.PublishedOffsetClaim cursor) {
+            this.lease = lease;
+            this.cursor = cursor;
+        }
+
+        public String topicName() {
+            return lease.name();
+        }
+
+        public long streamId() {
+            return lease.streamId();
+        }
+
+        /**
+         * Recovers any durable publication intent, reads the resulting cursor, builds the next task
+         * and publishes it without releasing the publication lease between those phases.
+         */
+        public PublicationResult publishNext(PublicationTaskFactory taskFactory) throws Exception {
+            lifecycleLock.readLock().lock();
+            publicationLock.lock();
+            try {
+                ensureCurrentLease();
+                for (int attempt = 0; attempt < MAX_PREPARED_CLAIM_RETRIES; attempt++) {
+                    recoverPreparedTask();
+                    long lastPublishedOffset = cursor.offset().getOffset();
+                    Optional<PreparedCompactStreamTask> nextTask = taskFactory.create(lastPublishedOffset);
+                    ensureCurrentLease();
+                    if (nextTask.isEmpty()) {
+                        return PublicationResult.NO_TASK;
+                    }
+                    PreparedCompactStreamTask task = nextTask.get();
+                    validateNextTask(task, lastPublishedOffset);
+                    Optional<CompactTaskManager.PreparedTaskClaim> preparedClaim =
+                            taskManager.tryCreatePreparedTaskClaim(task, lease.name());
+                    ensureCurrentLease();
+                    if (preparedClaim.isEmpty()) {
+                        continue;
+                    }
+                    publishPreparedTask(preparedClaim.get());
+                    return PublicationResult.PUBLISHED;
+                }
+                throw new IllegalStateException("Failed to claim the prepared task for " + lease.name());
+            } catch (PublicationFencedException error) {
+                fenced = true;
+                throw error;
+            } finally {
+                publicationLock.unlock();
+                lifecycleLock.readLock().unlock();
+            }
+        }
+
+        public boolean isClosed() {
+            return closed;
+        }
+
+        public boolean isFenced() {
+            return fenced;
+        }
+
+        /**
+         * Immediately and permanently fences this local publisher without waiting for an in-flight
+         * publication or performing any remote operation.
+         *
+         * <p>The owner-loss path should invoke this method synchronously before scheduling
+         * {@link #close()} to release the remote lease.
+         */
+        public void fence() {
+            fenced = true;
+        }
+
+        private void ensureCurrentLease() throws ExecutionException, InterruptedException {
+            if (closed || fenced) {
+                throw fencedException();
+            }
+            boolean current = taskManager.validatePublicationLease(lease);
+            // Re-read the local state after the remote validation. Ownership loss can fence the
+            // session while that validation is in flight.
+            if (closed || fenced || !current) {
+                fence();
+                throw fencedException();
+            }
+        }
+
+        private PublicationFencedException fencedException() {
+            return new PublicationFencedException(
+                    "Publication session for " + lease.name() + " is fenced");
+        }
+
+        private void recoverPreparedTask() throws Exception {
+            Optional<CompactTaskManager.PreparedTaskClaim> prepared =
+                    taskManager.getPreparedTaskClaim(lease.name());
+            ensureCurrentLease();
+            if (prepared.isEmpty()) {
+                return;
+            }
+            CompactTaskManager.PreparedTaskClaim claim = prepared.get();
+            PreparedCompactStreamTask task = claim.task();
+            if (task.getStreamId() != lease.streamId()) {
+                log.warn("Discarding prepared task {} for obsolete stream {} while stream {} owns {}",
+                        task.getTaskName(), task.getStreamId(), lease.streamId(), lease.name());
+                taskManager.deletePreparedTaskClaim(lease.name(), claim);
+                ensureCurrentLease();
+                return;
+            }
+
+            long targetOffset = OffsetRange.lastIncludedOffset(task.getStartOffset(), task.getEndOffset());
+            long currentOffset = cursor.offset().getOffset();
+            if (currentOffset == task.getStartOffset() - 1) {
+                publishPreparedTask(claim);
+                return;
+            }
+            if (currentOffset == targetOffset) {
+                makeTaskVisible(task, claim);
+                return;
+            }
+            if (currentOffset > targetOffset) {
+                log.warn("Discarding obsolete prepared task {} ending at {} because cursor for {} is already {}",
+                        task.getTaskName(), targetOffset, lease.name(), currentOffset);
+                taskManager.deletePreparedTaskClaim(lease.name(), claim);
+                ensureCurrentLease();
+                return;
+            }
+            throw new IllegalStateException("Prepared task " + task.getTaskName() + " has range ["
+                    + task.getStartOffset() + ", " + task.getEndOffset() + ") but cursor for "
+                    + lease.name() + " is " + currentOffset);
+        }
+
+        private void publishPreparedTask(CompactTaskManager.PreparedTaskClaim preparedClaim) throws Exception {
+            PreparedCompactStreamTask task = preparedClaim.task();
+            ensureCurrentLease();
+            taskManager.publishCompactTaskIfAbsent(task.toCompactStreamTask());
+            ensureCurrentLease();
+            long targetOffset = OffsetRange.lastIncludedOffset(task.getStartOffset(), task.getEndOffset());
+            CompactedOffset updated = new CompactedOffset(lease.streamId(), targetOffset, 0L);
+            cursor = taskManager.compareAndSetPublishedOffset(lease, cursor, updated);
+            ensureCurrentLease();
+            makeTaskVisible(task, preparedClaim);
+            ensureCurrentLease();
+            metrics.getLatestPublishedOffset().set(targetOffset,
+                    Attributes.of(AttributeKey.stringKey("topic"), lease.name()));
+        }
+
+        private void makeTaskVisible(
+                PreparedCompactStreamTask task,
+                CompactTaskManager.PreparedTaskClaim preparedClaim) throws Exception {
+            // The package marker is the worker-visible commit point. It is deliberately written only
+            // after the cursor CAS has committed this range to the current publisher session.
+            ensureCurrentLease();
+            taskManager.publishCompactTaskIfAbsent(task.toCompactStreamTask());
+            ensureCurrentLease();
+            taskManager.publishPackagedTaskName(task.getTaskName());
+            ensureCurrentLease();
+            if (!taskManager.deletePreparedTaskClaim(lease.name(), preparedClaim)) {
+                ensureCurrentLease();
+                log.info("Prepared task {} was already recovered by another owner", task.getTaskName());
+            }
+            ensureCurrentLease();
+        }
+
+        private void validateNextTask(PreparedCompactStreamTask task, long lastPublishedOffset) {
+            if (!lease.name().equals(task.getTopic())) {
+                throw new IllegalArgumentException("Prepared task topic does not match the publication session");
+            }
+            if (task.getStreamId() != lease.streamId()) {
+                throw new IllegalArgumentException("Prepared task stream does not match the publication session");
+            }
+            if (task.getStartOffset() != lastPublishedOffset + 1) {
+                throw new IllegalArgumentException("Prepared task must start immediately after the published cursor");
+            }
+            OffsetRange.lastIncludedOffset(task.getStartOffset(), task.getEndOffset());
+        }
+
+        @Override
+        public void close() throws Exception {
+            // Fencing is deliberately outside the write lock so an ownership-loss callback can
+            // synchronously stop further publication before close waits for in-flight work.
+            fence();
+            lifecycleLock.writeLock().lock();
+            try {
+                if (leaseReleaseSettled) {
+                    return;
+                }
+                closed = true;
+                // A false CAS result means this exact lease is already gone or superseded, which
+                // is a settled release. An exception is different: keep the release retryable on
+                // a subsequent close() while the local session remains permanently fenced.
+                try {
+                    taskManager.releasePublicationLease(lease);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw interrupted;
+                }
+                leaseReleaseSettled = true;
+            } finally {
+                lifecycleLock.writeLock().unlock();
+            }
+        }
+    }
+
+    public void recoverPreparedTasks(String topicName) throws Exception {
+        recoverPreparedTasks(topicName, OptionalLong.empty());
+    }
+
+    /**
+     * Recovers a prepared task only when it belongs to {@code expectedStreamId}.
+     * A task left behind by an older incarnation of the named stream is deleted without being published.
+     */
+    public void recoverPreparedTasks(String topicName, long expectedStreamId) throws Exception {
+        recoverPreparedTasks(topicName, OptionalLong.of(expectedStreamId));
+    }
+
+    private void recoverPreparedTasks(String topicName, OptionalLong expectedStreamId) throws Exception {
+        PreparedCompactStreamTask preparedCompactStreamTask =
+            taskManager.getPreparedStreamTask(topicName);
+        if (preparedCompactStreamTask != null) {
+            if (expectedStreamId.isPresent()
+                    && preparedCompactStreamTask.getStreamId() != expectedStreamId.getAsLong()) {
+                log.warn("Deleting stale prepared task for stream {} because its stream id {} does not match {}",
+                        topicName, preparedCompactStreamTask.getStreamId(), expectedStreamId.getAsLong());
+                taskManager.deletePreparedCompactTask(topicName);
+                return;
+            }
+            int status = preparedCompactStreamTask.getStatus();
+            if (status != PreparedCompactStreamTask.INIT
+                    && status != PreparedCompactStreamTask.PUSHED_TASK) {
+                return;
+            }
+            long publishedOffset = OffsetRange.lastIncludedOffset(
+                    preparedCompactStreamTask.getStartOffset(), preparedCompactStreamTask.getEndOffset());
+            if (status == PreparedCompactStreamTask.INIT) {
+                CompactStreamTask compactStreamTask = preparedCompactStreamTask.toCompactStreamTask();
+                try {
+                    taskManager.publishCompactTask(compactStreamTask);
+                } catch (ExecutionException e) {
+                    if (e.getCause() instanceof KeyAlreadyExistsException) {
+                        log.info("The task {} already pushed, ignore it.", compactStreamTask);
+                    } else {
+                        throw e;
+                    }
+                }
+                taskManager.publishPackagedTaskName(preparedCompactStreamTask.getTaskName());
+                preparedCompactStreamTask.setStatus(PreparedCompactStreamTask.PUSHED_TASK);
+                taskManager.updatePreparedCompactTask(preparedCompactStreamTask, Optional.of(topicName));
+                taskManager.updatePublishedOffset(topicName, preparedCompactStreamTask.getStreamId(),
+                    publishedOffset);
+                taskManager.deletePreparedCompactTask(topicName);
+            }
+            if (status == PreparedCompactStreamTask.PUSHED_TASK) {
+                taskManager.updatePublishedOffset(topicName, preparedCompactStreamTask.getStreamId(),
+                    publishedOffset);
+                taskManager.deletePreparedCompactTask(topicName);
+            }
+        }
+    }
+
+    public void publishTask(PreparedCompactStreamTask task) throws Exception {
+        var topicName = task.getTopic();
+        long publishedOffset = OffsetRange.lastIncludedOffset(task.getStartOffset(), task.getEndOffset());
+        taskManager.publishPreparedCompactTask(task, Optional.of(task.getTopic()));
+        taskManager.publishCompactTask(task.toCompactStreamTask());
+        log.info("Published compact task {}", task);
+        taskManager.publishPackagedTaskName(task.getTaskName());
+        task.setStatus(PreparedCompactStreamTask.PUSHED_TASK);
+        taskManager.updatePreparedCompactTask(task, Optional.of(topicName));
+        taskManager.updatePublishedOffset(topicName, task.getStreamId(), publishedOffset);
+        taskManager.deletePreparedCompactTask(topicName);
+
+        // Record the last published offset so integrations can detect compaction lag.
+        metrics.getLatestPublishedOffset().set(publishedOffset,
+            Attributes.of(AttributeKey.stringKey("topic"), task.getTopic()));
+    }
+
+    public long lastPublishedOffset(String topicName) throws IOException, ExecutionException, InterruptedException {
+        var publishedOffset = taskManager.getPublishedOffset(topicName);
+        if (publishedOffset != null) {
+            return publishedOffset.getOffset();
+        }
+        return -1;
+    }
+
+    /**
+     * Returns the last published offset for the expected stream incarnation, or {@code -1} when none exists.
+     */
+    public long lastPublishedOffset(String topicName, long expectedStreamId)
+            throws IOException, ExecutionException, InterruptedException {
+        var publishedOffset = taskManager.getPublishedOffset(topicName);
+        if (publishedOffset == null || publishedOffset.getId() != expectedStreamId) {
+            return -1;
+        }
+        return publishedOffset.getOffset();
+    }
+}

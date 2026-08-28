@@ -1,0 +1,137 @@
+#
+# SPDX-FileCopyrightText: 2026 OpenLakestream contributors <https://openlakestream.org>
+# SPDX-License-Identifier: Apache-2.0
+#
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-oxia
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: oxia
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: metadata-store
+spec:
+  selector:
+    app.kubernetes.io/name: oxia
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: client
+      port: 6648
+      targetPort: client
+    - name: metrics
+      port: 8080
+      targetPort: metrics
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-oxia-headless
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: oxia
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: metadata-store
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: oxia
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: client
+      port: 6648
+      targetPort: client
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Release.Name }}-oxia
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: oxia
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: metadata-store
+spec:
+  serviceName: {{ .Release.Name }}-oxia-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: oxia
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      annotations:
+        prometheus.io/path: /metrics
+        prometheus.io/port: "8080"
+        prometheus.io/scrape: "true"
+      labels:
+        app.kubernetes.io/name: oxia
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: metadata-store
+    spec:
+      securityContext:
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: oxia
+          image: "{{ .Values.oxia.image.repository }}:{{ .Values.oxia.image.tag }}"
+          imagePullPolicy: {{ .Values.oxia.image.pullPolicy }}
+          command:
+            - /oxia/bin/oxia
+          args:
+            - standalone
+            - --data-dir=/data/db
+            - --wal-dir=/data/wal
+            - --shards={{ .Values.oxia.shards }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - name: client
+              containerPort: 6648
+            - name: metrics
+              containerPort: 8080
+          resources:
+            {{- toYaml .Values.oxia.resources | nindent 12 }}
+          startupProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            failureThreshold: 30
+            periodSeconds: 2
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      {{- if not .Values.oxia.persistence.enabled }}
+      volumes:
+        - name: data
+          emptyDir: {}
+      {{- end }}
+  {{- if .Values.oxia.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        {{- if .Values.oxia.persistence.storageClassName }}
+        storageClassName: {{ .Values.oxia.persistence.storageClassName | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.oxia.persistence.size }}
+  {{- end }}

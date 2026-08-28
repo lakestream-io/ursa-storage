@@ -1,0 +1,231 @@
+#
+# SPDX-FileCopyrightText: 2026 OpenLakestream contributors <https://openlakestream.org>
+# SPDX-License-Identifier: Apache-2.0
+#
+
+name: Ursa Storage
+
+on:
+  pull_request:
+    branches:
+      - main
+      - branch-4.0
+      - branch-4.1
+  push:
+    branches:
+      - main
+      - branch-4.0
+      - branch-4.1
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MAVEN_OPTS: -Xss1500k -Xmx1500m -Daether.connector.http.reuseConnections=false -Daether.connector.requestTimeout=60000 -Dhttp.keepAlive=false -Dmaven.wagon.http.pool=false -Dmaven.wagon.http.retryHandler.class=standard -Dmaven.wagon.http.retryHandler.count=3 -Dmaven.wagon.http.retryHandler.requestSentEnabled=true -Dmaven.wagon.http.serviceUnavailableRetryStrategy.class=standard -Dmaven.wagon.rto=60000
+
+jobs:
+  build:
+    name: Build Project
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update apt-get
+        run: sudo apt-get update
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: corretto
+          java-version: 17
+
+      - name: Clean Disk
+        uses: ./.github/actions/clean-disk
+
+      - name: Cache local Maven repository
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository/*/*/*
+            !~/.m2/repository/io/lakestream/ursa-storage*/**
+            !~/.m2/repository/io/lakestream/lakestream*/**
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      - name: License check
+        run: mvn -B -ntp license:check
+
+      - name: Style check
+        run: mvn -B -ntp checkstyle:check
+
+      - name: Build with Maven skipTests
+        run: mvn -B -ntp clean install -DskipTests -Dspotbugs.skip=true -Dcheckstyle.skip=true -Dlicense.skip=true
+
+      - name: Spotbugs check
+        run: mvn -B -ntp spotbugs:check
+
+      - name: Compress project
+        run: |
+          rsync -av --exclude='.git' --exclude='*.tmp' --exclude='*.lock' . /tmp/project-copy/
+          tar -czf project-build.tar.gz -C /tmp/project-copy .
+
+      - name: Upload project artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: project-build
+          path: project-build.tar.gz
+
+      - name: Compress .m2 Ursa Storage artifacts
+        run: |
+          tar -czf m2-ursa-storage.tar.gz -C ~/.m2/repository/io/lakestream $(find ~/.m2/repository/io/lakestream -maxdepth 1 -type d \( -name 'ursa-storage*' -o -name 'lakestream*' \) -exec basename {} \;)
+
+      - name: Upload m2 ursa-storage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: m2-ursa-storage
+          path: m2-ursa-storage.tar.gz
+
+  test:
+    name: ${{ matrix.name }}
+    timeout-minutes: 120
+    runs-on: ubuntu-latest
+    needs: build
+    env:
+      EXTRA_OPTS: -Dlog4j.configurationFile=${{ github.workspace }}/resources/ci-log4j2.xml -T 1C -Dspotbugs.skip=true -Dcheckstyle.skip=true -Dlicense.skip=true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Unit Tests
+            test_type: unit
+            stress_ng: false
+            group_arg: -DexcludeGroups='gcs-group1,aws-group1,aws-group2,lakehouse,test-base'
+          - name: Unit Tests (Lakehouse)
+            test_type: unit
+            stress_ng: false
+            group_arg: -Dgroups=lakehouse -pl ursa-storage-lakehouse
+          - name: Integration Tests (S3 group1)
+            test_type: s3
+            stress_ng: false
+            group_arg: -Dgroups=aws-group1 -pl ursa-storage-test
+          - name: Integration Tests (S3 group2)
+            test_type: s3
+            stress_ng: false
+            group_arg: -Dgroups=aws-group2 -pl ursa-storage-test
+          - name: Integration Tests (GCS)
+            test_type: gcs
+            stress_ng: false
+            group_arg: -Dgroups=gcs-group1 -pl ursa-storage-test
+          - name: Unit Tests (stress-ng)
+            test_type: unit
+            stress_ng: true
+            group_arg: -DexcludeGroups='gcs-group1,aws-group1,aws-group2,lakehouse,test-base'
+          - name: Integration Tests (S3 stress-ng)
+            test_type: s3
+            stress_ng: true
+            group_arg: -Dgroups=aws-group1 -pl ursa-storage-test
+          - name: Integration Tests (GCS stress-ng)
+            test_type: gcs
+            stress_ng: true
+            group_arg: -Dgroups=gcs-group1 -pl ursa-storage-test
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update apt-get
+        run: sudo apt-get update
+      - name: Install stress-ng
+        if: ${{ matrix.stress_ng }}
+        run: sudo apt-get install -y stress-ng
+      - name: Install dstat
+        run: sudo apt-get install -y dstat
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: corretto
+          java-version: 17
+      - name: Clean Disk
+        uses: ./.github/actions/clean-disk
+      - name: Cache local Maven repository
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository/*/*/*
+            !~/.m2/repository/io/lakestream/ursa-storage*/**
+            !~/.m2/repository/io/lakestream/lakestream*/**
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      - name: Download m2 ursa-storage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: m2-ursa-storage
+
+      - name: Extract m2 ursa-storage
+        run: |
+          mkdir -p ~/.m2/repository/io/lakestream
+          tar -xzf m2-ursa-storage.tar.gz -C ~/.m2/repository/io/lakestream
+          ls -l ~/.m2/repository/io/lakestream
+
+      - name: Download project artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: project-build
+
+      - name: Extract project artifact
+        run: |
+          find . -type d -name target -exec ls -al {} \;
+          tar -xzf project-build.tar.gz
+          find . -type d -name target -exec ls -al {} \;
+
+      - name: Start stress-ng and dstat
+        if: ${{ matrix.stress_ng }}
+        run: |
+          cpus=$(nproc)
+          stress-ng --cpu $cpus --cpu-load 85 --vm 2 --vm-bytes 128M &
+          dstat -cdngytr > dstat.csv &
+          sleep 5
+          cat dstat.csv
+
+      - name: "Run tests (${{ matrix.name }})"
+        run: |
+          mvn -B -ntp test -DfailIfNoTests=false ${{ matrix.group_arg }} ${{ env.EXTRA_OPTS }}
+
+      - name: print dstat
+        if: always() && matrix.stress_ng == true
+        run: cat dstat.csv
+
+      - name: print JVM thread dumps when cancelled
+        uses: ./.github/actions/thread-dump-jvms
+        if: cancelled()
+
+      - name: Upload possible heap dump, core dump or crash files
+        uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: dumpfiles-${{ matrix.name }}
+          path: |
+            /tmp/*.hprof
+            /tmp/netty_leak_*.txt
+            **/hs_err_*.log
+            **/core.*
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: package surefire artifacts
+        if: failure()
+        run: |
+          rm -rf artifacts
+          mkdir artifacts
+          find . -type d -name "*surefire*" -exec cp --parents -R '{}' artifacts/ \;
+          zip -r artifacts.zip artifacts
+
+      - uses: actions/upload-artifact@v4
+        name: upload surefire-artifacts
+        if: failure()
+        with:
+          name: surefire-artifacts-${{ matrix.name }}
+          path: artifacts.zip

@@ -1,0 +1,32 @@
+/*
+ * SPDX-FileCopyrightText: 2026 OpenLakestream contributors <https://openlakestream.org>
+ * SPDX-License-Identifier: Apache-2.0
+ */
+syntax = "proto2";
+package io.lakestream.ursa.kafka.serde.protobuf.test;
+
+import "google/protobuf/descriptor.proto";
+
+option java_package = "io.lakestream.ursa.kafka.serde.protobuf.test";
+
+message FooBar2 {
+  extensions 100 to 200;
+  extensions 1000 to 1001;
+  extensions 2000 to 2000;
+
+  reserved 5000 to 6000;
+  reserved 10000 to 10001;
+  reserved 20000 to 20000;
+
+  optional int32 foo = 1;
+  optional string bar = 2;
+
+  enum FooBarBazEnum {
+    reserved 100 to 200;
+    reserved 1000 to 1001;
+    reserved 2000 to 2000;
+
+    BUG = 0;
+    ZAP = 1;
+  }
+}

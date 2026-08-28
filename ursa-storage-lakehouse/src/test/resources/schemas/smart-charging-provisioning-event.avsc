@@ -1,0 +1,406 @@
+{
+  "type": "record",
+  "name": "SmartChargingProvisioningEvent",
+  "namespace": "com.tme.ev.chargingplatform",
+  "fields": [
+    {
+      "name": "serialNumber",
+      "type": "string",
+      "default": ""
+    },
+    {
+      "name": "messageId",
+      "type": "string",
+      "default": ""
+    },
+    {
+      "name": "timestamp",
+      "type": "string",
+      "default": ""
+    },
+    {
+      "name": "id_wb",
+      "type": "string",
+      "default": ""
+    },
+    {
+      "name": "id_ev",
+      "type": "string",
+      "default": ""
+    },
+    {
+      "name": "user_info",
+      "type": {
+        "type": "record",
+        "name": "UserInfo",
+        "namespace": "com.tme.ev.chargingplatform",
+        "fields": [
+          {
+            "name": "user_id",
+            "type": "string",
+            "default": ""
+          },
+          {
+            "name": "meter_id",
+            "type": [
+              "null",
+              "string"
+            ],
+            "default": null
+          }
+        ]
+      },
+      "default": {
+        "user_id": "",
+        "meter_id": null
+      }
+    },
+    {
+      "name": "ev_parameters",
+      "type": {
+        "type": "record",
+        "name": "EVModel",
+        "namespace": "com.tme.ev.chargingplatform",
+        "fields": [
+          {
+            "name": "self_eff",
+            "type": "float",
+            "default": 0
+          },
+          {
+            "name": "charging_eff",
+            "type": "float",
+            "default": 0
+          },
+          {
+            "name": "battery_capacity",
+            "type": "float",
+            "default": 0
+          },
+          {
+            "name": "max_charging_rate",
+            "type": "float",
+            "default": 0
+          }
+        ]
+      },
+      "default": {
+        "self_eff": 0,
+        "charging_eff": 0,
+        "battery_capacity": 0,
+        "max_charging_rate": 0
+      }
+    },
+    {
+      "name": "wb_parameters",
+      "type": {
+        "type": "record",
+        "name": "WBModel",
+        "namespace": "com.tme.ev.chargingplatform",
+        "fields": [
+          {
+            "name": "charging_eff",
+            "type": "float",
+            "default": 0
+          },
+          {
+            "name": "max_power_charge",
+            "type": "float",
+            "default": 0
+          },
+          {
+            "name": "ocpp_protocol",
+            "type": "string",
+            "default": ""
+          }
+        ]
+      },
+      "default": {
+        "charging_eff": 0,
+        "max_power_charge": 0,
+        "ocpp_protocol": ""
+      }
+    },
+    {
+      "name": "contract_data",
+      "type": {
+        "type": "record",
+        "name": "EnergyContractData",
+        "namespace": "com.tme.ev.chargingplatform",
+        "fields": [
+          {
+            "name": "type",
+            "type": "string",
+            "default": ""
+          },
+          {
+            "name": "energy_supplier",
+            "type": "string",
+            "default": ""
+          },
+          {
+            "name": "currency",
+            "type": "string",
+            "default": ""
+          },
+          {
+            "name": "day_night",
+            "type": {
+              "type": "array",
+              "items": {
+                "type": "record",
+                "name": "DayNightContract",
+                "namespace": "com.tme.ev.chargingplatform",
+                "fields": [
+                  {
+                    "name": "day_of_the_week",
+                    "type": "string",
+                    "default": ""
+                  },
+                  {
+                    "name": "periods",
+                    "type": {
+                      "type": "array",
+                      "items": {
+                        "type": "record",
+                        "name": "HighLowPeriods",
+                        "namespace": "com.tme.ev.chargingplatform",
+                        "fields": [
+                          {
+                            "name": "start_time",
+                            "type": "string",
+                            "default": ""
+                          },
+                          {
+                            "name": "end_time",
+                            "type": "string",
+                            "default": ""
+                          },
+                          {
+                            "name": "high_period",
+                            "type": "boolean",
+                            "default": false
+                          },
+                          {
+                            "name": "unit_rate",
+                            "type": "string",
+                            "default": ""
+                          },
+                          {
+                            "name": "local_start_time",
+                            "type": "string",
+                            "default": ""
+                          },
+                          {
+                            "name": "local_end_time",
+                            "type": "string",
+                            "default": ""
+                          }
+                        ]
+                      }
+                    },
+                    "default": []
+                  }
+                ]
+              }
+            },
+            "default": []
+          },
+          {
+            "name": "variable",
+            "type": [
+              "null",
+              {
+                "type": "record",
+                "name": "VariableContract",
+                "namespace": "com.tme.ev.chargingplatform",
+                "fields": [
+                  {
+                    "name": "country_id",
+                    "type": "string",
+                    "default": ""
+                  }
+                ]
+              }
+            ],
+            "default": null
+          },
+          {
+            "name": "flat_unit_rate",
+            "type": [
+              "null",
+              "string"
+            ],
+            "default": null
+          },
+          {
+            "name": "timezone",
+            "type": "string",
+            "default": ""
+          },
+          {
+            "name": "contract_id",
+            "type": "string",
+            "default": ""
+          },
+          {
+            "name": "delivery_area",
+            "type": "string",
+            "default": ""
+          }
+        ]
+      },
+      "default": {
+        "type": "",
+        "energy_supplier": "",
+        "currency": "",
+        "day_night": [],
+        "variable": null,
+        "flat_unit_rate": null,
+        "timezone": "",
+        "contract_id": "",
+        "delivery_area": ""
+      }
+    },
+    {
+      "name": "preferences",
+      "type": {
+        "type": "record",
+        "name": "SmartChargingPreferences",
+        "namespace": "com.tme.ev.chargingplatform",
+        "fields": [
+          {
+            "name": "id_wb",
+            "type": "string",
+            "default": ""
+          },
+          {
+            "name": "soc_target_dep",
+            "type": "float",
+            "default": 0
+          },
+          {
+            "name": "soc_min_dep",
+            "type": [
+              "null",
+              "float"
+            ],
+            "default": null
+          },
+          {
+            "name": "departure_date_times",
+            "type": {
+              "type": "array",
+              "items": {
+                "type": "record",
+                "name": "DepartureTime",
+                "namespace": "com.tme.ev.chargingplatform",
+                "fields": [
+                  {
+                    "name": "day_of_the_week",
+                    "type": "string",
+                    "default": ""
+                  },
+                  {
+                    "name": "date_time_dep",
+                    "type": "string",
+                    "default": ""
+                  },
+                  {
+                    "name": "local_departure_time",
+                    "type": "string",
+                    "default": ""
+                  }
+                ]
+              }
+            },
+            "default": []
+          },
+          {
+            "name": "timezone",
+            "type": "string",
+            "default": ""
+          }
+        ]
+      },
+      "default": {
+        "id_wb": "",
+        "soc_target_dep": 0,
+        "soc_min_dep": null,
+        "departure_date_times": [],
+        "timezone": ""
+      }
+    },
+    {
+      "name": "address",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "Address",
+          "namespace": "com.tme.ev.chargingplatform",
+          "fields": [
+            {
+              "name": "country_code",
+              "type": "string",
+              "default": ""
+            },
+            {
+              "name": "postal_code",
+              "type": "string",
+              "default": ""
+            },
+            {
+              "name": "street_name",
+              "type": "string",
+              "default": ""
+            },
+            {
+              "name": "street_number",
+              "type": "string",
+              "default": ""
+            },
+            {
+              "name": "city",
+              "type": "string",
+              "default": ""
+            },
+            {
+              "name": "location_name",
+              "type": [
+                "null",
+                "string"
+              ],
+              "default": null
+            }
+          ]
+        }
+      ],
+      "default": null
+    },
+    {
+      "name": "coordinates",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "Coordinates",
+          "namespace": "com.tme.ev.chargingplatform",
+          "fields": [
+            {
+              "name": "latitude",
+              "type": "double",
+              "default": 0
+            },
+            {
+              "name": "longitude",
+              "type": "double",
+              "default": 0
+            }
+          ]
+        }
+      ],
+      "default": null
+    }
+  ]
+}

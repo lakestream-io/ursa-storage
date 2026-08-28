@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+#
+# SPDX-FileCopyrightText: 2026 OpenLakestream contributors <https://openlakestream.org>
+# SPDX-License-Identifier: Apache-2.0
+#
+
+URSA_STORAGE_HOME=`cd $(dirname $0)/..; pwd`
+LIB_DIR=${URSA_STORAGE_HOME}/lib
+CONF_DIR=${URSA_STORAGE_HOME}/conf
+LOG_PROPERTY_FILE=${CONF_DIR}/log4j2.properties
+URSA_STORAGE_LOG_DIR=${URSA_STORAGE_LOG_DIR:-"${URSA_STORAGE_HOME}/logs"}
+DEFAULT_URSA_STORAGE_CONF=$URSA_STORAGE_HOME/conf/ursa-storage.conf
+
+# Check for the java to use
+if [[ -z $JAVA_HOME ]]; then
+    JAVA=$(which java)
+    if [ $? != 0 ]; then
+        echo "Error: JAVA_HOME not set, and no java executable found in $PATH." 1>&2
+        exit 1
+    fi
+else
+    JAVA=$JAVA_HOME/bin/java
+fi
+
+# Check ar env and load ar_env.sh
+if [ -f "$URSA_STORAGE_HOME/conf/ursa-storage-perf-env.sh" ];
+then
+    . "$URSA_STORAGE_HOME/conf/ursa-storage-perf-env.sh"
+fi
+
+add_maven_deps_to_classpath() {
+    MVN="mvn"
+    if [ "$MAVEN_HOME" != "" ]; then
+	    MVN=${MAVEN_HOME}/bin/mvn
+    fi
+
+# Need to generate classpath from maven pom. This is costly so generate it
+# and cache it. Save the file into our target dir so a mvn clean will get
+# clean it up and force us create a new one.
+    f="${URSA_STORAGE_HOME}/target/classpath.txt"
+    if [ ! -f "${f}" ]
+    then
+	    ${MVN} -f "${URSA_STORAGE_HOME}/pom.xml" dependency:build-classpath -DincludeScope=compile -Dmdep.outputFile="${f}" &> /dev/null
+    fi
+    CLASSPATH=${CLASSPATH}:`cat "${f}"`
+    for j in `ls ${URSA_STORAGE_HOME}/target/*.jar`; do
+        CLASSPATH="${CLASSPATH}:${j}"
+    done
+}
+
+if [ -d "${LIB_DIR}" ]; then
+    for lib in `ls ${LIB_DIR}`; do
+        CLASSPATH="${CLASSPATH}:${LIB_DIR}/${lib}"
+    done
+else
+    add_maven_deps_to_classpath
+fi
+
+# Start --add-opens options
+# '--add-opens' option is not supported in jdk8
+if [[ -z "$IS_JAVA_8" ]]; then
+  OPTS="$OPTS --add-opens java.base/java.io=ALL-UNNAMED --add-opens java.base/java.util.zip=ALL-UNNAMED"
+  # Netty: enable java.nio.DirectByteBuffer
+  # https://github.com/netty/netty/blob/4.1/common/src/main/java/io/netty/util/internal/PlatformDependent0.java
+  # https://github.com/netty/netty/issues/12265
+  OPTS="$OPTS --add-opens java.base/java.nio=ALL-UNNAMED --add-opens java.base/jdk.internal.misc=ALL-UNNAMED"
+  # netty.DnsResolverUtil
+  OPTS="$OPTS --add-opens java.base/sun.net=ALL-UNNAMED"
+  # JvmDefaultGCMetricsLogger & MBeanStatsGenerator
+  OPTS="$OPTS --add-opens java.management/sun.management=ALL-UNNAMED"
+  # MBeanStatsGenerator
+  OPTS="$OPTS --add-opens jdk.management/com.sun.management.internal=ALL-UNNAMED"
+  # LinuxInfoUtils
+  OPTS="$OPTS --add-opens java.base/jdk.internal.platform=ALL-UNNAMED"
+fi
+
+OPTS="${OPTS} -Dlog4j2.configurationFile=${LOG_PROPERTY_FILE}"
+
+OPTS="$OPTS $URSA_STORAGE_MEM $URSA_STORAGE_GC $URSA_STORAGE_GC_LOG $URSA_STORAGE_EXTRA_OPTS"
+
+ursa_storage_help() {
+    cat <<EOF
+Usage: ursa <command>
+where command is one of:
+    produce                 Run a producer
+    consume                 Run a consumer
+    tailing-read            Run a tailing read performance test
+
+    help                    This help message
+
+or command is the full name of a class with a defined main() method.
+
+Environment variables:
+   URSA_STORAGE_LOG_CONF               Log4j configuration file (default $DEFAULT_LOG_CONF)
+   URSA_STORAGE_EXTRA_OPTS             Extra options to be passed to the jvm
+   URSA_STORAGE_EXTRA_CLASSPATH        Add extra paths to the Ursa classpath
+
+These variable can also be set in conf/ursa-storage-perf-env.sh
+EOF
+}
+
+cd "$URSA_STORAGE_HOME"
+
+# if no args specified, show usage
+if [ $# = 0 ]; then
+    ursa_storage_help;
+    exit 1;
+fi
+
+# get arguments
+COMMAND=$1
+shift
+
+if [ ! -d "$URSA_STORAGE_LOG_DIR" ]; then
+  mkdir -p "$URSA_STORAGE_LOG_DIR"
+fi
+
+if [ -z "$URSA_STORAGE_CONF" ]; then
+    URSA_STORAGE_CONF=$DEFAULT_URSA_STORAGE_CONF
+fi
+
+if [ "$COMMAND" == "produce" ]; then
+    exec ${JAVA} -cp ${CLASSPATH} ${OPTS} io.lakestream.ursa.storage.PerformanceProducer $URSA_STORAGE_CONF $@
+elif [ "$COMMAND" == "consume" ]; then
+    exec ${JAVA} -cp ${CLASSPATH} ${OPTS} io.lakestream.ursa.storage.PerformanceConsumer $URSA_STORAGE_CONF $@
+elif [ "$COMMAND" == "tailing-read" ]; then
+    exec ${JAVA} -cp ${CLASSPATH} ${OPTS} io.lakestream.ursa.storage.PerformanceTailingRead $URSA_STORAGE_CONF $@
+elif [ "$COMMAND" == "storage" ]; then
+    exec ${JAVA} -cp ${CLASSPATH} ${OPTS} io.lakestream.ursa.storage.FileStoragePerf $@
+elif [ "$COMMAND" == "perf" ]; then
+    exec ${JAVA} -cp ${CLASSPATH} ${OPTS} io.lakestream.ursa.storage.Perf $@
+elif [ "$COMMAND" == "admin" ]; then
+    exec ${JAVA} -cp ${CLASSPATH} ${OPTS} io.lakestream.ursa.storage.admin.Admin $@
+else
+    ursa_storage_help;
+fi

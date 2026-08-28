@@ -1,0 +1,3 @@
+io.lakestream.ursa.lakehouse.v2.LakehouseIcebergTableMaterializerFactory
+io.lakestream.ursa.lakehouse.v2.LakehouseDeltaTableMaterializerFactory
+io.lakestream.ursa.lakehouse.v2.LakehouseDeltaUcTableMaterializerFactory

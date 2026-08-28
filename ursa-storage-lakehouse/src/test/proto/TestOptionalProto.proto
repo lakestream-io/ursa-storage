@@ -1,0 +1,15 @@
+/*
+ * SPDX-FileCopyrightText: 2026 OpenLakestream contributors <https://openlakestream.org>
+ * SPDX-License-Identifier: Apache-2.0
+ */
+syntax = "proto3";
+
+package io.lakestream.ursa.kafka.serde.protobuf.test;
+
+option java_package = "io.lakestream.ursa.kafka.serde.protobuf.test";
+option java_outer_classname = "TestMessageOptionalProtos";
+
+message TestMessageOptional {
+    string test_string = 1;
+    optional string test_optional_string = 2;
+}

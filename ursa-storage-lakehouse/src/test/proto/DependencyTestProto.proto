@@ -1,0 +1,18 @@
+/*
+ * SPDX-FileCopyrightText: 2026 OpenLakestream contributors <https://openlakestream.org>
+ * SPDX-License-Identifier: Apache-2.0
+ */
+syntax = "proto3";
+
+import "NestedTestProto.proto";
+import "PublicTestProto.proto";
+
+package io.lakestream.ursa.kafka.serde.protobuf.test;
+
+option java_package = "io.lakestream.ursa.kafka.serde.protobuf.test";
+
+message DependencyMessage {
+    NestedMessage nested_message = 1;
+    bool is_active = 2;
+    TestMessage test_messsage = 3;
+}

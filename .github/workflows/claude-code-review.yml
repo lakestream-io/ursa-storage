@@ -1,0 +1,58 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [labeled]
+    paths:
+      - "**/*.java"
+      - "**/pom.xml"
+      - "**/*.yml"
+      - "**/*.yaml"
+      - "**/*.conf"
+      - "**/Dockerfile"
+      - "docker-compose.yaml"
+
+jobs:
+  claude-review:
+    if: github.event.label.name == 'claude-review'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+      issues: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Claude Code Review
+        id: claude-review
+        uses: anthropics/claude-code-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+          model: "claude-opus-5"
+
+          direct_prompt: |
+            Read CLAUDE.md at the repo root for project context and conventions.
+
+            Review this pull request focusing on:
+            1. Code quality, Java 17 best practices, and Lakestream coding standards (see CLAUDE.md)
+            2. Thread safety in storage operations, proper resource management
+            3. Performance for large-scale data operations
+            4. No hardcoded credentials, secure configuration
+            5. Test coverage for new functionality
+
+            Be constructive — this is critical distributed-storage infrastructure.
+
+          use_sticky_comment: true
+
+          allowed_tools: |
+            Bash(mvn *),
+            Bash(docker compose *),
+            Bash(git *),
+            Bash(find *),
+            Bash(wc *)

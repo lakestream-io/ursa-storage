@@ -1,0 +1,65 @@
+{
+  "type": "record",
+  "name": "AllTypesRecord",
+  "namespace": "io.lakestream.avro",
+  "fields": [
+    { "name": "a_boolean",    "type": "boolean" },
+    { "name": "a_int",        "type": "int" },
+    { "name": "a_long",       "type": "long" },
+    { "name": "a_float",      "type": "float" },
+    { "name": "a_double",     "type": "double" },
+    { "name": "a_bytes",      "type": "bytes" },
+    { "name": "a_string",     "type": "string" },
+
+    {
+      "name": "a_enum",
+      "type": {
+        "type": "enum",
+        "name": "Color",
+        "symbols": ["RED", "GREEN", "BLUE"]
+      }
+    },
+
+    {
+      "name": "a_array",
+      "type": {
+        "type": "array",
+        "items": "string"
+      }
+    },
+
+    {
+      "name": "a_map",
+      "type": {
+        "type": "map",
+        "values": "long"
+      }
+    },
+
+    {
+      "name": "a_union",
+      "type": ["null", "int"],
+      "default": null
+    },
+
+    {
+      "name": "a_fixed",
+      "type": {
+        "type": "fixed",
+        "name": "Fixed16",
+        "size": 16
+      }
+    },
+
+    {
+      "name": "a_nested_record",
+      "type": {
+        "type": "record",
+        "name": "NestedRecord",
+        "fields": [
+          { "name": "nested_field", "type": "string" }
+        ]
+      }
+    }
+  ]
+}

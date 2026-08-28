@@ -1,0 +1,98 @@
+#
+# SPDX-FileCopyrightText: 2026 OpenLakestream contributors <https://openlakestream.org>
+# SPDX-License-Identifier: Apache-2.0
+#
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-ursa
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ursa-storage-performance
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: benchmark
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: ursa-storage-performance
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: metrics
+      port: 9464
+      targetPort: metrics
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Release.Name }}-ursa
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ursa-storage-performance
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: benchmark
+spec:
+  serviceName: {{ .Release.Name }}-ursa
+  replicas: {{ .Values.ursa.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ursa-storage-performance
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      annotations:
+        prometheus.io/path: /metrics
+        prometheus.io/port: "9464"
+        prometheus.io/scrape: "true"
+      labels:
+        app.kubernetes.io/name: ursa-storage-performance
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: benchmark
+    spec:
+      containers:
+        - name: ursa
+          image: "{{ .Values.ursa.image.repository }}:{{ default .Chart.AppVersion .Values.ursa.image.tag }}"
+          imagePullPolicy: {{ .Values.ursa.image.pullPolicy }}
+          resources:
+            {{ .Values.ursa.resources | toYaml | nindent 12 }}
+          workingDir: /opt/ursa
+          command: ["sh", "-c"]
+          args:
+            - >
+              trap : TERM INT; sleep infinity & wait
+          ports:
+            - name: metrics
+              containerPort: 9464
+          env:
+            - name: URSA_STORAGE_CONF
+              value: /opt/ursa/conf/ursa-storage.conf
+            {{ .Values.ursa.env | toYaml | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /opt/ursa/conf/ursa-storage.conf
+              subPath: ursa-storage.conf
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/ursa
+      volumes:
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-ursa-config
+        {{- if not .Values.ursa.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.ursa.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        {{- if .Values.ursa.persistence.storageClassName }}
+        storageClassName: {{ .Values.ursa.persistence.storageClassName | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.ursa.persistence.size }}
+  {{- end }}

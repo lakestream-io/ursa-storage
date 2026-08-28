@@ -1,0 +1,29 @@
+/*
+ * SPDX-FileCopyrightText: 2026 OpenLakestream contributors <https://openlakestream.org>
+ * SPDX-License-Identifier: Apache-2.0
+ */
+syntax = "proto3";
+
+option java_package = "io.lakestream.ursa.lakehouse.utils";
+option java_outer_classname = "TestProtoVariant";
+
+import "google/protobuf/descriptor.proto";
+
+/*
+ * Fake custom option just to inject "variant" into unknown fields.
+ * We don't need to fully register it — unknown field parsing is enough.
+ */
+extend google.protobuf.FieldOptions {
+  string logical_type = 1001;
+}
+
+message TestMessage {
+  // repeated list
+  repeated string tags = 1 [(logical_type) = "variant"];
+
+  // map field (compiled as repeated MapEntry message)
+  map<string, int32> attributes = 2 [(logical_type) = "variant"];
+  int32 id = 3;
+  string name = 4;
+  int64 zip_code = 5 [(logical_type) = "variant"];
+}

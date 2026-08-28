@@ -1,0 +1,99 @@
+/*
+ * SPDX-FileCopyrightText: 2026 OpenLakestream contributors <https://openlakestream.org>
+ * SPDX-License-Identifier: Apache-2.0
+ */
+syntax = "proto3";
+
+package io.lakestream.ursa.lakehouse.v2.serde.iceberg.test;
+
+option java_package = "io.lakestream.ursa.lakehouse.v2.serde.iceberg.test";
+option java_outer_classname = "TestProtoMessages";
+
+// Enum for testing enum conversion
+enum Status {
+  UNKNOWN = 0;
+  ACTIVE = 1;
+  INACTIVE = 2;
+  PENDING = 3;
+}
+
+// Nested message for testing MESSAGE type conversion
+message Address {
+  string street = 1;
+  string city = 2;
+  string state = 3;
+  string zip_code = 4;
+  string country = 5;
+}
+
+// Contact information for nested message arrays
+message Contact {
+  string type = 1;  // email, phone, etc.
+  string value = 2;
+}
+
+// Main comprehensive test message covering all protobuf types
+message ComprehensiveTestMessage {
+  // INT32 types - all variations
+  int32 int32_field = 1;
+  uint32 uint32_field = 2;
+  sint32 sint32_field = 3;
+  fixed32 fixed32_field = 4;
+  sfixed32 sfixed32_field = 5;
+
+  // INT64 types - all variations
+  int64 int64_field = 6;
+  uint64 uint64_field = 7;
+  sint64 sint64_field = 8;
+  fixed64 fixed64_field = 9;
+  sfixed64 sfixed64_field = 10;
+
+  // Floating point types
+  float float_field = 11;
+  double double_field = 12;
+
+  // Boolean type
+  bool bool_field = 13;
+
+  // String type
+  string string_field = 14;
+
+  // Bytes type
+  bytes bytes_field = 15;
+
+  // Enum type
+  Status status_field = 16;
+
+  // Message type (nested)
+  Address address_field = 17;
+
+  // Repeated fields for all types
+  repeated int32 repeated_int32_field = 18;
+  repeated uint32 repeated_uint32_field = 19;
+  repeated sint32 repeated_sint32_field = 20;
+  repeated fixed32 repeated_fixed32_field = 21;
+  repeated sfixed32 repeated_sfixed32_field = 22;
+
+  repeated int64 repeated_int64_field = 23;
+  repeated uint64 repeated_uint64_field = 24;
+  repeated sint64 repeated_sint64_field = 25;
+  repeated fixed64 repeated_fixed64_field = 26;
+  repeated sfixed64 repeated_sfixed64_field = 27;
+
+  repeated float repeated_float_field = 28;
+  repeated double repeated_double_field = 29;
+
+  repeated bool repeated_bool_field = 30;
+  repeated string repeated_string_field = 31;
+  repeated bytes repeated_bytes_field = 32;
+  repeated Status repeated_status_field = 33;
+  repeated Address repeated_address_field = 34;
+  repeated Contact repeated_contact_field = 35;
+}
+
+// Simple test message for basic scenarios
+message SimpleTestMessage {
+  string name = 1;
+  int32 age = 2;
+  bool active = 3;
+}

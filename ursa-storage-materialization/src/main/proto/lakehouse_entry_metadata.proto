@@ -1,0 +1,25 @@
+/*
+ * SPDX-FileCopyrightText: 2026 OpenLakestream contributors <https://openlakestream.org>
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+syntax = "proto3";
+package materialization.proto;
+
+option java_multiple_files = true;
+option java_package = "io.lakestream.ursa.materialization.serde.proto";
+
+message EntryHeader {
+  optional int64 offset = 1;
+  optional int32 numberOfMessages = 2;
+  optional int64 writtenTimestamp = 3;
+  optional int32 entrySize = 4;
+  optional int64 cumulativeSize = 5;
+}
+
+message LakehouseEntryMetadata {
+  // Never reuse fields 1 and 3: persisted metadata must remain forward/backward parseable.
+  reserved 1, 3;
+  optional EntryHeader entryHeader = 2;
+  optional int64 schemaVersion = 4;
+}

@@ -1,0 +1,25 @@
+#
+# SPDX-FileCopyrightText: 2026 OpenLakestream contributors <https://openlakestream.org>
+# SPDX-License-Identifier: Apache-2.0
+#
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-ursa-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ursa-storage-performance
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: benchmark
+data:
+  ursa-storage.conf: |
+    backendStorageType={{ .Values.ursa.config.backendStorageType }}
+    {{- with .Values.ursa.config.storagePath }}
+    storagePath={{ . }}
+    {{- end }}
+    {{- range $key, $value := .Values.ursa.config.extraProperties }}
+    {{ $key }}={{ $value }}
+    {{- end }}
+    metadataStoreUrl=oxia://{{ $.Release.Name }}-oxia.{{ $.Release.Namespace }}.svc.cluster.local:6648/default
+    oxiaStorageUrl=oxia://{{ $.Release.Name }}-oxia.{{ $.Release.Namespace }}.svc.cluster.local:6648/default
