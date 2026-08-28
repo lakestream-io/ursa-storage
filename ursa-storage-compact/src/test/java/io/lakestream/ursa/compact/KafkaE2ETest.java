@@ -11,8 +11,8 @@ import io.lakestream.ursa.compaction.CompactionManager;
 import io.lakestream.ursa.compaction.OxiaCompactTaskManager;
 import io.lakestream.ursa.compaction.task.PreparedCompactStreamTask;
 import io.lakestream.ursa.lakehouse.LakehouseConfiguration;
+import io.lakestream.ursa.lakehouse.compact.KafkaEntryProcessFactory;
 import io.lakestream.ursa.lakehouse.iceberg.IcebergTable;
-import io.lakestream.ursa.lakehouse.utils.TopicNames;
 import io.lakestream.ursa.storage.impl.StorageConfig;
 import io.lakestream.ursa.test.containers.util.KafkaStandalone;
 import io.lakestream.ursa.test.containers.util.StaticVariables;
@@ -23,6 +23,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedList;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.UUID;
@@ -31,6 +32,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.RandomStringUtils;
 import org.apache.iceberg.data.IcebergGenerics;
 import org.apache.iceberg.data.Record;
+import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.junit.jupiter.api.AfterAll;
@@ -118,6 +120,12 @@ public class KafkaE2ETest {
         }
         producer.flush();
 
+        String sourceTopicId;
+        try (var admin = Admin.create(kafkaStandalone.connProps())) {
+            sourceTopicId = admin.describeTopics(List.of(topic)).allTopicNames().get()
+                    .get(topic).topicId().toString();
+        }
+
         CompactionManager manager = new CompactionManager(compactionScheduler.getCompactTaskManager());
 
         var task = new PreparedCompactStreamTask();
@@ -128,16 +136,19 @@ public class KafkaE2ETest {
         task.setEndOffset(Math.addExact(offsets.getLast(), 1L));
         task.setProperties(Map.of(
                 "entryFormat", "KAFKA",
-                "entrySerDeType", "KAFKA_BATCHED_RAW_PARQUET"));
+                "entrySerDeType", "KAFKA_BATCHED_RAW_PARQUET",
+                KafkaEntryProcessFactory.SOURCE_TOPIC_PROPERTY, topic + "-partition-0",
+                KafkaEntryProcessFactory.SOURCE_TOPIC_ID_PROPERTY, sourceTopicId,
+                KafkaEntryProcessFactory.SOURCE_SCHEMA_TOPIC_PROPERTY, topic));
         task.setTaskName(UUID.randomUUID().toString());
         task.setStatus(PreparedCompactStreamTask.INIT);
         manager.publishTask(task);
+        var compactTaskKey = OxiaCompactTaskManager.buildSubTaskKey(task.toCompactStreamTask());
 
-        waitingForCompactTaskCompleteForTopic(canonicalTopic);
-
-        var icebergTable = getIcebergTable(topic);
-        icebergTable.loadTable();
-        var records = IcebergGenerics.read(icebergTable.getTable()).build();
+        @Cleanup var icebergTable = getIcebergTable(topic);
+        waitingForIcebergRecords(icebergTable, numberOfMessages);
+        waitingForCompactTaskRemoval(compactTaskKey);
+        @Cleanup var records = IcebergGenerics.read(icebergTable.getTable()).build();
         int readCount = 0;
         for (Record record : records) {
             var key = (ByteBuffer) record.getField("__key");
@@ -158,23 +169,35 @@ public class KafkaE2ETest {
         return icebergTable;
     }
 
-    void waitingForCompactTaskCompleteForTopic(String topic) {
-        log.info("Waiting for compaction task to complete for topic {}", topic);
-        var oxiaTaskManager = (OxiaCompactTaskManager) compactionScheduler.getCompactTaskManager();
+    void waitingForIcebergRecords(IcebergTable icebergTable, int expectedCount) {
+        log.info("Waiting for {} records in Iceberg table {}", expectedCount, icebergTable.getIdentifier());
         Awaitility.await()
             .atMost(Duration.ofMinutes(3))
-            .pollDelay(Duration.ofSeconds(10))
-            .pollInterval(Duration.ofSeconds(10))
+            .pollInterval(Duration.ofSeconds(1))
             .until(() -> {
-                var tasksByTopic = oxiaTaskManager.getFirstNTasksOfTopic(100).get();
-                log.info("All tasks in the manager {}", tasksByTopic);
-                var tasks = tasksByTopic.entrySet().stream()
-                    .filter(e ->
-                        TopicNames.partitionedTopicName(e.getKey()).equals(TopicNames.partitionedTopicName(topic)))
-                    .map(Map.Entry::getValue)
-                    .toList();
-                log.info("Waiting for compaction tasks for topic {} to complete, remaining tasks: {}", topic, tasks);
-                return tasks.isEmpty();
+                if (!icebergTable.exists()) {
+                    return false;
+                }
+                icebergTable.loadTable();
+                icebergTable.getTable().refresh();
+                if (icebergTable.getTable().currentSnapshot() == null) {
+                    return false;
+                }
+                try (var records = IcebergGenerics.read(icebergTable.getTable()).build()) {
+                    int count = 0;
+                    for (Record ignored : records) {
+                        count++;
+                    }
+                    return count == expectedCount;
+                }
             });
+    }
+
+    void waitingForCompactTaskRemoval(String compactTaskKey) {
+        var taskManager = (OxiaCompactTaskManager) compactionScheduler.getCompactTaskManager();
+        Awaitility.await()
+            .atMost(Duration.ofSeconds(30))
+            .pollInterval(Duration.ofMillis(200))
+            .until(() -> taskManager.getCompactStreamTask(compactTaskKey).get() == null);
     }
 }

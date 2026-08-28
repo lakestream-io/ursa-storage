@@ -597,27 +597,27 @@ public class IcebergTableTest {
     public void testFormatS3TableName() {
         assertThrows(IllegalArgumentException.class, () -> TableNameFormatUtils.formatS3TableName(""));
         assertThrows(IllegalArgumentException.class, () -> TableNameFormatUtils.formatS3TableName(null));
-        assertEquals(TableNameFormatUtils.formatS3TableName("test"), "test");
-        assertEquals(TableNameFormatUtils.formatS3TableNamespaceName("public/default"), "public___default");
-        assertEquals(TableNameFormatUtils.formatS3TableNamespaceName("public/default/"), "public___default");
-        assertEquals(TableNameFormatUtils.formatS3TableName("default/test.v1-v2-partition-0"),
-            "persistent__________public___default___test_v1__v2__partition__0");
-        assertEquals(TableNameFormatUtils.formatS3TableName("test.v1"), "test_v1");
-        assertEquals(TableNameFormatUtils.formatS3TableName("test.v1.v2"), "test_v1_v2");
-        assertEquals(TableNameFormatUtils.formatS3TableName("test:8080"), "test____8080");
+        assertEquals("test", TableNameFormatUtils.formatS3TableName("test"));
+        assertEquals("public___default", TableNameFormatUtils.formatS3TableNamespaceName("public/default"));
+        assertEquals("public___default", TableNameFormatUtils.formatS3TableNamespaceName("public/default/"));
+        assertEquals("default___test_v1__v2__partition__0",
+            TableNameFormatUtils.formatS3TableName("default/test.v1-v2-partition-0"));
+        assertEquals("test_v1", TableNameFormatUtils.formatS3TableName("test.v1"));
+        assertEquals("test_v1_v2", TableNameFormatUtils.formatS3TableName("test.v1.v2"));
+        assertEquals("test____8080", TableNameFormatUtils.formatS3TableName("test:8080"));
         // Test cases with uppercase letters - uppercase should be converted to lowercase with underscore suffix
-        assertEquals(TableNameFormatUtils.formatS3TableName("Test"), "t_est");
-        assertEquals(TableNameFormatUtils.formatS3TableName("TEST"), "t_e_s_t");
-        assertEquals(TableNameFormatUtils.formatS3TableName("TestCase"), "t_estc_ase");
-        assertEquals(TableNameFormatUtils.formatS3TableName("public/default/Test"), "public___default___t_est");
-        assertEquals(TableNameFormatUtils.formatS3TableName("public/default/test"), "public___default___test");
-        assertEquals(TableNameFormatUtils.formatS3TableName("MyTable"), "m_yt_able");
-        assertEquals(TableNameFormatUtils.formatS3TableName("MyTableName"), "m_yt_ablen_ame");
+        assertEquals("t_est", TableNameFormatUtils.formatS3TableName("Test"));
+        assertEquals("t_e_s_t", TableNameFormatUtils.formatS3TableName("TEST"));
+        assertEquals("t_estc_ase", TableNameFormatUtils.formatS3TableName("TestCase"));
+        assertEquals("public___default___t_est", TableNameFormatUtils.formatS3TableName("public/default/Test"));
+        assertEquals("public___default___test", TableNameFormatUtils.formatS3TableName("public/default/test"));
+        assertEquals("m_yt_able", TableNameFormatUtils.formatS3TableName("MyTable"));
+        assertEquals("m_yt_ablen_ame", TableNameFormatUtils.formatS3TableName("MyTableName"));
         // Test edge cases
-        assertEquals(TableNameFormatUtils.formatS3TableName("ABC"), "a_b_c");
-        assertEquals(TableNameFormatUtils.formatS3TableName("AbC"), "a_bc");
-        assertEquals(TableNameFormatUtils.formatS3TableName("aBC"), "ab_c");
-        assertEquals(TableNameFormatUtils.formatS3TableName("abc"), "abc");
+        assertEquals("a_b_c", TableNameFormatUtils.formatS3TableName("ABC"));
+        assertEquals("a_bc", TableNameFormatUtils.formatS3TableName("AbC"));
+        assertEquals("ab_c", TableNameFormatUtils.formatS3TableName("aBC"));
+        assertEquals("abc", TableNameFormatUtils.formatS3TableName("abc"));
     }
 
     @Test

@@ -8,6 +8,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anySet;
+import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -106,6 +107,9 @@ public class AsyncCleanerTest {
         AsyncCleaner asyncCleaner = spy(new AsyncCleaner(spyStorageApi, walStorage,
             ursaStorageTestBase.getConfig().getUrsaConfig()));
 
+        // Locking is covered by testLock. Avoid coupling this cleanup test to Oxia request timing under load.
+        doNothing().when(asyncCleaner).lock();
+        doNothing().when(asyncCleaner).unlock();
         when(asyncCleaner.getLastDeletedPosition()).thenReturn(CompletableFuture.completedFuture(
                 "2024/03/15/06/01/01/01__dummy"));
 

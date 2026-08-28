@@ -152,14 +152,12 @@ public class KafkaStandalone extends GenericContainer<KafkaStandalone> {
      */
     private static class SchemaRegistryContainer extends GenericContainer<SchemaRegistryContainer> {
         private static final int REGISTRY_PORT = 8081;
-        private final int hostPort;
 
         public SchemaRegistryContainer(Network network, String bootstrapServers) {
             super(DockerImageName.parse("confluentinc/cp-schema-registry:7.5.0"));
-            this.hostPort = PortManager.nextLockedFreePort();
 
             withNetwork(network);
-            addFixedExposedPort(hostPort, REGISTRY_PORT);
+            withExposedPorts(REGISTRY_PORT);
 
             withEnv("SCHEMA_REGISTRY_HOST_NAME", "schema-registry");
             withEnv("SCHEMA_REGISTRY_LISTENERS", "http://0.0.0.0:8081");
@@ -177,13 +175,7 @@ public class KafkaStandalone extends GenericContainer<KafkaStandalone> {
         }
 
         public String getUrl() {
-            return String.format("http://%s:%d", getHost(), hostPort);
-        }
-
-        @Override
-        public void stop() {
-            super.stop();
-            PortManager.releaseLockedPort(hostPort);
+            return String.format("http://%s:%d", getHost(), getMappedPort(REGISTRY_PORT));
         }
     }
 }

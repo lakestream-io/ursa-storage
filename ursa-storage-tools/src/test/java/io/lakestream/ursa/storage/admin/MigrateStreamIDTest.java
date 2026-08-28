@@ -18,6 +18,7 @@ import io.oxia.client.api.GetResult;
 import io.oxia.client.api.options.PutOption;
 import io.oxia.testcontainers.OxiaContainer;
 import java.nio.charset.StandardCharsets;
+import java.util.Map;
 import java.util.Set;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -44,11 +45,13 @@ public class MigrateStreamIDTest {
     }
 
     @Test
-    void shouldMigrateLegacyStreamIdEntries() throws Exception {
-        final String key = "streams/test";
-        final long streamId = 123L;
-        final String generatorKey = StorageFormat.STREAM_ID_GENERATOR_PATH + "/" + key;
-        final String registerKey = StorageFormat.STREAM_REGISTER_PATH + "/" + streamId;
+    void shouldMigrateOpaqueStreamIdEntries() throws Exception {
+        final Map<String, Long> streamIdsByKey = Map.of(
+                "test", 120L,
+                "streams/test", 121L,
+                "tenant/namespace/test", 122L,
+                "public/default/persistent/test", 123L,
+                "organization/team/namespace/category/stream", 124L);
 
         StorageConfig config = new StorageConfig();
         config.setBackendStorageType("local");
@@ -59,23 +62,32 @@ public class MigrateStreamIDTest {
             var storageApi = ursaStorage.getDefaultStorageApi();
             AsyncOxiaClient oxiaClient = storageApi.getStorageOxiaClient();
 
-            oxiaClient.put(generatorKey,
-                            Long.toString(streamId).getBytes(StandardCharsets.UTF_8),
-                            Set.of(PutOption.PartitionKey(StorageFormat.STREAM_ID_GENERATOR_PATH)))
-                    .join();
-
-            oxiaClient.put(registerKey, new byte[0]).join();
+            for (var entry : streamIdsByKey.entrySet()) {
+                var generatorKey = StorageFormat.STREAM_ID_GENERATOR_PATH + "/" + entry.getKey();
+                oxiaClient.put(generatorKey,
+                                Long.toString(entry.getValue()).getBytes(StandardCharsets.UTF_8),
+                                Set.of(PutOption.PartitionKey(StorageFormat.STREAM_ID_GENERATOR_PATH)))
+                        .join();
+                oxiaClient.put(StorageFormat.STREAM_REGISTER_PATH + "/" + entry.getValue(), new byte[0]).join();
+            }
+            oxiaClient.put(
+                    "/unrelated/key",
+                    "not-a-stream-id".getBytes(StandardCharsets.UTF_8),
+                    Set.of(PutOption.PartitionKey(StorageFormat.STREAM_ID_GENERATOR_PATH))).join();
 
             MigrateStreamID migrateStreamID = new MigrateStreamID();
             int result = migrateStreamID.execute(storageApi);
             assertEquals(0, result);
 
-            GetResult resultGet = oxiaClient.get(registerKey).join();
-            assertNotNull(resultGet);
+            for (var entry : streamIdsByKey.entrySet()) {
+                var registerKey = StorageFormat.STREAM_REGISTER_PATH + "/" + entry.getValue();
+                GetResult resultGet = oxiaClient.get(registerKey).join();
+                assertNotNull(resultGet);
 
-            StreamProperties properties = UrsaObjectMapperFactory.getMapper()
-                    .readValue(resultGet.value(), StreamProperties.class);
-            assertEquals(key, properties.key());
+                StreamProperties properties = UrsaObjectMapperFactory.getMapper()
+                        .readValue(resultGet.value(), StreamProperties.class);
+                assertEquals(entry.getKey(), properties.key());
+            }
         }
     }
 }

@@ -297,9 +297,9 @@ public class ObjectPoolTest {
         ObjectPool.PooledObject<TestObject> borrowed2 = shortTimeoutPool.borrow("key2");
 
         shortTimeoutPool.release(borrowed1, false);
-        Thread.sleep(100);
         shortTimeoutPool.release(borrowed2, false);
-        Thread.sleep(150);
+        Thread.sleep(250);
+        borrowed2.updateLastUsed();
 
         shortTimeoutPool.evictIdle();
 

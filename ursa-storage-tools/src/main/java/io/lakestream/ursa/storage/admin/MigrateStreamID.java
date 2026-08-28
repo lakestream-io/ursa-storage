@@ -9,24 +9,24 @@ import com.fasterxml.jackson.databind.ObjectWriter;
 import io.lakestream.ursa.json.UrsaObjectMapperFactory;
 import io.lakestream.ursa.storage.StorageApi;
 import io.lakestream.ursa.storage.StreamProperties;
-import io.lakestream.ursa.storage.Utils;
 import io.lakestream.ursa.storage.impl.StorageFormat;
-import io.lakestream.ursa.storage.impl.utils.RangeScanConsumerImpl;
 import io.lakestream.ursa.utils.FutureUtils;
 import io.oxia.client.api.AsyncOxiaClient;
+import io.oxia.client.api.GetResult;
+import io.oxia.client.api.RangeScanConsumer;
 import io.oxia.client.api.exceptions.UnexpectedVersionIdException;
 import io.oxia.client.api.options.PutOption;
 import io.oxia.client.api.options.RangeScanOption;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
-import java.util.stream.Collectors;
 import picocli.CommandLine;
 
 /**
@@ -47,24 +47,48 @@ public class MigrateStreamID implements Callable<Integer> {
     private Admin parent;
 
     private Map<String, Long> getKeyToStreamIdMap(AsyncOxiaClient oxiaClient) {
-        var key  = StorageFormat.STREAM_ID_GENERATOR_PATH + "/";
-        var rangeScan = new RangeScanConsumerImpl();
+        var keyPrefix = StorageFormat.STREAM_ID_GENERATOR_PATH + "/";
+        var keyToStreamIdMap = new HashMap<String, Long>();
+        var scanFuture = new CompletableFuture<Map<String, Long>>();
 
-        var keyRange = Utils.generateKeyRange(key, 4);
-
+        // In hierarchical namespaces, descendants at different slash depths are not contiguous.
+        // Empty bounds scan all user keys in the routed shard. Filter while streaming so client
+        // memory is bounded by the number of stream mappings rather than all records in the shard.
         oxiaClient.rangeScan(
-                keyRange.getLeft(),
-                keyRange.getRight(),
-                rangeScan,
-                Set.of(RangeScanOption.PartitionKey(StorageFormat.STREAM_ID_GENERATOR_PATH)));
+                "",
+                "",
+                new RangeScanConsumer() {
+                    @Override
+                    public synchronized boolean onNext(GetResult result) {
+                        if (!result.key().startsWith(keyPrefix)) {
+                            return true;
+                        }
+                        try {
+                            var key = result.key().substring(keyPrefix.length());
+                            var streamId = Long.parseLong(new String(result.value(), StandardCharsets.UTF_8));
+                            var previousStreamId = keyToStreamIdMap.putIfAbsent(key, streamId);
+                            if (previousStreamId != null && previousStreamId.longValue() != streamId) {
+                                throw new IllegalStateException("Conflicting stream IDs for key " + key);
+                            }
+                            return true;
+                        } catch (RuntimeException error) {
+                            scanFuture.completeExceptionally(error);
+                            return false;
+                        }
+                    }
 
-        return rangeScan.getFuture().thenApply(results ->
-                results.stream()
-                        .collect(Collectors.toMap(
-                                r -> r.key().substring(key.length()),
-                                r -> Long.parseLong(new String(r.value(), StandardCharsets.UTF_8))
-                        ))
-        ).join();
+                    @Override
+                    public synchronized void onError(Throwable error) {
+                        scanFuture.completeExceptionally(error);
+                    }
+
+                    @Override
+                    public synchronized void onCompleted() {
+                        scanFuture.complete(keyToStreamIdMap);
+                    }
+                },
+                Set.of(RangeScanOption.PartitionKey(StorageFormat.STREAM_ID_GENERATOR_PATH)));
+        return scanFuture.join();
     }
 
     private final ObjectReader streamPropertiesReader =
