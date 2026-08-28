@@ -152,6 +152,8 @@
       --add-opens java.base/java.util.concurrent=ALL-UNNAMED
       --add-opens java.sql/java.sql=ALL-UNNAMED
       -Dotel.metrics.exporter=none
+      -Dotel.traces.exporter=none
+      -Dotel.logs.exporter=none
       -Dursa.compaction.disable.instance.admin=true
     </test.additional.args>
   </properties>
