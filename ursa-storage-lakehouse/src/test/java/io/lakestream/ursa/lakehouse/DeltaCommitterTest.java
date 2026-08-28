@@ -732,7 +732,9 @@ class DeltaCommitterTest {
         //The table is created by the old kernel.
         //The table schema {id, name, age, location{x,y}}
         String topic = "test_topic";
-        Path sourceTablePath = Path.of("src/test/resources/test_delta_table");
+        // The legacy fixture includes the Pulsar tenant directory; use the contents
+        // below that tenant as the storage root for this unqualified topic.
+        Path sourceTablePath = Path.of("src/test/resources/test_delta_table/public");
         Path testTablePath = path.resolve("test_delta_table_" + softDeleteEnabled);
         copyDirectory(sourceTablePath, testTablePath);
         String location = testTablePath.toString();

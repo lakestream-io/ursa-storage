@@ -69,6 +69,11 @@
       <scope>test</scope>
     </dependency>
     <dependency>
+      <groupId>io.github.oxia-db</groupId>
+      <artifactId>oxia-client</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
       <groupId>org.projectlombok</groupId>
       <artifactId>lombok</artifactId>
       <scope>provided</scope>

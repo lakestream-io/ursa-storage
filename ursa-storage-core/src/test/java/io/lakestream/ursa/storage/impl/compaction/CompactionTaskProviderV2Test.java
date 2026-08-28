@@ -377,7 +377,7 @@ class CompactionTaskProviderV2Test {
 
     @Test
     @Timeout(10)
-    void testConcurrentQuarantineAndGetTask() throws Exception {
+    void testConcurrentGetTaskSkipsQuarantinedTasks() throws Exception {
         // Given
         provider = new CompactionTaskProviderV2(taskManager, compactionMetrics, 1000, 50.0);
 
@@ -393,9 +393,10 @@ class CompactionTaskProviderV2Test {
                 .when(taskManager).getCompactStreamTask("sub" + i);
         }
 
-        // When - one thread quarantines while others get tasks
+        // When - quarantine known tasks before the concurrent getters start
         ExecutorService executor = Executors.newFixedThreadPool(5);
         CountDownLatch doneLatch = new CountDownLatch(5);
+        CountDownLatch quarantineComplete = new CountDownLatch(1);
         List<PackagedCompactStreamTask> retrievedTasks = new ArrayList<>();
 
         // Quarantine thread
@@ -408,15 +409,17 @@ class CompactionTaskProviderV2Test {
             } catch (Exception e) {
                 e.printStackTrace();
             } finally {
+                quarantineComplete.countDown();
                 doneLatch.countDown();
             }
         });
+
+        assertTrue(quarantineComplete.await(5, TimeUnit.SECONDS), "Timed out quarantining tasks");
 
         // Get task threads
         for (int i = 0; i < 4; i++) {
             executor.submit(() -> {
                 try {
-                    Thread.sleep(50); // Let some quarantine happen first
                     PackagedCompactStreamTask task = provider.getTask();
                     if (task != null) {
                         synchronized (retrievedTasks) {
@@ -431,10 +434,11 @@ class CompactionTaskProviderV2Test {
             });
         }
 
-        doneLatch.await(5, TimeUnit.SECONDS);
+        assertTrue(doneLatch.await(5, TimeUnit.SECONDS), "Timed out getting tasks");
         executor.shutdown();
 
         // Then - should not get any quarantined tasks
+        assertEquals(4, retrievedTasks.size(), "Each getter should retrieve a task");
         for (PackagedCompactStreamTask task : retrievedTasks) {
             int taskNum = Integer.parseInt(task.getTaskName().replace("task", ""));
             assertTrue(taskNum >= 5, "Got quarantined task: " + task.getTaskName());

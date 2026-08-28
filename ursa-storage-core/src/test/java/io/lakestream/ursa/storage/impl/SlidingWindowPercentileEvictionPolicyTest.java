@@ -29,7 +29,7 @@ public class SlidingWindowPercentileEvictionPolicyTest {
     int windowSize = 10;
     int cacheSize = 20;
     int percentileComputeDelayInMillis = 100;
-    int stalePercentileDelayFactor = 2;
+    int stalePercentileDelayFactor = 10;
     int entryCount = 3;
     LoadingCache<String, CompletableFuture<PersistCache>> cache;
     SlidingWindowPercentileEvictionPolicy target;
@@ -100,6 +100,11 @@ public class SlidingWindowPercentileEvictionPolicyTest {
         }
     }
 
+    void calculatePercentiles() throws InterruptedException {
+        Thread.sleep((long) percentileComputeDelayInMillis * stalePercentileDelayFactor * 2 + 50);
+        target.onLoad("cleanup-trigger");
+    }
+
     @Test
     public void test_eviction() throws Exception {
 
@@ -108,6 +113,7 @@ public class SlidingWindowPercentileEvictionPolicyTest {
             fill(i);
         }
 
+        calculatePercentiles();
         int evicted = target.tryEvict(cache, cacheSize).join();
         assertThat(evicted > 0).isTrue();
     }
@@ -141,7 +147,8 @@ public class SlidingWindowPercentileEvictionPolicyTest {
             fill(i);
         }
 
-        Thread.sleep(percentileComputeDelayInMillis * stalePercentileDelayFactor);
+        calculatePercentiles();
+        Thread.sleep((long) percentileComputeDelayInMillis * stalePercentileDelayFactor + 50);
         int evicted = target.tryEvict(cache, cacheSize).join();
         assertThat(evicted).isZero();
     }
