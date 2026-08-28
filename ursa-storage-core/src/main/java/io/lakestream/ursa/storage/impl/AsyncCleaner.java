@@ -80,8 +80,13 @@ public class AsyncCleaner implements Runnable {
     @VisibleForTesting
     void cleanup() {
         log.info("Start to clean up the WAL log files.");
+        // lock() uses IfRecordDoesNotExist, so it throws when another node already holds the lock.
+        // Only release the lock if this node actually took it - unlocking unconditionally in the
+        // finally block would delete the holder's record and break mutual exclusion.
+        boolean lockAcquired = false;
         try {
             lock();
+            lockAcquired = true;
             Set<Long> streams = storageApi.listStreams().get();
             log.info("Start to calculate the next delete position from {} streams.", streams.size());
             String nextDelete = null;
@@ -123,7 +128,9 @@ public class AsyncCleaner implements Runnable {
         } catch (Exception e) {
             log.error("Failed to process the WAL cleanup.", e);
         } finally {
-            unlock();
+            if (lockAcquired) {
+                unlock();
+            }
         }
     }
 

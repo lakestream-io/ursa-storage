@@ -171,7 +171,7 @@ public class KafkaE2ETest {
 
     void waitingForIcebergRecords(IcebergTable icebergTable, int expectedCount) {
         log.info("Waiting for {} records in Iceberg table {}", expectedCount, icebergTable.getIdentifier());
-        Awaitility.await()
+        Awaitility.await("at least " + expectedCount + " records in " + icebergTable.getIdentifier())
             .atMost(Duration.ofMinutes(3))
             .pollInterval(Duration.ofSeconds(1))
             .until(() -> {
@@ -188,7 +188,12 @@ public class KafkaE2ETest {
                     for (Record ignored : records) {
                         count++;
                     }
-                    return count == expectedCount;
+                    log.info("Iceberg table {} currently holds {} record(s)", icebergTable.getIdentifier(), count);
+                    // Wait for at least the expected count rather than exactly it. Snapshots are
+                    // append-only so the count only converges upward, and an over-count (a
+                    // duplicate-compaction regression) should fail on the assertion below with the
+                    // actual number rather than time out here with no diagnosis.
+                    return count >= expectedCount;
                 }
             });
     }

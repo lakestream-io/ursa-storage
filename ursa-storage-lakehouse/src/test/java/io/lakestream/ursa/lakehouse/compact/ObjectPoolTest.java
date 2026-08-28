@@ -296,10 +296,13 @@ public class ObjectPoolTest {
         ObjectPool.PooledObject<TestObject> borrowed1 = shortTimeoutPool.borrow("key1");
         ObjectPool.PooledObject<TestObject> borrowed2 = shortTimeoutPool.borrow("key2");
 
+        // Release borrowed2 only after the idle timeout has already elapsed for borrowed1, so the
+        // two are separated by release() itself rather than by a narrow gap between two sleeps.
+        // Do not refresh borrowed2 by calling updateLastUsed() directly: that would make the test
+        // pass even if release() stopped marking objects as recently used.
         shortTimeoutPool.release(borrowed1, false);
-        shortTimeoutPool.release(borrowed2, false);
         Thread.sleep(250);
-        borrowed2.updateLastUsed();
+        shortTimeoutPool.release(borrowed2, false);
 
         shortTimeoutPool.evictIdle();
 

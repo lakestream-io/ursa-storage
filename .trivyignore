@@ -1,0 +1,30 @@
+# Accepted CVE findings.
+#
+# The Trivy job fails the build on CRITICAL/HIGH findings (see
+# .github/workflows/pr-trivy.yml). Entries here are deliberate, reviewed
+# exceptions. Each one must record the affected package, the version that
+# fixes it, why it is not fixed yet, and an expiry date.
+#
+# Every entry below is a transitive dependency of Iceberg 1.10.0 or Confluent
+# 7.9.4. Upgrading them means overriding a version our upstreams pin, so each
+# needs its own compatibility testing rather than a blind bump.
+#
+# Review these on or before the expiry date. Do not add an entry without one.
+
+# io.airlift:aircompressor 0.27 -> fixed in 2.0.3
+# Reached via ursa-storage-lakehouse. Major-version bump; needs Iceberg/Delta
+# compression compatibility testing.
+CVE-2025-67721 exp:2026-11-30
+
+# com.squareup.wire:wire-runtime-jvm 5.5.0 -> fixed in 6.3.0
+# Reached via io.confluent:kafka-protobuf-provider:7.9.4. Major-version bump of
+# a Confluent-pinned transitive; needs protobuf schema round-trip testing.
+CVE-2026-45799 exp:2026-11-30
+
+# org.apache.httpcomponents.core5:httpcore5 5.3.4 -> fixed in 5.4.3
+# Reached via org.apache.iceberg:iceberg-core:1.10.0.
+CVE-2026-54399 exp:2026-11-30
+
+# org.apache.httpcomponents.core5:httpcore5-h2 5.3.4 -> fixed in 5.4.3
+# Reached via org.apache.iceberg:iceberg-core:1.10.0.
+CVE-2026-54428 exp:2026-11-30

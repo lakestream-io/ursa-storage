@@ -130,7 +130,7 @@ public class CompactionScheduler {
     public CompactionScheduler(StorageConfig config)
             throws Exception {
         this.config = config;
-        OpenTelemetrySdk openTelemetrySdk = AutoConfiguredOpenTelemetrySdk.initialize().getOpenTelemetrySdk();
+        OpenTelemetrySdk openTelemetrySdk = createOpenTelemetrySdk();
         this.instrumentProvider = new InstrumentProvider(openTelemetrySdk);
 
         oxiaClient = OxiaClientFactory.create(config.getMetadataStoreUrl(), config.getMetadataStoreConfig(),
@@ -179,6 +179,35 @@ public class CompactionScheduler {
                 compactTaskManager, storageOxiaClient, compactionMetrics, storageBindings.getSchemaRegistry());
         this.topicManager = storageBindings.createTopicManager();
         this.materializationService = buildMaterializationService(config, storageBindings, compactionMetrics);
+    }
+
+    /**
+     * Default every OpenTelemetry signal exporter to {@code none}.
+     *
+     * <p>This module ships the OpenTelemetry SDK and its autoconfiguration extension but no exporter
+     * artifact. Autoconfiguration defaults each signal to the OTLP exporter, so a bare
+     * {@code AutoConfiguredOpenTelemetrySdk.initialize()} throws {@code ConfigurationException} and the
+     * compaction server fails to start. System properties are overlaid last, so operators can still
+     * select an exporter with {@code -Dotel.*} once the matching artifact is on the classpath.
+     */
+    static Map<String, String> openTelemetryProperties() {
+        Map<String, String> properties = new HashMap<>();
+        properties.put("otel.metrics.exporter", "none");
+        properties.put("otel.traces.exporter", "none");
+        properties.put("otel.logs.exporter", "none");
+        for (String name : System.getProperties().stringPropertyNames()) {
+            if (name.startsWith("otel.")) {
+                properties.put(name, System.getProperty(name));
+            }
+        }
+        return properties;
+    }
+
+    private static OpenTelemetrySdk createOpenTelemetrySdk() {
+        return AutoConfiguredOpenTelemetrySdk.builder()
+                .addPropertiesSupplier(CompactionScheduler::openTelemetryProperties)
+                .build()
+                .getOpenTelemetrySdk();
     }
 
     private void initializeWithUrsaStorage(OpenTelemetrySdk openTelemetrySdk) throws Exception {
