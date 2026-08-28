@@ -113,6 +113,16 @@
         <Bug pattern="NP_NULL_ON_SOME_PATH_FROM_RETURN_VALUE,NP_NULL_ON_SOME_PATH,RCN_REDUNDANT_NULLCHECK_WOULD_HAVE_BEEN_A_NPE"/>
     </Match>
 
+    <!-- The SPI default method only throws, so SpotBugs infers a non-null return even though
+         service-loaded implementations can violate the contract. Keep the defensive check. -->
+    <Match>
+        <Class name="io.lakestream.api.ExternalStreamRegistryLoader"/>
+        <Method name="open"
+                params="java.lang.String, java.util.Properties, java.lang.ClassLoader"
+                returns="io.lakestream.api.ExternalStreamRegistry"/>
+        <Bug pattern="RCN_REDUNDANT_NULLCHECK_OF_NONNULL_VALUE"/>
+    </Match>
+
     <!-- ================================================================== -->
     <!-- Static field exposure: similar to EI_EXPOSE_REP for static fields  -->
     <!-- ================================================================== -->
