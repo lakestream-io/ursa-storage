@@ -80,7 +80,7 @@ jobs:
 
       - name: Compress .m2 Ursa Storage artifacts
         run: |
-          tar -czf m2-ursa-storage.tar.gz -C ~/.m2/repository/io/lakestream $(find ~/.m2/repository/io/lakestream -maxdepth 1 -type d \( -name 'ursa-storage*' -o -name 'lakestream*' \) -exec basename {} \;)
+          tar -czf m2-ursa-storage.tar.gz -C ~/.m2/repository/io/lakestream $(find ~/.m2/repository/io/lakestream -mindepth 1 -maxdepth 1 -type d \( -name 'ursa-storage*' -o -name 'lakestream*' \) -exec basename {} \;)
 
       - name: Upload m2 ursa-storage artifact
         uses: actions/upload-artifact@v4
