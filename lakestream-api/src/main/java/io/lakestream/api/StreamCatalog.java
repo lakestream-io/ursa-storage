@@ -236,9 +236,10 @@ public interface StreamCatalog extends AutoCloseable {
     /**
      * Idempotently registers a single partition of a stream whose underlying log was created
      * outside this catalog (for example, a stream created by an external control plane rather than through
-     * {@link #createStream}). Writes the catalog partition metadata for {@code partitionIndex} using
-     * the supplied {@code streamId}, then grows the stream config so its partition count is at least
-     * {@code partitionIndex + 1}, preserving any existing properties and materialization policy.
+     * {@link #createStream}). Grows the stream config so its partition count is at least
+     * {@code partitionIndex + 1}, preserving any existing properties and materialization policy,
+     * then creates or ownership-retags the catalog partition metadata for {@code partitionIndex}
+     * using the supplied {@code streamId}.
      *
      * <p>This lets a consumer (for example, the materialization compaction worker) resolve an
      * broker-created stream via {@link #loadStream} that would otherwise throw
@@ -270,9 +271,9 @@ public interface StreamCatalog extends AutoCloseable {
     /**
      * Deletes an externally controlled partition.
      *
-     * <p>Deletion is ordered so log data is removed before catalog metadata, and catalog metadata
-     * is removed before the keyed log-ID mapping. The operation also cleans up a keyed mapping left
-     * behind by historical writes whose catalog partition metadata is already absent.
+     * <p>Deletion first replaces catalog partition metadata with an ownership-fenced tombstone,
+     * then removes log data and the keyed log-ID mapping. The tombstone is retained so a delayed
+     * writer from the deleted incarnation cannot make the partition visible again.
      *
      * @param id the partition-stripped stream identity
      * @param partitionIndex the zero-based partition index

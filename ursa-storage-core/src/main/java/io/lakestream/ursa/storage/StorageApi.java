@@ -103,6 +103,15 @@ public interface StorageApi extends Closeable {
     CompletableFuture<Void> deleteStreamIdMapping(String key);
 
     /**
+     * Deletes a keyed stream-ID mapping only when it still references the expected stream ID.
+     *
+     * @param key the key whose mapping should be deleted
+     * @param expectedStreamId the stream ID that the caller still owns
+     * @return a future that completes when the mapping is absent or owned by another stream ID
+     */
+    CompletableFuture<Void> deleteStreamIdMapping(String key, long expectedStreamId);
+
+    /**
      * Retrieves a map of all stream IDs and their associated keys.
      *
      * <p>The returned map contains mappings from stream IDs to their corresponding {@link StreamProperties}.

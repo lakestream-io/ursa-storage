@@ -8,10 +8,13 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -40,12 +43,18 @@ import io.lakestream.api.exception.NoSuchNamespaceException;
 import io.lakestream.api.exception.NoSuchStreamException;
 import io.lakestream.ursa.catalog.metadata.LogMetadata;
 import io.lakestream.ursa.catalog.metadata.LogMetadataSerde;
+import io.lakestream.ursa.storage.impl.exception.NoSuchKeyException;
 import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.GetResult;
 import io.oxia.client.api.PutResult;
 import io.oxia.client.api.Version;
+import io.oxia.client.api.exceptions.KeyAlreadyExistsException;
 import io.oxia.client.api.exceptions.UnexpectedVersionIdException;
+import io.oxia.client.api.options.DeleteOption;
 import io.oxia.client.api.options.PutOption;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -54,6 +63,11 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
+import java.util.stream.IntStream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -81,10 +95,14 @@ class IndexedStreamCatalogTest {
 
     @BeforeEach
     void setUp() {
+        lenient().when(oxiaClient.get(anyString()))
+            .thenReturn(CompletableFuture.completedFuture(null));
         catalogPaths = new DefaultCatalogPaths();
         catalog = new IndexedStreamCatalog(oxiaClient, catalogPaths, logStorage,
-            logId -> null, null,
+            (name, logId, reader) -> null, null,
             key -> CompletableFuture.completedFuture(nextStreamId++),
+            key -> CompletableFuture.failedFuture(new NoSuchKeyException(key)),
+            (key, expectedStreamId) -> CompletableFuture.completedFuture(null),
             null, null, List.of());
         catalog.initialize("test-catalog", Map.of()).join();
         streamId = new StreamIdentifier("public/default", "my-topic");
@@ -95,24 +113,12 @@ class IndexedStreamCatalogTest {
     @Test
     void createStream_success() throws Exception {
         nextStreamId = 100L;
-        byte[] configBytes;
-        try {
-            configBytes = MAPPER.writeValueAsBytes(Map.of("partitions", 2));
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
-        when(oxiaClient.get("/admin/streams/public/default/my-topic"))
-            .thenReturn(CompletableFuture.completedFuture(null))
-            .thenReturn(CompletableFuture.completedFuture(
-                new GetResult("/admin/streams/public/default/my-topic", configBytes, DUMMY_VERSION)));
-
-        // Put calls succeed
-        when(oxiaClient.put(any(), any(byte[].class)))
-            .thenReturn(CompletableFuture.completedFuture(new PutResult("key", DUMMY_VERSION)));
-
-        // getLayout reads partition metadata to resolve LogIds
-        mockPartitionMetadata(streamId, 0, 100L, Map.of("key1", "val1"));
-        mockPartitionMetadata(streamId, 1, 101L, Map.of("key1", "val1"));
+        String configPath = catalogPaths.streamConfigPath(streamId);
+        String firstPartitionPath = catalogPaths.partitionMetadataPath(streamId, 0);
+        String secondPartitionPath = catalogPaths.partitionMetadataPath(streamId, 1);
+        mockVersionedConfig(configPath);
+        mockCreateOnlyRecord(firstPartitionPath);
+        mockCreateOnlyRecord(secondPartitionPath);
 
         Partitioning partitioning = new Partitioning(PartitioningStrategy.INDEXED, Map.of("numPartitions", "2"));
         Stream result = catalog.createStream(streamId, new StreamConfig(), partitioning,
@@ -122,24 +128,283 @@ class IndexedStreamCatalogTest {
         assertEquals(LifecycleState.ACTIVE, result.state());
         assertEquals(Map.of("key1", "val1"), result.properties());
 
-        // Verify 2 partition metadata puts + 1 config put = 3 total
-        verify(oxiaClient, times(3)).put(any(), any(byte[].class));
-        verify(oxiaClient).put(eq("/streams/public/default/my-topic-partition-0"), any(byte[].class));
-        verify(oxiaClient).put(eq("/streams/public/default/my-topic-partition-1"), any(byte[].class));
-        verify(oxiaClient).put(eq("/admin/streams/public/default/my-topic"), any(byte[].class));
+        verify(oxiaClient).put(eq(firstPartitionPath), any(byte[].class),
+            eq(Set.of(PutOption.IfRecordDoesNotExist)));
+        verify(oxiaClient).put(eq(secondPartitionPath), any(byte[].class),
+            eq(Set.of(PutOption.IfRecordDoesNotExist)));
+        verify(oxiaClient).put(eq(configPath), any(byte[].class),
+            eq(Set.of(PutOption.IfRecordDoesNotExist)));
+        verify(oxiaClient).put(eq(configPath), any(byte[].class),
+            eq(Set.of(PutOption.IfVersionIdEquals(1L))));
     }
 
     @Test
-    void createStream_alreadyExists() {
-        when(oxiaClient.get("/admin/streams/public/default/my-topic"))
+    void createStream_alreadyExists() throws Exception {
+        String configPath = "/admin/streams/public/default/my-topic";
+        when(oxiaClient.get(configPath))
             .thenReturn(CompletableFuture.completedFuture(
-                new GetResult("/admin/streams/public/default/my-topic", new byte[]{}, DUMMY_VERSION)));
+                new GetResult(configPath, streamConfigBytes(1, Map.of(), false), DUMMY_VERSION)));
 
         Partitioning partitioning = new Partitioning(PartitioningStrategy.INDEXED, Map.of("numPartitions", "1"));
         ExecutionException ex = assertThrows(ExecutionException.class, () ->
             catalog.createStream(streamId, new StreamConfig(), partitioning,
                 new SchemaConfig(), Map.of()).get());
         assertInstanceOf(AlreadyExistsException.class, ex.getCause());
+        verify(oxiaClient, never()).put(eq(configPath), any(byte[].class), any());
+    }
+
+    @Test
+    void createStream_permanentlyDeletedIdentityDoesNotCreatePartitions() {
+        String configPath = "/admin/streams/public/default/my-topic";
+        when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(
+            new GetResult(configPath,
+                "{\"_externalStreamPermanentlyDeleted\":true}"
+                    .getBytes(StandardCharsets.UTF_8),
+                DUMMY_VERSION)));
+
+        Partitioning partitioning = new Partitioning(
+            PartitioningStrategy.INDEXED, Map.of("numPartitions", "1"));
+        ExecutionException ex = assertThrows(ExecutionException.class, () ->
+            catalog.createStream(streamId, new StreamConfig(), partitioning,
+                new SchemaConfig(), Map.of()).get());
+
+        assertInstanceOf(AlreadyExistsException.class, ex.getCause());
+        verify(oxiaClient, never()).put(any(), any(byte[].class));
+        verify(oxiaClient, never()).put(eq(configPath), any(byte[].class), any());
+    }
+
+    @Test
+    void createStream_takeoverFencesLateOwnerAndReusesStablePartitionId() throws Exception {
+        String configPath = catalogPaths.streamConfigPath(streamId);
+        String partitionPath = catalogPaths.partitionMetadataPath(streamId, 0);
+        AtomicReference<VersionedValue> configState = mockVersionedConfig(configPath);
+        mockCreateOnlyRecord(partitionPath);
+
+        CompletableFuture<Long> delayedAllocation = new CompletableFuture<>();
+        AtomicInteger allocationCalls = new AtomicInteger();
+        List<String> allocationKeys = new java.util.concurrent.CopyOnWriteArrayList<>();
+        IndexedStreamCatalog concurrentCatalog = new IndexedStreamCatalog(
+            oxiaClient, catalogPaths, logStorage,
+            (name, logId, reader) -> null, null,
+            key -> {
+                allocationKeys.add(key.orElseThrow());
+                return allocationCalls.getAndIncrement() == 0
+                    ? delayedAllocation : CompletableFuture.completedFuture(100L);
+            },
+            ignored -> CompletableFuture.completedFuture(100L),
+            (key, expectedStreamId) -> CompletableFuture.completedFuture(null),
+            null, null, List.of());
+        Partitioning partitioning = new Partitioning(
+            PartitioningStrategy.INDEXED, Map.of("numPartitions", "1"));
+
+        CompletableFuture<Stream> staleOwner = concurrentCatalog.createStream(
+            streamId, new StreamConfig(), partitioning, new SchemaConfig(), Map.of());
+        String incarnation = MAPPER.readTree(configState.get().value())
+            .get("_incarnationId").asText();
+
+        CompletableFuture<Stream> takeover = concurrentCatalog.createStream(
+            streamId, new StreamConfig(), partitioning, new SchemaConfig(), Map.of());
+
+        assertEquals(streamId, takeover.join().identifier());
+        delayedAllocation.complete(100L);
+
+        CompletionException failure = assertThrows(CompletionException.class, staleOwner::join);
+        assertInstanceOf(
+            IndexedStreamConfigStore.ProvisioningOwnershipLostException.class,
+            failure.getCause());
+        assertEquals(2, allocationCalls.get());
+        assertEquals(List.of(
+            "lakestream-native/" + streamId.fullName() + "/" + incarnation + "/partition-0",
+            "lakestream-native/" + streamId.fullName() + "/" + incarnation + "/partition-0"),
+            allocationKeys);
+        verify(oxiaClient, times(1)).put(eq(partitionPath), any(byte[].class),
+            eq(Set.of(PutOption.IfRecordDoesNotExist)));
+        verify(oxiaClient, never()).delete(eq(partitionPath), any());
+        verify(logStorage, never()).deleteLog(any());
+    }
+
+    @Test
+    void lateNativeAllocationAfterCompletedDropCleansItsOwnMappingAndRegistration()
+            throws Exception {
+        String configPath = catalogPaths.streamConfigPath(streamId);
+        String partitionPath = catalogPaths.partitionMetadataPath(streamId, 0);
+        AtomicReference<VersionedValue> config = mockVersionedConfig(configPath);
+        AtomicReference<VersionedValue> partition = mockCreateOnlyRecord(partitionPath);
+        CompletableFuture<Long> allocation = new CompletableFuture<>();
+        AtomicReference<Long> mappedStreamId = new AtomicReference<>();
+        List<String> mappingDeletes = new ArrayList<>();
+        when(logStorage.deleteLog(LogId.of(701L)))
+            .thenReturn(CompletableFuture.completedFuture(null));
+        IndexedStreamCatalog racedCatalog = new IndexedStreamCatalog(
+            oxiaClient, catalogPaths, logStorage,
+            (name, logId, reader) -> null, null,
+            key -> allocation.thenApply(streamId -> {
+                mappedStreamId.set(streamId);
+                return streamId;
+            }),
+            key -> mappedStreamId.get() == null
+                ? CompletableFuture.failedFuture(new NoSuchKeyException(key))
+                : CompletableFuture.completedFuture(mappedStreamId.get()),
+            (key, expectedStreamId) -> {
+                mappingDeletes.add(key + ":" + expectedStreamId);
+                if (expectedStreamId.equals(mappedStreamId.get())) {
+                    mappedStreamId.set(null);
+                }
+                return CompletableFuture.completedFuture(null);
+            }, null, null, List.of());
+        Partitioning partitioning = new Partitioning(
+            PartitioningStrategy.INDEXED, Map.of("numPartitions", "1"));
+
+        CompletableFuture<Stream> create = racedCatalog.createStream(
+            streamId, new StreamConfig(), partitioning, new SchemaConfig(), Map.of());
+        assertFalse(create.isDone());
+        String incarnation = MAPPER.readTree(config.get().value())
+            .get("_incarnationId").asText();
+
+        assertTrue(racedCatalog.dropStream(streamId, false).join());
+        allocation.complete(701L);
+
+        CompletionException failure = assertThrows(CompletionException.class, create::join);
+        assertInstanceOf(
+            IndexedStreamConfigStore.ProvisioningOwnershipLostException.class,
+            failure.getCause());
+        assertNull(mappedStreamId.get());
+        assertEquals("DROPPED", MAPPER.readTree(config.get().value())
+            .get("_provisioningState").asText());
+        assertTrue(LOG_METADATA_SERDE.deserialize(
+            partitionPath, partition.get().value()).deleted());
+        verify(logStorage).deleteLog(LogId.of(701L));
+        assertEquals(List.of(
+            "lakestream-native/" + streamId.fullName() + "/" + incarnation
+                + "/partition-0:701"), mappingDeletes);
+    }
+
+    @Test
+    void createStream_partitionFailureRetainsRecoveryAnchors() throws Exception {
+        String configPath = catalogPaths.streamConfigPath(streamId);
+        String firstPartitionPath = catalogPaths.partitionMetadataPath(streamId, 0);
+        String secondPartitionPath = catalogPaths.partitionMetadataPath(streamId, 1);
+        RuntimeException partitionFailure = new RuntimeException("partition write failed");
+        AtomicReference<VersionedValue> configState = mockVersionedConfig(configPath);
+        AtomicReference<VersionedValue> firstPartitionState =
+            mockCreateOnlyRecord(firstPartitionPath);
+        when(oxiaClient.put(eq(secondPartitionPath), any(byte[].class),
+                eq(Set.of(PutOption.IfRecordDoesNotExist))))
+            .thenReturn(CompletableFuture.failedFuture(partitionFailure));
+        when(oxiaClient.get(secondPartitionPath))
+            .thenReturn(CompletableFuture.completedFuture(null));
+
+        Partitioning partitioning = new Partitioning(
+            PartitioningStrategy.INDEXED, Map.of("numPartitions", "2"));
+        CompletionException failure = assertThrows(CompletionException.class, () ->
+            catalog.createStream(streamId, new StreamConfig(), partitioning,
+                new SchemaConfig(), Map.of()).join());
+
+        assertEquals(partitionFailure, failure.getCause());
+        assertTrue(MAPPER.readTree(configState.get().value())
+            .get("_provisioning").asBoolean());
+        assertNotNull(firstPartitionState.get());
+        verify(oxiaClient, never()).delete(eq(firstPartitionPath), any());
+        verify(oxiaClient, never()).delete(eq(configPath), any());
+        verify(logStorage, never()).deleteLog(any());
+    }
+
+    @Test
+    void createStream_retryAfterPostMetadataFailureReusesStableAnchors() throws Exception {
+        String configPath = catalogPaths.streamConfigPath(streamId);
+        String partitionPath = catalogPaths.partitionMetadataPath(streamId, 0);
+        RuntimeException postMetadataFailure =
+            new RuntimeException("crashed after partition metadata");
+        AtomicReference<VersionedValue> configState = mockVersionedConfig(configPath);
+        AtomicInteger configReads = new AtomicInteger();
+        when(oxiaClient.get(configPath)).thenAnswer(ignored -> {
+            if (configReads.incrementAndGet() == 4) {
+                return CompletableFuture.failedFuture(postMetadataFailure);
+            }
+            VersionedValue current = configState.get();
+            return CompletableFuture.completedFuture(current == null ? null
+                : new GetResult(configPath, current.value(), current.version()));
+            });
+        AtomicReference<VersionedValue> partitionState =
+            mockCreateOnlyRecord(partitionPath);
+        List<String> allocationKeys = new java.util.concurrent.CopyOnWriteArrayList<>();
+        IndexedStreamCatalog recoveringCatalog = new IndexedStreamCatalog(
+            oxiaClient, catalogPaths, logStorage,
+            (name, logId, reader) -> null, null,
+            key -> {
+                allocationKeys.add(key.orElseThrow());
+                return CompletableFuture.completedFuture(100L);
+            }, ignored -> CompletableFuture.completedFuture(100L),
+            (key, expectedStreamId) -> CompletableFuture.completedFuture(null),
+            null, null, List.of());
+
+        Partitioning partitioning = new Partitioning(
+            PartitioningStrategy.INDEXED, Map.of("numPartitions", "1"));
+        CompletionException failure = assertThrows(CompletionException.class, () ->
+            recoveringCatalog.createStream(streamId, new StreamConfig(), partitioning,
+                new SchemaConfig(), Map.of()).join());
+
+        assertEquals(postMetadataFailure, failure.getCause());
+        String incarnation = MAPPER.readTree(configState.get().value())
+            .get("_incarnationId").asText();
+        assertEquals(streamId, recoveringCatalog.createStream(
+            streamId, new StreamConfig(), partitioning,
+            new SchemaConfig(), Map.of()).join().identifier());
+
+        String expectedKey = "lakestream-native/" + streamId.fullName()
+            + "/" + incarnation + "/partition-0";
+        assertEquals(List.of(expectedKey, expectedKey), allocationKeys);
+        assertNotNull(partitionState.get());
+        verify(oxiaClient).put(eq(partitionPath), any(byte[].class),
+            eq(Set.of(PutOption.IfRecordDoesNotExist)));
+        verify(oxiaClient, never()).delete(eq(configPath), any());
+        verify(oxiaClient, never()).delete(eq(partitionPath), any());
+        verify(logStorage, never()).deleteLog(any());
+    }
+
+    @Test
+    void createStream_unknownFinalizeOutcomeDoesNotDeleteCreatedPartitions() {
+        String configPath = catalogPaths.streamConfigPath(streamId);
+        String partitionPath = catalogPaths.partitionMetadataPath(streamId, 0);
+        RuntimeException finalizeFailure = new RuntimeException("finalize response lost");
+        RuntimeException readFailure = new RuntimeException("readback unavailable");
+        AtomicReference<byte[]> currentConfig = new AtomicReference<>();
+        java.util.concurrent.atomic.AtomicBoolean finalizeAttempted =
+            new java.util.concurrent.atomic.AtomicBoolean();
+        when(oxiaClient.get(configPath)).thenAnswer(ignored -> {
+            if (finalizeAttempted.get()) {
+                return CompletableFuture.failedFuture(readFailure);
+            }
+            byte[] value = currentConfig.get();
+            return CompletableFuture.completedFuture(value == null ? null
+                : new GetResult(configPath, value, version(1)));
+        });
+        when(oxiaClient.put(eq(configPath), any(byte[].class),
+                eq(Set.of(PutOption.IfRecordDoesNotExist))))
+            .thenAnswer(invocation -> {
+                currentConfig.set(invocation.getArgument(1, byte[].class));
+                return CompletableFuture.completedFuture(
+                    new PutResult(configPath, version(1)));
+            });
+        mockCreateOnlyRecord(partitionPath);
+        when(oxiaClient.put(eq(configPath), any(byte[].class),
+                eq(Set.of(PutOption.IfVersionIdEquals(1L)))))
+            .thenAnswer(ignored -> {
+                finalizeAttempted.set(true);
+                return CompletableFuture.failedFuture(finalizeFailure);
+            });
+
+        Partitioning partitioning = new Partitioning(
+            PartitioningStrategy.INDEXED, Map.of("numPartitions", "1"));
+        CompletionException failure = assertThrows(CompletionException.class, () ->
+            catalog.createStream(streamId, new StreamConfig(), partitioning,
+                new SchemaConfig(), Map.of()).join());
+
+        assertEquals(finalizeFailure, failure.getCause());
+        assertTrue(List.of(finalizeFailure.getSuppressed()).contains(readFailure));
+        verify(logStorage, never()).deleteLog(any());
+        verify(oxiaClient, never()).delete(eq(partitionPath), any());
+        verify(oxiaClient, never()).delete(eq(configPath), any());
     }
 
     // --- getLayout ---
@@ -233,11 +498,78 @@ class IndexedStreamCatalogTest {
                 "/admin/streams/public/default/topic-a",
                 "/admin/streams/public/default/topic-b"
             )));
+        when(oxiaClient.get("/admin/streams/public/default/topic-a"))
+            .thenReturn(CompletableFuture.completedFuture(
+                new GetResult("topic-a", new byte[]{}, DUMMY_VERSION)));
+        when(oxiaClient.get("/admin/streams/public/default/topic-b"))
+            .thenReturn(CompletableFuture.completedFuture(
+                new GetResult("topic-b", new byte[]{}, DUMMY_VERSION)));
 
         List<StreamIdentifier> streams = catalog.listStreams("public/default").get();
         assertEquals(2, streams.size());
         assertEquals("topic-a", streams.get(0).name());
         assertEquals("topic-b", streams.get(1).name());
+    }
+
+    @Test
+    void listStreams_excludesPermanentDeletionTombstones() throws Exception {
+        String prefix = "/admin/streams/public/default/";
+        String activePath = prefix + "active";
+        String deletedPath = prefix + "deleted";
+        when(oxiaClient.list(eq(prefix), eq(prefix + "\uffff")))
+            .thenReturn(CompletableFuture.completedFuture(List.of(activePath, deletedPath)));
+        when(oxiaClient.get(activePath)).thenReturn(CompletableFuture.completedFuture(
+            new GetResult(activePath, new byte[]{}, DUMMY_VERSION)));
+        when(oxiaClient.get(deletedPath)).thenReturn(CompletableFuture.completedFuture(
+            new GetResult(deletedPath,
+                "{\"_externalStreamPermanentlyDeleted\":true}"
+                    .getBytes(StandardCharsets.UTF_8),
+                DUMMY_VERSION)));
+
+        assertEquals(
+            List.of(new StreamIdentifier("public/default", "active")),
+            catalog.listStreams("public/default").get());
+    }
+
+    @Test
+    void listStreams_boundsConcurrentVisibilityReads() throws Exception {
+        String prefix = "/admin/streams/public/default/";
+        List<String> paths = IntStream.range(0, 34)
+            .mapToObj(index -> prefix + "topic-" + index)
+            .toList();
+        when(oxiaClient.list(eq(prefix), eq(prefix + "\uffff")))
+            .thenReturn(CompletableFuture.completedFuture(paths));
+        Map<String, CompletableFuture<GetResult>> pendingReads = new HashMap<>();
+        paths.forEach(path -> pendingReads.put(path, new CompletableFuture<>()));
+        when(oxiaClient.get(any(String.class))).thenAnswer(invocation ->
+            pendingReads.get(invocation.getArgument(0, String.class)));
+
+        CompletableFuture<List<StreamIdentifier>> result = catalog.listStreams("public/default");
+
+        verify(oxiaClient, times(32)).get(any(String.class));
+        assertFalse(result.isDone());
+        for (int index = 0; index < 32; index++) {
+            String path = paths.get(index);
+            byte[] value = index == 5
+                ? "{\"_externalStreamPermanentlyDeleted\":true}"
+                    .getBytes(StandardCharsets.UTF_8)
+                : new byte[]{};
+            pendingReads.get(path).complete(new GetResult(path, value, DUMMY_VERSION));
+        }
+
+        verify(oxiaClient, times(34)).get(any(String.class));
+        assertFalse(result.isDone());
+        pendingReads.get(paths.get(32)).complete(
+            new GetResult(paths.get(32), new byte[]{}, DUMMY_VERSION));
+        pendingReads.get(paths.get(33)).complete(new GetResult(
+            paths.get(33),
+            "{\"_externalStreamPermanentlyDeleted\":true}"
+                .getBytes(StandardCharsets.UTF_8),
+            DUMMY_VERSION));
+
+        assertEquals(32, result.get().size());
+        assertFalse(result.get().contains(new StreamIdentifier("public/default", "topic-5")));
+        assertFalse(result.get().contains(new StreamIdentifier("public/default", "topic-33")));
     }
 
     // --- streamExists ---
@@ -261,38 +593,301 @@ class IndexedStreamCatalogTest {
 
     @Test
     void dropStream_success() throws Exception {
-        mockStreamExistence(streamId, true);
-
-        when(oxiaClient.delete(any()))
-            .thenReturn(CompletableFuture.completedFuture(true));
+        String configPath = catalogPaths.streamConfigPath(streamId);
+        String partitionPath = catalogPaths.partitionMetadataPath(streamId, 0);
+        AtomicReference<VersionedValue> config = mockVersionedConfig(
+            configPath, streamConfigBytes(1, Map.of(), false));
+        AtomicReference<VersionedValue> partition = mockCreateOnlyRecord(partitionPath);
 
         boolean result = catalog.dropStream(streamId, false).get();
+
         assertTrue(result);
-        verify(oxiaClient).delete("/streams/public/default/my-topic-partition-0");
-        verify(oxiaClient).delete("/admin/streams/public/default/my-topic");
+        assertEquals("DROPPED", MAPPER.readTree(config.get().value())
+            .get("_provisioningState").asText());
+        LogMetadata tombstone = LOG_METADATA_SERDE.deserialize(
+            partitionPath, partition.get().value());
+        assertTrue(tombstone.deleted());
         verify(logStorage, never()).deleteLog(any());
     }
 
     @Test
     void dropStream_withPurge() throws Exception {
-        mockStreamExistence(streamId, true);
-        mockStreamConfig(streamId, 1);
-        mockPartitionMetadata(streamId, 0, 300L, Map.of());
-
-        when(oxiaClient.delete(any()))
-            .thenReturn(CompletableFuture.completedFuture(true));
+        String configPath = catalogPaths.streamConfigPath(streamId);
+        String partitionPath = catalogPaths.partitionMetadataPath(streamId, 0);
+        mockVersionedConfig(configPath, streamConfigBytes(1, Map.of(), false));
+        byte[] metadata = LOG_METADATA_SERDE.serialize(
+            partitionPath, new LogMetadata(300L, Map.of(), OptionalLong.empty()));
+        AtomicReference<VersionedValue> partition =
+            mockVersionedConfig(partitionPath, metadata);
         when(logStorage.deleteLog(LogId.of(300L)))
             .thenReturn(CompletableFuture.completedFuture(null));
 
         boolean result = catalog.dropStream(streamId, true).get();
+
         assertTrue(result);
         verify(logStorage).deleteLog(LogId.of(300L));
+        assertTrue(LOG_METADATA_SERDE.deserialize(
+            partitionPath, partition.get().value()).deleted());
     }
 
     @Test
     void dropStream_notFound() throws Exception {
         mockStreamExistence(streamId, false);
         assertFalse(catalog.dropStream(streamId, false).get());
+    }
+
+    @Test
+    void dropWithoutKeyedLifecycleCapabilityFailsBeforeWritingAbortingClaim()
+            throws Exception {
+        String configPath = catalogPaths.streamConfigPath(streamId);
+        byte[] original = streamConfigBytes(1, Map.of(), false);
+        AtomicReference<VersionedValue> config =
+            mockVersionedConfig(configPath, original);
+        IndexedStreamCatalog legacyFactoryCatalog = new IndexedStreamCatalog(
+            oxiaClient, catalogPaths, logStorage, logId -> null, null,
+            key -> CompletableFuture.completedFuture(1L), null, null, List.of());
+        IndexedStreamCatalog namedFactoryCatalog = new IndexedStreamCatalog(
+            oxiaClient, catalogPaths, logStorage,
+            (name, logId, reader) -> null, null,
+            key -> CompletableFuture.completedFuture(1L), null, null, List.of());
+
+        for (IndexedStreamCatalog noCapabilities
+                : List.of(legacyFactoryCatalog, namedFactoryCatalog)) {
+            CompletionException failure = assertThrows(CompletionException.class, () ->
+                noCapabilities.dropStream(streamId, false).join());
+            assertInstanceOf(UnsupportedOperationException.class, failure.getCause());
+            assertEquals(new String(original, StandardCharsets.UTF_8),
+                new String(config.get().value(), StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    void writeEntryPointsWithoutKeyedLifecycleCapabilityFailBeforePersistence() {
+        AtomicInteger allocationAttempts = new AtomicInteger();
+        Function<Optional<String>, CompletableFuture<Long>> generator = key -> {
+            allocationAttempts.incrementAndGet();
+            return CompletableFuture.completedFuture(1L);
+        };
+        IndexedStreamCatalog legacyFactoryCatalog = new IndexedStreamCatalog(
+            oxiaClient, catalogPaths, logStorage, logId -> null, null,
+            generator, null, null, List.of());
+        IndexedStreamCatalog namedFactoryCatalog = new IndexedStreamCatalog(
+            oxiaClient, catalogPaths, logStorage,
+            (name, logId, reader) -> null, null,
+            generator, null, null, List.of());
+        Partitioning partitioning = new Partitioning(
+            PartitioningStrategy.INDEXED, Map.of("numPartitions", "1"));
+
+        for (IndexedStreamCatalog noCapabilities
+                : List.of(legacyFactoryCatalog, namedFactoryCatalog)) {
+            assertInstanceOf(UnsupportedOperationException.class,
+                assertThrows(CompletionException.class, () -> noCapabilities.createStream(
+                    streamId, new StreamConfig(), partitioning,
+                    new SchemaConfig(), Map.of()).join()).getCause());
+            assertInstanceOf(UnsupportedOperationException.class,
+                assertThrows(CompletionException.class, () -> noCapabilities
+                    .registerExternalStream(streamId, 1, Map.of()).join()).getCause());
+            assertInstanceOf(UnsupportedOperationException.class,
+                assertThrows(CompletionException.class, () -> noCapabilities
+                    .registerExternalPartition(streamId, 0, 1L, Map.of()).join()).getCause());
+            assertInstanceOf(UnsupportedOperationException.class,
+                assertThrows(CompletionException.class, () -> noCapabilities
+                    .openExternalPartition(streamId, 0, Map.of()).join()).getCause());
+        }
+
+        assertEquals(0, allocationAttempts.get());
+        verify(oxiaClient, never()).put(anyString(), any(byte[].class), any());
+    }
+
+    @Test
+    void nativeDropRetainsAbortingAnchorAndRetriesConditionalMappingCleanupWithoutPurge()
+            throws Exception {
+        String configPath = catalogPaths.streamConfigPath(streamId);
+        String partitionPath = catalogPaths.partitionMetadataPath(streamId, 0);
+        String incarnation = "native-incarnation";
+        String mappingKey = "lakestream-native/" + streamId.fullName()
+            + "/" + incarnation + "/partition-0";
+        AtomicReference<VersionedValue> config = mockVersionedConfig(
+            configPath,
+            ownedStreamConfigBytes(
+                1, Map.of("tier", "hot"), incarnation, "create-owner", "NATIVE_CREATE"));
+        byte[] metadata = LOG_METADATA_SERDE.serialize(
+            partitionPath, new LogMetadata(
+                300L, Map.of(), OptionalLong.empty(),
+                incarnation, "create-owner", 1L, false));
+        AtomicReference<VersionedValue> partition =
+            mockVersionedConfig(partitionPath, metadata);
+        RuntimeException firstCleanupFailure = new RuntimeException("mapping delete failed");
+        AtomicInteger deleteAttempts = new AtomicInteger();
+        List<String> mappingDeletes = new ArrayList<>();
+        IndexedStreamCatalog mappedCatalog = new IndexedStreamCatalog(
+            oxiaClient, catalogPaths, logStorage,
+            (name, logId, reader) -> null, null,
+            key -> CompletableFuture.completedFuture(999L),
+            key -> CompletableFuture.completedFuture(300L),
+            (key, expectedStreamId) -> {
+                mappingDeletes.add(key + ":" + expectedStreamId);
+                return deleteAttempts.getAndIncrement() == 0
+                    ? CompletableFuture.failedFuture(firstCleanupFailure)
+                    : CompletableFuture.completedFuture(null);
+            }, null, null, List.of());
+        mappedCatalog.initialize("mapped-catalog", Map.of()).join();
+
+        CompletionException firstFailure = assertThrows(CompletionException.class, () ->
+            mappedCatalog.dropStream(streamId, false).join());
+
+        assertEquals(firstCleanupFailure, firstFailure.getCause());
+        assertNotNull(config.get());
+        JsonNode abortingConfig = MAPPER.readTree(config.get().value());
+        assertEquals("ABORTING", abortingConfig.get("_provisioningState").asText());
+        assertEquals(incarnation, abortingConfig.get("_incarnationId").asText());
+        assertFalse(mappedCatalog.streamExists(streamId).join());
+        LogMetadata firstTombstone = LOG_METADATA_SERDE.deserialize(
+            partitionPath, partition.get().value());
+        assertTrue(firstTombstone.deleted());
+        assertEquals(300L, firstTombstone.streamId());
+        verify(logStorage, never()).deleteLog(any());
+
+        assertTrue(mappedCatalog.dropStream(streamId, false).join());
+
+        assertEquals("DROPPED", MAPPER.readTree(config.get().value())
+            .get("_provisioningState").asText());
+        assertEquals(List.of(mappingKey + ":300", mappingKey + ":300"), mappingDeletes);
+        LogMetadata completedTombstone = LOG_METADATA_SERDE.deserialize(
+            partitionPath, partition.get().value());
+        assertTrue(completedTombstone.deleted());
+        assertEquals(incarnation, completedTombstone.registrationIncarnationId());
+        verify(logStorage, never()).deleteLog(any());
+    }
+
+    @Test
+    void externalDropDeletesKeyedMappingWithoutPurgingData() throws Exception {
+        String configPath = catalogPaths.streamConfigPath(streamId);
+        String partitionPath = catalogPaths.partitionMetadataPath(streamId, 0);
+        String mappingKey = catalogPaths.compactedReaderName(streamId, 0);
+        String incarnation = "external-incarnation";
+        AtomicReference<VersionedValue> config = mockVersionedConfig(
+            configPath,
+            ownedStreamConfigBytes(
+                1, Map.of(), incarnation, "registration-owner", "EXTERNAL"));
+        byte[] metadata = LOG_METADATA_SERDE.serialize(
+            partitionPath, new LogMetadata(
+                300L, Map.of(), OptionalLong.empty(),
+                incarnation, "registration-owner", 1L, false));
+        AtomicReference<VersionedValue> partition =
+            mockVersionedConfig(partitionPath, metadata);
+        List<String> mappingDeletes = new ArrayList<>();
+        IndexedStreamCatalog mappedCatalog = new IndexedStreamCatalog(
+            oxiaClient, catalogPaths, logStorage,
+            (name, logId, reader) -> null, null,
+            key -> CompletableFuture.completedFuture(999L),
+            key -> CompletableFuture.completedFuture(300L),
+            (key, expectedStreamId) -> {
+                mappingDeletes.add(key + ":" + expectedStreamId);
+                return CompletableFuture.completedFuture(null);
+            }, null, null, List.of());
+
+        assertTrue(mappedCatalog.dropStream(streamId, false).join());
+
+        assertEquals("DROPPED", MAPPER.readTree(config.get().value())
+            .get("_provisioningState").asText());
+        assertEquals(List.of(mappingKey + ":300"), mappingDeletes);
+        LogMetadata tombstone = LOG_METADATA_SERDE.deserialize(
+            partitionPath, partition.get().value());
+        assertTrue(tombstone.deleted());
+        assertEquals(2L, tombstone.registrationOwnerGeneration());
+        verify(logStorage, never()).deleteLog(any());
+    }
+
+    @Test
+    void lateSealCannotOverwritePartitionTombstoneAfterDrop() throws Exception {
+        String configPath = catalogPaths.streamConfigPath(streamId);
+        String partitionPath = catalogPaths.partitionMetadataPath(streamId, 0);
+        String incarnation = "external-incarnation";
+        mockVersionedConfig(
+            configPath,
+            ownedStreamConfigBytes(
+                1, Map.of(), incarnation, "registration-owner", "EXTERNAL"));
+        byte[] initialMetadata = LOG_METADATA_SERDE.serialize(
+            partitionPath, new LogMetadata(
+                301L, Map.of(), OptionalLong.empty(),
+                incarnation, "registration-owner", 1L, false));
+        AtomicReference<VersionedValue> partition = new AtomicReference<>(
+            new VersionedValue(initialMetadata, version(1)));
+        AtomicLong nextPartitionVersion = new AtomicLong(1L);
+        CompletableFuture<PutResult> delayedSealWrite = new CompletableFuture<>();
+        AtomicInteger partitionWrites = new AtomicInteger();
+        when(oxiaClient.get(partitionPath)).thenAnswer(ignored -> {
+            VersionedValue current = partition.get();
+            return CompletableFuture.completedFuture(new GetResult(
+                partitionPath, current.value(), current.version()));
+        });
+        when(oxiaClient.put(eq(partitionPath), any(byte[].class), any()))
+            .thenAnswer(invocation -> {
+                if (partitionWrites.getAndIncrement() == 0) {
+                    return delayedSealWrite;
+                }
+                @SuppressWarnings("unchecked")
+                Set<PutOption> options = invocation.getArgument(2, Set.class);
+                VersionedValue current = partition.get();
+                if (!options.contains(
+                        PutOption.IfVersionIdEquals(current.version().versionId()))) {
+                    return CompletableFuture.failedFuture(
+                        new UnexpectedVersionIdException(
+                            partitionPath, current.version().versionId()));
+                }
+                Version next = version(nextPartitionVersion.incrementAndGet());
+                byte[] value = invocation.getArgument(1, byte[].class);
+                partition.set(new VersionedValue(value.clone(), next));
+                return CompletableFuture.completedFuture(new PutResult(partitionPath, next));
+            });
+
+        CompletableFuture<Void> staleSeal = catalog.sealStream(streamId);
+        assertFalse(staleSeal.isDone());
+        assertTrue(catalog.dropStream(streamId, false).join());
+
+        delayedSealWrite.completeExceptionally(
+            new UnexpectedVersionIdException(partitionPath, version(1).versionId()));
+        CompletionException sealFailure = assertThrows(CompletionException.class, staleSeal::join);
+        assertInstanceOf(NoSuchStreamException.class, sealFailure.getCause());
+        LogMetadata tombstone = LOG_METADATA_SERDE.deserialize(
+            partitionPath, partition.get().value());
+        assertTrue(tombstone.deleted());
+        assertEquals(301L, tombstone.streamId());
+    }
+
+    @Test
+    void newNativeIncarnationCasReplacesOldPartitionTombstone() throws Exception {
+        String configPath = catalogPaths.streamConfigPath(streamId);
+        String partitionPath = catalogPaths.partitionMetadataPath(streamId, 0);
+        AtomicReference<VersionedValue> config = mockVersionedConfig(
+            configPath, droppedStreamConfigBytes(
+                1, "old-incarnation", "old-drop-owner", 2L, "NATIVE_CREATE"));
+        byte[] oldTombstone = LOG_METADATA_SERDE.serialize(
+            partitionPath, new LogMetadata(
+                300L, Map.of(), OptionalLong.empty(),
+                "old-incarnation", "old-drop-owner", 2L, true));
+        AtomicReference<VersionedValue> partition =
+            mockVersionedConfig(partitionPath, oldTombstone);
+        nextStreamId = 400L;
+
+        Stream created = catalog.createStream(
+            streamId, new StreamConfig(),
+            new Partitioning(PartitioningStrategy.INDEXED, Map.of("numPartitions", "1")),
+            new SchemaConfig(), Map.of()).join();
+
+        assertEquals(streamId, created.identifier());
+        JsonNode activeConfig = MAPPER.readTree(config.get().value());
+        String newIncarnation = activeConfig.get("_incarnationId").asText();
+        assertFalse(activeConfig.has("_provisioning"));
+        assertFalse(newIncarnation.equals("old-incarnation"));
+        LogMetadata replacement = LOG_METADATA_SERDE.deserialize(
+            partitionPath, partition.get().value());
+        assertFalse(replacement.deleted());
+        assertEquals(400L, replacement.streamId());
+        assertEquals(newIncarnation, replacement.registrationIncarnationId());
+        assertEquals(activeConfig.get("_ownerToken").asText(),
+            replacement.registrationOwnerToken());
     }
 
     // --- Namespace CRUD ---
@@ -383,10 +978,59 @@ class IndexedStreamCatalogTest {
         when(oxiaClient.list(eq(configPrefix), eq(configPrefix + "\uffff")))
             .thenReturn(CompletableFuture.completedFuture(
                 List.of("/admin/streams/my-ns/some-topic")));
+        when(oxiaClient.get("/admin/streams/my-ns/some-topic"))
+            .thenReturn(CompletableFuture.completedFuture(new GetResult(
+                "/admin/streams/my-ns/some-topic", new byte[]{}, DUMMY_VERSION)));
 
         ExecutionException ex = assertThrows(ExecutionException.class, () ->
             catalog.dropNamespace("my-ns").get());
         assertInstanceOf(NamespaceNotEmptyException.class, ex.getCause());
+    }
+
+    @Test
+    void dropNamespaceConservativelyRejectsHiddenProvisioningStream() {
+        mockNamespaceMetadata("my-ns", Map.of());
+        String configPrefix = "/admin/streams/my-ns/";
+        String streamPath = configPrefix + "provisioning-topic";
+        when(oxiaClient.list(eq(configPrefix), eq(configPrefix + "\uffff")))
+            .thenReturn(CompletableFuture.completedFuture(List.of(streamPath)));
+        when(oxiaClient.get(streamPath)).thenReturn(CompletableFuture.completedFuture(
+            new GetResult(streamPath,
+                ("{\"partitions\":1,\"properties\":{},"
+                    + "\"_incarnationId\":\"inc\",\"_ownerToken\":\"owner\","
+                    + "\"_creationKind\":\"NATIVE_CREATE\",\"_provisioning\":true,"
+                    + "\"_provisioningState\":\"PROVISIONING\"}")
+                    .getBytes(StandardCharsets.UTF_8),
+                DUMMY_VERSION)));
+
+        ExecutionException failure = assertThrows(ExecutionException.class, () ->
+            catalog.dropNamespace("my-ns").get());
+
+        assertInstanceOf(NamespaceNotEmptyException.class, failure.getCause());
+        verify(oxiaClient, never()).delete("/admin/streams/_namespaces/my-ns");
+    }
+
+    @Test
+    void dropNamespaceConservativelyRejectsHiddenAbortingStream() {
+        mockNamespaceMetadata("my-ns", Map.of());
+        String configPrefix = "/admin/streams/my-ns/";
+        String streamPath = configPrefix + "aborting-topic";
+        when(oxiaClient.list(eq(configPrefix), eq(configPrefix + "\uffff")))
+            .thenReturn(CompletableFuture.completedFuture(List.of(streamPath)));
+        when(oxiaClient.get(streamPath)).thenReturn(CompletableFuture.completedFuture(
+            new GetResult(streamPath,
+                ("{\"partitions\":1,\"properties\":{},"
+                    + "\"_incarnationId\":\"inc\",\"_ownerToken\":\"drop-owner\","
+                    + "\"_creationKind\":\"NATIVE_CREATE\",\"_provisioning\":true,"
+                    + "\"_provisioningState\":\"ABORTING\"}")
+                    .getBytes(StandardCharsets.UTF_8),
+                DUMMY_VERSION)));
+
+        ExecutionException failure = assertThrows(ExecutionException.class, () ->
+            catalog.dropNamespace("my-ns").get());
+
+        assertInstanceOf(NamespaceNotEmptyException.class, failure.getCause());
+        verify(oxiaClient, never()).delete("/admin/streams/_namespaces/my-ns");
     }
 
     @Test
@@ -580,13 +1224,17 @@ class IndexedStreamCatalogTest {
         mockPartitionMetadata(streamId, 0, 100L, Map.of());
         mockPartitionMetadata(streamId, 1, 101L, Map.of());
 
-        when(oxiaClient.put(any(), any(byte[].class)))
+        when(oxiaClient.put(any(), any(byte[].class), any()))
             .thenReturn(CompletableFuture.completedFuture(new PutResult("key", DUMMY_VERSION)));
 
         catalog.sealStream(streamId).get();
 
-        verify(oxiaClient).put(eq("/streams/public/default/my-topic-partition-0"), any(byte[].class));
-        verify(oxiaClient).put(eq("/streams/public/default/my-topic-partition-1"), any(byte[].class));
+        verify(oxiaClient).put(eq("/streams/public/default/my-topic-partition-0"),
+            any(byte[].class),
+            eq(Set.of(PutOption.IfVersionIdEquals(DUMMY_VERSION.versionId()))));
+        verify(oxiaClient).put(eq("/streams/public/default/my-topic-partition-1"),
+            any(byte[].class),
+            eq(Set.of(PutOption.IfVersionIdEquals(DUMMY_VERSION.versionId()))));
     }
 
     @Test
@@ -703,6 +1351,37 @@ class IndexedStreamCatalogTest {
         return MAPPER.writeValueAsBytes(config);
     }
 
+    private byte[] ownedStreamConfigBytes(
+            int partitions, Map<String, String> properties,
+            String incarnationId, String ownerToken, String creationKind)
+            throws Exception {
+        ObjectNode config = MAPPER.createObjectNode();
+        config.put("partitions", partitions);
+        ObjectNode configProperties = config.putObject("properties");
+        properties.forEach(configProperties::put);
+        config.put("_incarnationId", incarnationId);
+        config.put("_ownerToken", ownerToken);
+        config.put("_ownerGeneration", 1L);
+        config.put("_creationKind", creationKind);
+        return MAPPER.writeValueAsBytes(config);
+    }
+
+    private byte[] droppedStreamConfigBytes(
+            int partitions, String incarnationId, String ownerToken,
+            long ownerGeneration, String creationKind) throws Exception {
+        ObjectNode config = MAPPER.createObjectNode();
+        config.put("partitions", partitions);
+        config.putObject("properties");
+        config.put("_incarnationId", incarnationId);
+        config.put("_ownerToken", ownerToken);
+        config.put("_ownerGeneration", ownerGeneration);
+        config.put("_metadataSourceGeneration", ownerGeneration - 1);
+        config.put("_creationKind", creationKind);
+        config.put("_provisioning", true);
+        config.put("_provisioningState", "DROPPED");
+        return MAPPER.writeValueAsBytes(config);
+    }
+
     private void mockPartitionMetadata(StreamIdentifier id, int partIdx, long partStreamId,
                                         Map<String, String> properties) {
         String path = catalogPaths.partitionMetadataPath(id, partIdx);
@@ -715,6 +1394,89 @@ class IndexedStreamCatalogTest {
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
+    }
+
+    private AtomicReference<VersionedValue> mockVersionedConfig(String path) {
+        return mockVersionedConfig(path, null);
+    }
+
+    private AtomicReference<VersionedValue> mockVersionedConfig(
+            String path, byte[] initialValue) {
+        AtomicReference<VersionedValue> state = new AtomicReference<>(initialValue == null
+            ? null : new VersionedValue(initialValue.clone(), version(1)));
+        AtomicLong nextVersion = new AtomicLong(initialValue == null ? 0L : 1L);
+        lenient().when(oxiaClient.get(path)).thenAnswer(ignored -> {
+            VersionedValue current = state.get();
+            return CompletableFuture.completedFuture(current == null ? null
+                : new GetResult(path, current.value(), current.version()));
+        });
+        lenient().when(oxiaClient.put(eq(path), any(byte[].class), any())).thenAnswer(invocation -> {
+            byte[] value = invocation.getArgument(1, byte[].class);
+            @SuppressWarnings("unchecked")
+            Set<PutOption> options = invocation.getArgument(2, Set.class);
+            VersionedValue current = state.get();
+            if (options.contains(PutOption.IfRecordDoesNotExist) && current != null) {
+                return CompletableFuture.failedFuture(new KeyAlreadyExistsException(path));
+            }
+            if (!options.contains(PutOption.IfRecordDoesNotExist)
+                    && (current == null || !options.contains(
+                        PutOption.IfVersionIdEquals(current.version().versionId())))) {
+                return CompletableFuture.failedFuture(new UnexpectedVersionIdException(
+                    path, current == null ? -1L : current.version().versionId()));
+            }
+            Version version = version(nextVersion.incrementAndGet());
+            state.set(new VersionedValue(value.clone(), version));
+            return CompletableFuture.completedFuture(new PutResult(path, version));
+        });
+        lenient().when(oxiaClient.delete(eq(path), any())).thenAnswer(invocation -> {
+            @SuppressWarnings("unchecked")
+            Set<DeleteOption> options = invocation.getArgument(1, Set.class);
+            VersionedValue current = state.get();
+            if (current == null || !options.contains(
+                    DeleteOption.IfVersionIdEquals(current.version().versionId()))) {
+                return CompletableFuture.completedFuture(false);
+            }
+            state.set(null);
+            return CompletableFuture.completedFuture(true);
+        });
+        return state;
+    }
+
+    private AtomicReference<VersionedValue> mockCreateOnlyRecord(String path) {
+        AtomicReference<VersionedValue> state = new AtomicReference<>();
+        AtomicLong nextVersion = new AtomicLong();
+        lenient().when(oxiaClient.get(path)).thenAnswer(ignored -> {
+            VersionedValue current = state.get();
+            return CompletableFuture.completedFuture(current == null ? null
+                : new GetResult(path, current.value(), current.version()));
+        });
+        lenient().when(oxiaClient.put(eq(path), any(byte[].class), any()))
+            .thenAnswer(invocation -> {
+                VersionedValue current = state.get();
+                @SuppressWarnings("unchecked")
+                Set<PutOption> options = invocation.getArgument(2, Set.class);
+                if (options.contains(PutOption.IfRecordDoesNotExist) && current != null) {
+                    return CompletableFuture.failedFuture(new KeyAlreadyExistsException(path));
+                }
+                if (!options.contains(PutOption.IfRecordDoesNotExist)
+                        && (current == null || !options.contains(
+                            PutOption.IfVersionIdEquals(current.version().versionId())))) {
+                    return CompletableFuture.failedFuture(new UnexpectedVersionIdException(
+                        path, current == null ? -1L : current.version().versionId()));
+                }
+                Version version = version(nextVersion.incrementAndGet());
+                byte[] value = invocation.getArgument(1, byte[].class);
+                state.set(new VersionedValue(value.clone(), version));
+                return CompletableFuture.completedFuture(new PutResult(path, version));
+            });
+        return state;
+    }
+
+    private static Version version(long id) {
+        return new Version(id, 0, 0, 0, Optional.empty(), Optional.empty());
+    }
+
+    private record VersionedValue(byte[] value, Version version) {
     }
 
     private void mockStreamExistence(StreamIdentifier id, boolean exists) {
@@ -752,22 +1514,22 @@ class IndexedStreamCatalogTest {
     @Test
     void registerExternalStream_createsOnlyLogicalConfigWhenAbsent() throws Exception {
         String configPath = "/admin/streams/public/default/my-topic";
-        when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(null));
-        when(oxiaClient.put(any(), any(byte[].class), any()))
-            .thenReturn(CompletableFuture.completedFuture(new PutResult("key", DUMMY_VERSION)));
+        mockVersionedConfig(configPath);
 
         catalog.registerExternalStream(streamId, 3, Map.of("owner", "kafka")).get();
 
         ArgumentCaptor<byte[]> config = ArgumentCaptor.forClass(byte[].class);
-        verify(oxiaClient).put(eq(configPath), config.capture(),
-            eq(Set.of(PutOption.IfRecordDoesNotExist)));
-        verify(oxiaClient, times(1)).put(any(), any(byte[].class), any());
+        verify(oxiaClient, times(2)).put(eq(configPath), config.capture(), any());
         verify(logStorage, never()).deleteLog(any());
 
-        JsonNode node = MAPPER.readTree(config.getValue());
-        assertEquals(3, node.get("partitions").asInt());
-        assertEquals("kafka", node.get("properties").get("owner").asText());
-        assertFalse(node.has("materialization"));
+        JsonNode claim = MAPPER.readTree(config.getAllValues().get(0));
+        JsonNode active = MAPPER.readTree(config.getAllValues().get(1));
+        assertTrue(claim.get("_provisioning").asBoolean());
+        assertEquals("EXTERNAL", claim.get("_creationKind").asText());
+        assertEquals(3, active.get("partitions").asInt());
+        assertEquals("kafka", active.get("properties").get("owner").asText());
+        assertFalse(active.has("materialization"));
+        assertFalse(active.has("_provisioning"));
     }
 
     @Test
@@ -818,16 +1580,19 @@ class IndexedStreamCatalogTest {
     }
 
     @Test
-    void unregisterExternalStream_deletesOnlyLogicalConfigAndIsIdempotent() throws Exception {
+    void unregisterExternalStreamRetainsLogicalRecoveryConfigAndIsIdempotent() throws Exception {
         String configPath = "/admin/streams/public/default/my-topic";
-        when(oxiaClient.delete(configPath))
-            .thenReturn(CompletableFuture.completedFuture(true))
-            .thenReturn(CompletableFuture.completedFuture(false));
+        byte[] config = streamConfigBytes(1, Map.of(), false);
+        AtomicReference<VersionedValue> configState =
+            mockVersionedConfig(configPath, config);
 
         catalog.unregisterExternalStream(streamId).get();
         catalog.unregisterExternalStream(streamId).get();
 
-        verify(oxiaClient, times(2)).delete(configPath);
+        JsonNode retained = MAPPER.readTree(configState.get().value());
+        assertTrue(retained.path("_provisioning").asBoolean());
+        assertEquals("UNREGISTERED", retained.path("_provisioningState").asText());
+        verify(oxiaClient, never()).delete(eq(configPath), any());
         verify(oxiaClient, never()).delete("/streams/public/default/my-topic-partition-0");
         verify(logStorage, never()).deleteLog(any());
     }
@@ -838,9 +1603,19 @@ class IndexedStreamCatalogTest {
     void registerExternalPartition_createsConfigWhenAbsent() throws Exception {
         String configPath = "/admin/streams/public/default/my-topic";
         String partPath = "/streams/public/default/my-topic-partition-0";
-        when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(null));
-        when(oxiaClient.put(any(), any(byte[].class), any()))
-            .thenReturn(CompletableFuture.completedFuture(new PutResult("key", DUMMY_VERSION)));
+        var currentConfig = new java.util.concurrent.atomic.AtomicReference<byte[]>();
+        when(oxiaClient.get(configPath)).thenAnswer(ignored ->
+            CompletableFuture.completedFuture(currentConfig.get() == null ? null
+                : new GetResult(configPath, currentConfig.get(), DUMMY_VERSION)));
+        when(oxiaClient.put(eq(configPath), any(byte[].class), any()))
+            .thenAnswer(invocation -> {
+                currentConfig.set(invocation.getArgument(1, byte[].class));
+                return CompletableFuture.completedFuture(
+                    new PutResult(configPath, DUMMY_VERSION));
+            });
+        when(oxiaClient.put(eq(partPath), any(byte[].class), any()))
+            .thenReturn(CompletableFuture.completedFuture(
+                new PutResult(partPath, DUMMY_VERSION)));
 
         catalog.registerExternalPartition(streamId, 0, 100L, Map.of("k", "v")).get();
 
@@ -917,4 +1692,79 @@ class IndexedStreamCatalogTest {
         verify(oxiaClient, never()).put(eq(configPath), any(byte[].class),
             eq(Set.of(PutOption.IfVersionIdEquals(DUMMY_VERSION.versionId()))));
     }
+
+    @Test
+    void registerExternalPartition_doesNotWriteMetadataForPermanentlyDeletedStream() {
+        String configPath = "/admin/streams/public/default/my-topic";
+        when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(
+            new GetResult(configPath,
+                "{\"_externalStreamPermanentlyDeleted\":true}"
+                    .getBytes(StandardCharsets.UTF_8),
+                DUMMY_VERSION)));
+
+        ExecutionException failure = assertThrows(ExecutionException.class, () ->
+            catalog.registerExternalPartition(streamId, 2, 100L, Map.of()).get());
+
+        assertInstanceOf(NoSuchStreamException.class, failure.getCause());
+        verify(oxiaClient, never()).put(
+            eq("/streams/public/default/my-topic-partition-2"),
+            any(byte[].class), any());
+    }
+
+    @Test
+    void registerExternalPartition_acceptsMatchingMetadataAfterCreateRace() throws Exception {
+        String configPath = catalogPaths.streamConfigPath(streamId);
+        String partPath = catalogPaths.partitionMetadataPath(streamId, 0);
+        when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(
+            new GetResult(configPath, streamConfigBytes(1, Map.of(), false), DUMMY_VERSION)));
+        mockPartitionMetadata(streamId, 0, 100L, Map.of());
+
+        catalog.registerExternalPartition(streamId, 0, 100L, Map.of()).get();
+
+        verify(oxiaClient, times(2)).get(partPath);
+    }
+
+    @Test
+    void registerExternalPartition_rejectsDifferentMetadataAfterCreateRace() throws Exception {
+        String configPath = catalogPaths.streamConfigPath(streamId);
+        String partPath = catalogPaths.partitionMetadataPath(streamId, 0);
+        when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(
+            new GetResult(configPath, streamConfigBytes(1, Map.of(), false), DUMMY_VERSION)));
+        mockPartitionMetadata(streamId, 0, 200L, Map.of());
+
+        ExecutionException failure = assertThrows(ExecutionException.class, () ->
+            catalog.registerExternalPartition(streamId, 0, 100L, Map.of()).get());
+
+        assertInstanceOf(AlreadyExistsException.class, failure.getCause());
+    }
+
+    @Test
+    void unregisterThenDifferentExternalIdDoesNotReviveStalePartitionMetadata() throws Exception {
+        String configPath = catalogPaths.streamConfigPath(streamId);
+        String partPath = catalogPaths.partitionMetadataPath(streamId, 0);
+        var currentConfig = new java.util.concurrent.atomic.AtomicReference<byte[]>(
+            streamConfigBytes(1, Map.of(), false));
+        when(oxiaClient.get(configPath)).thenAnswer(ignored ->
+            CompletableFuture.completedFuture(currentConfig.get() == null ? null
+                : new GetResult(configPath, currentConfig.get(), DUMMY_VERSION)));
+        when(oxiaClient.put(eq(configPath), any(byte[].class), any()))
+            .thenAnswer(invocation -> {
+                currentConfig.set(invocation.getArgument(1, byte[].class));
+                return CompletableFuture.completedFuture(
+                    new PutResult(configPath, DUMMY_VERSION));
+            });
+        byte[] staleMetadata = LOG_METADATA_SERDE.serialize(
+            partPath, new LogMetadata(200L, Map.of(), OptionalLong.empty()));
+        when(oxiaClient.get(partPath)).thenReturn(CompletableFuture.completedFuture(
+            new GetResult(partPath, staleMetadata, DUMMY_VERSION)));
+
+        catalog.unregisterExternalStream(streamId).join();
+        CompletionException failure = assertThrows(CompletionException.class, () ->
+            catalog.registerExternalPartition(streamId, 0, 100L, Map.of()).join());
+
+        assertInstanceOf(AlreadyExistsException.class, failure.getCause());
+        assertFalse(catalog.streamExists(streamId).join());
+        verify(oxiaClient, never()).delete(eq(partPath), any());
+    }
+
 }

@@ -5,6 +5,8 @@
 package io.lakestream.ursa.catalog.metadata;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 
 import java.nio.charset.StandardCharsets;
@@ -20,11 +22,34 @@ class LogMetadataSerdeTest {
     @Test
     void preservesPersistedJsonFormat() throws Exception {
         assertMetadata(new LogMetadata(1L, null, OptionalLong.of(2L)),
-                "{\"streamId\":1,\"properties\":{},\"terminatedOffset\":2}");
+                "{\"streamId\":1,\"properties\":{},\"terminatedOffset\":2,\"deleted\":false}");
         assertMetadata(new LogMetadata(2L, null, OptionalLong.empty()),
-                "{\"streamId\":2,\"properties\":{},\"terminatedOffset\":null}");
+                "{\"streamId\":2,\"properties\":{},\"terminatedOffset\":null,\"deleted\":false}");
         assertMetadata(new LogMetadata(3L, Map.of("key", "value"), OptionalLong.of(4L)),
-                "{\"streamId\":3,\"properties\":{\"key\":\"value\"},\"terminatedOffset\":4}");
+                "{\"streamId\":3,\"properties\":{\"key\":\"value\"},\"terminatedOffset\":4,\"deleted\":false}");
+    }
+
+    @Test
+    void roundTripsRegistrationAndDeletionFields() throws Exception {
+        assertMetadata(new LogMetadata(4L, Map.of("key", "value"), OptionalLong.of(5L),
+                        "incarnation-1", "owner-1", 7L, true),
+                "{\"streamId\":4,\"properties\":{\"key\":\"value\"},\"terminatedOffset\":5,"
+                        + "\"registrationIncarnationId\":\"incarnation-1\","
+                        + "\"registrationOwnerToken\":\"owner-1\","
+                        + "\"registrationOwnerGeneration\":7,\"deleted\":true}");
+    }
+
+    @Test
+    void readsLegacyJsonWithoutRegistrationAndDeletionFields() throws Exception {
+        byte[] content = "{\"streamId\":3,\"properties\":{},\"terminatedOffset\":4}"
+                .getBytes(StandardCharsets.UTF_8);
+
+        LogMetadata metadata = SERDE.deserialize(METADATA_PATH, content);
+
+        assertNull(metadata.registrationIncarnationId());
+        assertNull(metadata.registrationOwnerToken());
+        assertNull(metadata.registrationOwnerGeneration());
+        assertFalse(metadata.deleted());
     }
 
     @Test

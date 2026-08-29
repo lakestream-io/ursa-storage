@@ -47,6 +47,11 @@ class UrsaKafkaStreamCatalogProviderTest {
             }
 
             @Override
+            public CompletableFuture<Void> permanentlyDeleteExternalStream(StreamIdentifier id) {
+                return CompletableFuture.completedFuture(null);
+            }
+
+            @Override
             public void close() {
             }
         };

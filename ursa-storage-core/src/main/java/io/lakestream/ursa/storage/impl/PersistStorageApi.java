@@ -56,6 +56,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -157,7 +158,8 @@ public class PersistStorageApi implements StorageApi {
         StreamProperties value = new StreamProperties(key);
         try {
             return oxiaClient.put(STREAM_REGISTER_PATH + "/" + streamId,
-                            STREAM_PROPERTIES_WRITER.writeValueAsBytes(value))
+                            STREAM_PROPERTIES_WRITER.writeValueAsBytes(value),
+                            Set.of(PutOption.IfRecordDoesNotExist))
                     .thenApply(x -> streamId);
         } catch (IOException e) {
             return CompletableFuture.failedFuture(
@@ -215,6 +217,59 @@ public class PersistStorageApi implements StorageApi {
     }
 
     @Override
+    public CompletableFuture<Void> deleteStreamIdMapping(String key, long expectedStreamId) {
+        String keyPath = STREAM_ID_GENERATOR_PATH + "/" + key;
+        Set<GetOption> getOptions = Set.of(GetOption.PartitionKey(STREAM_ID_GENERATOR_PATH));
+        return oxiaClient.get(keyPath, getOptions).thenCompose(result -> {
+            if (result == null) {
+                return CompletableFuture.completedFuture(null);
+            }
+            long currentStreamId = Long.parseLong(
+                new String(result.value(), StandardCharsets.UTF_8));
+            if (currentStreamId != expectedStreamId) {
+                return CompletableFuture.completedFuture(null);
+            }
+            return oxiaClient.delete(keyPath, Set.of(
+                    DeleteOption.PartitionKey(STREAM_ID_GENERATOR_PATH),
+                    DeleteOption.IfVersionIdEquals(result.version().versionId())))
+                .handle((deleted, failure) -> new ConditionalDeleteResult(
+                    Boolean.TRUE.equals(deleted), failure == null ? null
+                        : FutureUtils.unwrapCompletionException(failure)))
+                .thenCompose(delete -> {
+                    if (delete.deleted()) {
+                        return CompletableFuture.completedFuture(null);
+                    }
+                    if (delete.failure() instanceof UnexpectedVersionIdException) {
+                        return deleteStreamIdMapping(key, expectedStreamId);
+                    }
+                    if (delete.failure() != null) {
+                        return CompletableFuture.failedFuture(delete.failure());
+                    }
+                    return verifyConditionalMappingDelete(keyPath, getOptions, expectedStreamId);
+                });
+        });
+    }
+
+    private CompletableFuture<Void> verifyConditionalMappingDelete(
+            String keyPath, Set<GetOption> getOptions, long expectedStreamId) {
+        return oxiaClient.get(keyPath, getOptions).thenCompose(current -> {
+            if (current == null) {
+                return CompletableFuture.completedFuture(null);
+            }
+            long currentStreamId = Long.parseLong(
+                new String(current.value(), StandardCharsets.UTF_8));
+            if (currentStreamId != expectedStreamId) {
+                return CompletableFuture.completedFuture(null);
+            }
+            return CompletableFuture.failedFuture(new IllegalStateException(
+                "Conditional keyed stream-ID delete returned false for " + keyPath));
+        });
+    }
+
+    private record ConditionalDeleteResult(boolean deleted, Throwable failure) {
+    }
+
+    @Override
     public CompletableFuture<Map<Long, StreamProperties>> listStreamsWithProperties() {
         String prefix = STREAM_REGISTER_PATH + "/";
         var rangeScan = new RangeScanConsumerImpl();
@@ -240,38 +295,102 @@ public class PersistStorageApi implements StorageApi {
 
     private CompletableFuture<Long> internalGenerateStreamId(Optional<String> key) {
         if (key.isPresent()) {
-            String keyPath = STREAM_ID_GENERATOR_PATH + "/" + key.get();
+            String streamKey = key.orElseThrow();
+            String keyPath = STREAM_ID_GENERATOR_PATH + "/" + streamKey;
             return oxiaClient.get(keyPath, Set.of(GetOption.PartitionKey(STREAM_ID_GENERATOR_PATH)))
                 .thenCompose(result -> {
                     if (result == null) {
                         return generateId()
-                            .thenCompose(streamId ->
-                                oxiaClient.put(keyPath, streamId.toString().getBytes(StandardCharsets.UTF_8),
-                                        Set.of(PutOption.IfRecordDoesNotExist,
-                                            PutOption.PartitionKey(STREAM_ID_GENERATOR_PATH)))
-                                    .handle((r, e) -> {
-                                        if (e != null) {
-                                            if (e.getCause() instanceof KeyAlreadyExistsException) {
-                                                return null;
-                                            } else {
-                                                throw new CompletionException(e);
-                                            }
-                                        }
-                                        return r;
-                                    }).thenCompose(pr -> {
-                                        if (pr == null) {
-                                            return generateStreamId(key);
-                                        } else {
-                                            return registerStream(streamId, key.orElse(null));
-                                        }
-                                    }));
-                    } else {
-                        return CompletableFuture.completedFuture(
-                            Long.parseLong(new String(result.value(), StandardCharsets.UTF_8)));
+                            .thenCompose(streamId -> createKeyedStreamIdMapping(
+                                streamKey, keyPath, streamId));
                     }
+                    long streamId = Long.parseLong(
+                        new String(result.value(), StandardCharsets.UTF_8));
+                    return ensureStreamRegistered(streamId, streamKey);
                 });
         }
         return generateId().thenCompose(streamId -> registerStream(streamId, null));
+    }
+
+    private CompletableFuture<Long> createKeyedStreamIdMapping(
+            String streamKey, String keyPath, long streamId) {
+        Set<GetOption> getOptions = Set.of(GetOption.PartitionKey(STREAM_ID_GENERATOR_PATH));
+        return oxiaClient.put(keyPath, Long.toString(streamId).getBytes(StandardCharsets.UTF_8),
+                Set.of(PutOption.IfRecordDoesNotExist,
+                    PutOption.PartitionKey(STREAM_ID_GENERATOR_PATH)))
+            .handle((result, failure) -> new MappingWriteResult(
+                failure == null ? null : FutureUtils.unwrapCompletionException(failure)))
+            .thenCompose(write -> {
+                if (write.failure() == null) {
+                    return ensureStreamRegistered(streamId, streamKey);
+                }
+                return oxiaClient.get(keyPath, getOptions)
+                    .handle((current, readFailure) -> new MappingReadResult(
+                        current, readFailure == null ? null
+                            : FutureUtils.unwrapCompletionException(readFailure)))
+                    .thenCompose(read -> {
+                        if (read.failure() != null) {
+                            write.failure().addSuppressed(read.failure());
+                            return CompletableFuture.failedFuture(write.failure());
+                        }
+                        if (read.result() != null) {
+                            long mappedStreamId = Long.parseLong(new String(
+                                read.result().value(), StandardCharsets.UTF_8));
+                            if (mappedStreamId == streamId) {
+                                return ensureStreamRegistered(streamId, streamKey);
+                            }
+                        }
+                        if (read.result() == null
+                                && !(write.failure() instanceof KeyAlreadyExistsException)) {
+                            return CompletableFuture.failedFuture(write.failure());
+                        }
+                        return internalGenerateStreamId(Optional.of(streamKey));
+                    });
+            });
+    }
+
+    private CompletableFuture<Long> ensureStreamRegistered(long streamId, String key) {
+        return registerStream(streamId, key)
+            .handle((registered, failure) -> new RegistrationWriteResult(
+                registered, failure == null ? null
+                    : FutureUtils.unwrapCompletionException(failure)))
+            .thenCompose(write -> {
+                if (write.failure() == null) {
+                    return CompletableFuture.completedFuture(write.streamId());
+                }
+                String path = STREAM_REGISTER_PATH + "/" + streamId;
+                return oxiaClient.get(path)
+                    .handle((current, readFailure) -> new MappingReadResult(
+                        current, readFailure == null ? null
+                            : FutureUtils.unwrapCompletionException(readFailure)))
+                    .thenCompose(read -> {
+                        if (read.failure() != null) {
+                            write.failure().addSuppressed(read.failure());
+                            return CompletableFuture.failedFuture(write.failure());
+                        }
+                        if (read.result() != null) {
+                            try {
+                                StreamProperties current = deserializeStreamProperties(
+                                    read.result().value());
+                                if (Objects.equals(current.key(), key)) {
+                                    return CompletableFuture.completedFuture(streamId);
+                                }
+                            } catch (IOException e) {
+                                write.failure().addSuppressed(e);
+                            }
+                        }
+                        return CompletableFuture.failedFuture(write.failure());
+                    });
+            });
+    }
+
+    private record MappingWriteResult(Throwable failure) {
+    }
+
+    private record MappingReadResult(GetResult result, Throwable failure) {
+    }
+
+    private record RegistrationWriteResult(Long streamId, Throwable failure) {
     }
 
     private CompletableFuture<Long> generateId() {
