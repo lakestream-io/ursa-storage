@@ -9,6 +9,8 @@ import static org.junit.Assert.fail;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anySet;
 import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -118,6 +120,10 @@ public class AsyncCleanerTest {
 
         // Assert
         verify(mockFileStorage).deleteWithDatePrefixes(anySet());
+        // The stubs above remove the end-to-end lock exercise, so pin the call sites instead:
+        // cleanup() must still take the lock and release it in its finally block.
+        verify(asyncCleaner).lock();
+        verify(asyncCleaner).unlock();
         S3Client s3Client = ursaStorageTestBase.getS3BasedTestClass().s3Client;
         GetBucketLifecycleConfigurationRequest request = GetBucketLifecycleConfigurationRequest.builder()
             .bucket(ursaStorageTestBase.getS3BasedTestClass().bucket).build();
@@ -137,6 +143,27 @@ public class AsyncCleanerTest {
 
         assertTrue(expectedPrefixes.isEmpty());
         assertEquals("2024/03/15/09/01/01/__dummy", new String(mockOxiaClient.get("ursa-wal-delete-marker").get().value()));
+    }
+
+    @Test
+    public void testCleanupSkipsWorkAndKeepsForeignLockWhenLockNotAcquired() throws Exception {
+        WalStorage walStorage = spy(ursaStorageTestBase.getFailureInjectedStorage());
+        FileStorage mockFileStorage = spy(walStorage.getFileStorage());
+        when(walStorage.getFileStorage()).thenReturn(mockFileStorage);
+
+        @Cleanup("stop")
+        AsyncCleaner asyncCleaner = spy(new AsyncCleaner(spy(storageApi), walStorage,
+            ursaStorageTestBase.getConfig().getUrsaConfig()));
+
+        // lock() uses IfRecordDoesNotExist, so this is what a lock held by another node looks like.
+        doThrow(new IllegalStateException("lock is held by another node")).when(asyncCleaner).lock();
+
+        asyncCleaner.cleanup();
+
+        // The failure is swallowed and logged; this run must simply do nothing.
+        verify(mockFileStorage, never()).deleteWithDatePrefixes(anySet());
+        // And it must not delete a lock it never acquired - doing so would break mutual exclusion.
+        verify(asyncCleaner, never()).unlock();
     }
 
 //    @Test

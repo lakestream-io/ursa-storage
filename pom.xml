@@ -133,6 +133,12 @@
 
     <testMaxHeapSize>1024M</testMaxHeapSize>
     <testHeapDumpPath>/tmp</testHeapDumpPath>
+    <!--
+      The otel.*.exporter=none flags below keep OpenTelemetry autoconfiguration from selecting the
+      OTLP exporter in test JVMs. CompactionScheduler no longer relies on them - it supplies the same
+      defaults programmatically - but modules such as ursa-storage-tools do ship exporter artifacts,
+      so without these their tests would autoconfigure a live OTLP exporter and attempt to export.
+    -->
     <test.additional.args>
       -Dnet.bytebuddy.experimental=true
       -Dio.netty.tryReflectionSetAccessible=true
@@ -645,10 +651,6 @@
           <exclusion>
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-annotations</artifactId>
-          </exclusion>
-          <exclusion>
-            <groupId>io.netty</groupId>
-            <artifactId>netty-transport-native-unix-common</artifactId>
           </exclusion>
           <exclusion>
             <groupId>com.fasterxml.jackson.core</groupId>
@@ -2445,6 +2447,7 @@
           <excludes>
             <exclude>LICENSE</exclude>
             <exclude>NOTICE</exclude>
+            <exclude>.trivyignore</exclude>
             <exclude>resources/license.template</exclude>
             <exclude>**/build/**</exclude>
             <exclude>**/ahc.properties</exclude>

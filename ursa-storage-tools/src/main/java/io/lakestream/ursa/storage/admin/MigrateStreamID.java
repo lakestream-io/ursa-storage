@@ -27,6 +27,10 @@ import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
 import picocli.CommandLine;
 
 /**
@@ -36,6 +40,12 @@ import picocli.CommandLine;
  * After: same key with value {@code {"key": "analytics/orders"}}.
  *
  * <p>Keys are opaque stream names interpreted by the integration that created them.
+ *
+ * <p>Operationally, this streams every record in the Oxia shard that holds
+ * {@link StorageFormat#STREAM_ID_GENERATOR_PATH}, not just the stream-id entries, so its runtime
+ * scales with total shard contents rather than with the number of streams. On large clusters run it
+ * during a maintenance window and raise {@code --scan-timeout-minutes} if needed. Re-running is
+ * safe: entries that already hold valid {@link StreamProperties} are left untouched.
  */
 @CommandLine.Command(
     name = "migrate-stream-id",
@@ -46,20 +56,30 @@ public class MigrateStreamID implements Callable<Integer> {
     @CommandLine.ParentCommand
     private Admin parent;
 
+    @CommandLine.Option(
+        names = "--scan-timeout-minutes",
+        description = "Abort the stream-id shard scan after this many minutes (default: ${DEFAULT-VALUE}).")
+    private long scanTimeoutMinutes = 10;
+
     private Map<String, Long> getKeyToStreamIdMap(AsyncOxiaClient oxiaClient) {
         var keyPrefix = StorageFormat.STREAM_ID_GENERATOR_PATH + "/";
         var keyToStreamIdMap = new HashMap<String, Long>();
         var scanFuture = new CompletableFuture<Map<String, Long>>();
+        var scannedRecords = new AtomicLong();
 
-        // In hierarchical namespaces, descendants at different slash depths are not contiguous.
-        // Empty bounds scan all user keys in the routed shard. Filter while streaming so client
-        // memory is bounded by the number of stream mappings rather than all records in the shard.
+        // Oxia orders keys by slash-component count first, so descendants at different depths are
+        // not contiguous and no non-empty bound pair covers them all. Empty bounds scan every user
+        // key in the routed shard, and we filter while streaming so retained memory is bounded by
+        // the number of stream mappings. Note the scan still transfers every record in that shard,
+        // including WAL index records, so its cost scales with total shard contents rather than
+        // with the number of streams.
         oxiaClient.rangeScan(
                 "",
                 "",
                 new RangeScanConsumer() {
                     @Override
                     public synchronized boolean onNext(GetResult result) {
+                        scannedRecords.incrementAndGet();
                         if (!result.key().startsWith(keyPrefix)) {
                             return true;
                         }
@@ -72,7 +92,10 @@ public class MigrateStreamID implements Callable<Integer> {
                             }
                             return true;
                         } catch (RuntimeException error) {
-                            scanFuture.completeExceptionally(error);
+                            // Name the offending record: without it the operator gets a bare
+                            // "For input string" and no way to find the entry that aborted the run.
+                            scanFuture.completeExceptionally(new IllegalStateException(
+                                    "Invalid stream-id mapping at key " + result.key(), error));
                             return false;
                         }
                     }
@@ -88,7 +111,22 @@ public class MigrateStreamID implements Callable<Integer> {
                     }
                 },
                 Set.of(RangeScanOption.PartitionKey(StorageFormat.STREAM_ID_GENERATOR_PATH)));
-        return scanFuture.join();
+
+        try {
+            var mappings = scanFuture.get(scanTimeoutMinutes, TimeUnit.MINUTES);
+            System.out.println("Scanned " + scannedRecords.get() + " records in the routed shard; found "
+                    + mappings.size() + " stream-id mappings.");
+            return mappings;
+        } catch (TimeoutException e) {
+            throw new IllegalStateException("Timed out after " + scanTimeoutMinutes
+                    + " minute(s) scanning the stream-id shard (" + scannedRecords.get()
+                    + " records read so far). Re-run with a larger --scan-timeout-minutes.", e);
+        } catch (ExecutionException e) {
+            throw new CompletionException(e.getCause());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while scanning the stream-id shard", e);
+        }
     }
 
     private final ObjectReader streamPropertiesReader =
@@ -133,8 +171,9 @@ public class MigrateStreamID implements Callable<Integer> {
         try (storageApi) {
             return execute(storageApi);
         } catch (Exception e) {
-            System.err.println("Error: Failed to migrate stream IDs: " + e.getMessage());
-            e.printStackTrace();
+            var cause = FutureUtils.unwrapCompletionException(e);
+            System.err.println("Error: Failed to migrate stream IDs: " + cause);
+            cause.printStackTrace();
             return 1;
         } finally {
             Admin.cleanup();
@@ -149,6 +188,13 @@ public class MigrateStreamID implements Callable<Integer> {
             futures.add(checkAndUpdateStreamId(oxiaClient, entry.getValue(), entry.getKey()));
         }
         FutureUtils.waitForAll(futures).join();
+        if (keyToStreamIdMap.isEmpty()) {
+            // Distinguish "nothing to migrate" from "the scan came back empty". Both previously
+            // printed nothing and exited 0, which made a no-op run look like a successful one.
+            System.out.println("No stream-id mappings found; nothing to migrate.");
+        } else {
+            System.out.println("Processed " + keyToStreamIdMap.size() + " stream-id mapping(s).");
+        }
         return 0;
     }
 }
