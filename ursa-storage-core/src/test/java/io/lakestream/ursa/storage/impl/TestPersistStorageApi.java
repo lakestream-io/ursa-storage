@@ -16,6 +16,7 @@ import static org.junit.jupiter.api.Assertions.fail;
 
 import io.lakestream.api.EntryHeader;
 import io.lakestream.api.EntryIndex;
+import io.lakestream.api.LogId;
 import io.lakestream.api.LogState;
 import io.lakestream.api.Position;
 import io.lakestream.api.exception.LogFencedException;
@@ -441,6 +442,18 @@ public class TestPersistStorageApi {
     public void generateAndDeleteEmptyStreamId() throws Exception {
         long streamId = storage.generateStreamId().get();
         storage.deleteStream(streamId).get();
+    }
+
+    @Test
+    public void deleteLogIsIdempotentAcrossCrashReplay() throws Exception {
+        long streamId = storage.generateStreamId().get();
+        StorageApiLogStorage logStorage = new StorageApiLogStorage(storage);
+
+        logStorage.deleteLog(LogId.of(streamId)).get();
+        logStorage.deleteLog(LogId.of(streamId)).get();
+
+        assertTrue(storage.listStreams().get().stream()
+            .noneMatch(id -> id == streamId));
     }
 
     @Test

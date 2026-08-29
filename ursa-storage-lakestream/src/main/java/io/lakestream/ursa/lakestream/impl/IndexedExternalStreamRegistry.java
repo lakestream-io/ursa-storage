@@ -41,6 +41,11 @@ final class IndexedExternalStreamRegistry implements ExternalStreamRegistry {
     }
 
     @Override
+    public CompletableFuture<Void> permanentlyDeleteExternalStream(StreamIdentifier id) {
+        return streamConfigStore.permanentlyDeleteExternalStream(id);
+    }
+
+    @Override
     public void close() {
         if (!closed.compareAndSet(false, true)) {
             return;

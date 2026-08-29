@@ -61,9 +61,12 @@ class IndexedStreamCatalogStreamPolicyTest {
     @BeforeEach
     void setUp() {
         catalogPaths = new DefaultCatalogPaths();
-        catalog = new IndexedStreamCatalog(oxiaClient, catalogPaths, logStorage,
-            logId -> null, null,
+        catalog = IndexedStreamCatalog.withConditionalStreamIdMappingDeletion(
+            oxiaClient, catalogPaths, logStorage,
+            (name, logId, reader) -> null, null,
             key -> CompletableFuture.completedFuture(nextStreamId++),
+            key -> CompletableFuture.completedFuture(-1L),
+            (key, expectedStreamId) -> CompletableFuture.completedFuture(null),
             null, null, List.of());
         catalog.initialize("test-catalog", Map.of()).join();
         streamId = new StreamIdentifier("public/default", "mat-topic");

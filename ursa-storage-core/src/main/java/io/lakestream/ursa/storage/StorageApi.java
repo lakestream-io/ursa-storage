@@ -14,6 +14,7 @@ import io.oxia.client.api.AsyncOxiaClient;
 import java.io.Closeable;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -51,6 +52,16 @@ import java.util.concurrent.CompletableFuture;
  * non-blocking operations, enhancing the overall performance and scalability of the
  * storage system.
  *
+ * <p>Catalog implementations that clean up keyed stream allocations require an atomic, durable
+ * mapping fence. Implementations that do not advertise
+ * {@link #supportsFencedStreamIdMappings()} remain usable for operations that do not encounter
+ * retired allocations, but destructive lifecycle operations fail with
+ * {@link UnsupportedOperationException}. A conditional delete alone cannot close the window in
+ * which an allocator started before deletion publishes after the key becomes absent. The catalog
+ * must also not emulate fencing with {@link #getStreamIdByKey(String)} followed by
+ * {@link #deleteStreamIdMapping(String)} because a concurrent replacement between those calls
+ * would be deleted without ownership fencing.
+ *
  * <p>Implementations of this interface should handle the coordination between these
  * different components, ensuring:
  * <ul>
@@ -67,20 +78,282 @@ import java.util.concurrent.CompletableFuture;
 public interface StorageApi extends Closeable {
 
     /**
-     * Generates a new stream ID.
-     * @return
+     * Generates a globally unique stream ID that is never reused by this storage instance.
+     *
+     * @return a future resolving to a fresh stream ID
      */
     default CompletableFuture<Long> generateStreamId() {
         return generateStreamId(Optional.empty());
     }
 
     /**
-     * Generates a new stream ID with the specified key. The key will binding to the stream ID.
+     * Generates or resolves a stream ID bound to the specified key.
+     *
+     * <p>Every newly generated numeric ID must be globally unique and must never be reused, even
+     * after its keyed mapping and physical log have been retired. Lifecycle cleanup relies on this
+     * invariant to ensure an old cleanup journal cannot delete a later log with the same ID.
      *
      * @param key The key of the stream
      * @return A CompletableFuture that resolves to the generated stream ID
      */
     CompletableFuture<Long> generateStreamId(Optional<String> key);
+
+    /**
+     * Allocates a stream ID and reports whether this invocation created its keyed mapping.
+     *
+     * <p>The default is deliberately conservative for existing implementations: without an
+     * atomic allocation result, callers must treat the returned mapping as reused and must not
+     * destructively compensate it after a higher-level operation is rejected.
+     *
+     * @param key the optional key to bind to the stream ID
+     * @return the allocated stream ID and keyed-mapping provenance
+     */
+    default CompletableFuture<StreamIdAllocation> allocateStreamId(Optional<String> key) {
+        return generateStreamId(key).thenApply(streamId ->
+            new StreamIdAllocation(streamId, false));
+    }
+
+    /** Result of a stream-ID allocation. */
+    record StreamIdAllocation(long streamId, boolean createdKeyedMapping) {
+    }
+
+    /**
+     * Durable identity of the catalog lifecycle that owns a keyed stream-ID mapping.
+     *
+     * <p>The incarnation prevents a generation counter that restarts for a recreated logical
+     * stream from being confused with an older lifecycle. The token distinguishes competing
+     * owners within one incarnation, while the generation orders ownership changes recorded by
+     * the catalog.
+     */
+    record StreamIdMappingOwner(
+            String incarnationId, String ownerToken, long ownerGeneration) {
+
+        private static final String LEGACY_IDENTITY = "__legacy__";
+
+        public StreamIdMappingOwner {
+            Objects.requireNonNull(incarnationId, "incarnationId");
+            Objects.requireNonNull(ownerToken, "ownerToken");
+            if (incarnationId.isBlank()) {
+                throw new IllegalArgumentException("incarnationId must not be blank");
+            }
+            if (ownerToken.isBlank()) {
+                throw new IllegalArgumentException("ownerToken must not be blank");
+            }
+            if (ownerGeneration < 0) {
+                throw new IllegalArgumentException("ownerGeneration must be non-negative");
+            }
+        }
+
+        /** Returns the synthetic owner used when reading the legacy numeric mapping format. */
+        public static StreamIdMappingOwner legacy() {
+            return new StreamIdMappingOwner(LEGACY_IDENTITY, LEGACY_IDENTITY, 0);
+        }
+
+        /** Returns whether this is the synthetic owner of a legacy numeric mapping. */
+        public boolean isLegacy() {
+            return incarnationId.equals(LEGACY_IDENTITY)
+                && ownerToken.equals(LEGACY_IDENTITY)
+                && ownerGeneration == 0;
+        }
+    }
+
+    /**
+     * Descriptor of a durable keyed-mapping tombstone.
+     *
+     * <p>A caller must retain this descriptor in its cleanup journal and acknowledge the exact
+     * descriptor before a later owner can replace the tombstone. A stream ID of {@code -1}
+     * represents a fence installed while the mapping was absent.
+     */
+    record StreamIdMappingFence(long streamId, StreamIdMappingOwner owner) {
+
+        public StreamIdMappingFence {
+            if (streamId < -1) {
+                throw new IllegalArgumentException("streamId must be -1 or non-negative");
+            }
+            Objects.requireNonNull(owner, "owner");
+        }
+    }
+
+    /** Descriptor of an active keyed stream-ID mapping observed by an atomic fence attempt. */
+    record ActiveStreamIdMapping(long streamId, StreamIdMappingOwner owner) {
+
+        public ActiveStreamIdMapping {
+            if (streamId < 0) {
+                throw new IllegalArgumentException("streamId must be non-negative");
+            }
+            Objects.requireNonNull(owner, "owner");
+        }
+    }
+
+    /**
+     * Atomic outcome of a lifecycle-aware keyed-mapping fence.
+     *
+     * <p>{@link Fenced} proves that the key contains the returned durable tombstone. {@link
+     * PreservedActive} reports the complete active mapping that was deliberately left unchanged
+     * because it did not match the expected lifecycle.
+     */
+    interface StreamIdMappingFenceResult {
+
+        /** A durable tombstone was installed or was already present. */
+        record Fenced(StreamIdMappingFence fence) implements StreamIdMappingFenceResult {
+
+            public Fenced {
+                Objects.requireNonNull(fence, "fence");
+            }
+        }
+
+        /** A non-matching active mapping was observed and preserved. */
+        record PreservedActive(ActiveStreamIdMapping mapping)
+                implements StreamIdMappingFenceResult {
+
+            public PreservedActive {
+                Objects.requireNonNull(mapping, "mapping");
+            }
+        }
+    }
+
+    /**
+     * Reports an active keyed mapping that cannot be allocated or bound by another lifecycle.
+     */
+    final class StreamIdMappingConflictException extends IllegalStateException {
+
+        private final String key;
+        private final ActiveStreamIdMapping activeMapping;
+
+        public StreamIdMappingConflictException(
+                String key, ActiveStreamIdMapping activeMapping) {
+            super("Keyed stream-ID mapping is active for a different owner or stream ID at "
+                + Objects.requireNonNull(key, "key") + " (streamId="
+                + Objects.requireNonNull(activeMapping, "activeMapping").streamId() + ")");
+            this.key = key;
+            this.activeMapping = activeMapping;
+        }
+
+        /** Returns the logical mapping key that conflicted. */
+        public String key() {
+            return key;
+        }
+
+        /** Returns the active mapping that was preserved. */
+        public ActiveStreamIdMapping activeMapping() {
+            return activeMapping;
+        }
+    }
+
+    /**
+     * Allocates a keyed stream ID for a durable lifecycle owner.
+     *
+     * <p>An existing active mapping is reused only when it has the same owner. A tombstone is
+     * replaced only when {@code acknowledgedFence} exactly matches its durable descriptor.
+     *
+     * @param key the key to bind
+     * @param owner the lifecycle that will own the active mapping
+     * @param acknowledgedFence the exact preceding tombstone, when replacing one
+     * @return the allocated stream ID and whether this call installed the active mapping
+     */
+    default CompletableFuture<StreamIdAllocation> allocateStreamId(
+            String key, StreamIdMappingOwner owner,
+            Optional<StreamIdMappingFence> acknowledgedFence) {
+        return CompletableFuture.failedFuture(new UnsupportedOperationException(
+            "Lifecycle-aware keyed stream-ID allocation is not supported by this storage"));
+    }
+
+    /**
+     * Binds an already allocated stream ID to a durable lifecycle owner.
+     *
+     * <p>This is used to atomically adopt a legacy broker-created numeric mapping without changing
+     * its stream ID. A different active owner or stream ID is never overwritten. As with
+     * lifecycle-aware allocation, replacing a tombstone requires its exact descriptor.
+     */
+    default CompletableFuture<Void> bindStreamIdMapping(
+            String key, long streamId, StreamIdMappingOwner owner,
+            Optional<StreamIdMappingFence> acknowledgedFence) {
+        return CompletableFuture.failedFuture(new UnsupportedOperationException(
+            "Lifecycle-aware keyed stream-ID binding is not supported by this storage"));
+    }
+
+    /**
+     * Atomically fences or observes a keyed mapping for the expected lifecycle.
+     *
+     * <p>When {@code expectedStreamId} is {@code -1}, an active mapping owned by {@code
+     * expectedOwner} represents an allocation that raced publication with an absent-key fence. The
+     * implementation must fence that mapping's actual stream ID and return it in {@link
+     * StreamIdMappingFenceResult.Fenced}. A non-matching active mapping must be preserved and
+     * returned in {@link StreamIdMappingFenceResult.PreservedActive}.
+     */
+    default CompletableFuture<StreamIdMappingFenceResult> fenceStreamIdMappingState(
+            String key, long expectedStreamId, StreamIdMappingOwner expectedOwner) {
+        return CompletableFuture.failedFuture(new UnsupportedOperationException(
+            "Lifecycle-aware keyed stream-ID fencing is not supported by this storage"));
+    }
+
+    /**
+     * Atomically fences an active keyed mapping owned by the expected lifecycle.
+     *
+     * <p>The result contains the durable tombstone descriptor when a fence is installed or already
+     * present. An empty result means an active mapping belongs to another owner or stream ID and
+     * was left unchanged. When the mapping is absent, the implementation installs a stable
+     * {@code -1} tombstone owned by {@code expectedOwner} so an older in-flight allocator cannot
+     * publish afterward.
+     *
+     * @deprecated use {@link #fenceStreamIdMappingState(String, long, StreamIdMappingOwner)} to
+     *     distinguish a durable fence from the active mapping that was preserved
+     */
+    @Deprecated
+    default CompletableFuture<Optional<StreamIdMappingFence>> fenceStreamIdMapping(
+            String key, long expectedStreamId, StreamIdMappingOwner expectedOwner) {
+        return fenceStreamIdMappingState(key, expectedStreamId, expectedOwner)
+            .thenApply(result -> result instanceof StreamIdMappingFenceResult.Fenced fenced
+                ? Optional.of(fenced.fence()) : Optional.empty());
+    }
+
+    /**
+     * Rewrites an exact durable tombstone into its canonical descriptor.
+     *
+     * <p>This operation lets cleanup collapse one or more retired allocation descriptors into the
+     * current partition tombstone. It must never overwrite an active mapping or a different
+     * tombstone.
+     */
+    default CompletableFuture<Void> canonicalizeStreamIdMappingFence(
+            String key, StreamIdMappingFence expectedFence,
+            StreamIdMappingFence canonicalFence) {
+        return CompletableFuture.failedFuture(new UnsupportedOperationException(
+            "Lifecycle-aware keyed stream-ID fence canonicalization is not supported"));
+    }
+
+    /**
+     * Returns whether durable lifecycle-aware mapping fences are implemented atomically.
+     *
+     * <p>The default is {@code false} so older and custom implementations remain binary
+     * compatible without being treated as safe for cleanup-journal acknowledgement.
+     */
+    default boolean supportsFencedStreamIdMappings() {
+        return false;
+    }
+
+    /**
+     * Reports that a keyed allocation became invalid after its stream registration was made
+     * durable.
+     *
+     * <p>The allocation is retained so a lifecycle-aware caller can safely compensate resources
+     * that this storage layer cannot delete without knowing whether the stream ID was published.
+     */
+    final class KeyedAllocationInvalidatedException extends RuntimeException {
+
+        private final StreamIdAllocation allocation;
+
+        public KeyedAllocationInvalidatedException(
+                StreamIdAllocation allocation, Throwable cause) {
+            super("Keyed stream-ID allocation was invalidated for stream ID "
+                + Objects.requireNonNull(allocation, "allocation").streamId(), cause);
+            this.allocation = allocation;
+        }
+
+        /** Returns the allocation that failed its final keyed-mapping validation. */
+        public StreamIdAllocation allocation() {
+            return allocation;
+        }
+    }
 
     /**
      * Retrieves the stream ID associated with the specified key.
@@ -91,16 +364,55 @@ public interface StorageApi extends Closeable {
     CompletableFuture<Long> getStreamIdByKey(String key);
 
     /**
-     * Deletes only the keyed stream-ID mapping.
+     * Deletes only an active keyed stream-ID mapping.
      *
      * <p>This operation deliberately does not delete stream data or registration metadata. It is
      * intended for callers that must remove the mapping only after data and higher-level catalog
-     * metadata have been deleted successfully.
+     * metadata have been deleted successfully. An implementation that advertises {@link
+     * #supportsFencedStreamIdMappings()} must never remove a durable tombstone through this legacy
+     * method and may reject the operation entirely.
      *
      * @param key the key whose mapping should be deleted
      * @return a future that completes when the mapping has been deleted
+     * @throws UnsupportedOperationException if unconditional mapping deletion is disabled
+     * @deprecated lifecycle-aware callers must use {@link
+     *     #fenceStreamIdMappingState(String, long, StreamIdMappingOwner)}
      */
+    @Deprecated
     CompletableFuture<Void> deleteStreamIdMapping(String key);
+
+    /**
+     * Removes or durably fences a keyed stream-ID mapping only when it still references the
+     * expected stream ID.
+     *
+     * <p>An implementation that advertises {@link #supportsFencedStreamIdMappings()} must leave a
+     * stable tombstone rather than making the key absent, so an allocator that started before this
+     * operation cannot publish after it completes.
+     *
+     * @param key the key whose mapping should be deleted
+     * @param expectedStreamId the stream ID that the caller still owns
+     * @return a future that completes when the mapping is absent or owned by another stream ID
+     * @throws UnsupportedOperationException if the storage implementation does not support
+     *     conditional keyed-mapping deletion
+     */
+    default CompletableFuture<Void> deleteStreamIdMapping(String key, long expectedStreamId) {
+        return CompletableFuture.failedFuture(new UnsupportedOperationException(
+            "Conditional keyed stream-ID deletion is not supported by this storage"));
+    }
+
+    /**
+     * Returns whether {@link #deleteStreamIdMapping(String, long)} is implemented atomically.
+     *
+     * <p>The default is {@code false} for binary compatibility with existing implementations. A
+     * {@code false} result does not disable metadata-only catalog operations or initial keyed
+     * allocation, but operations that can destructively clean up a keyed mapping must fail before
+     * deleting log data or the mapping.
+     *
+     * @return {@code true} only when conditional keyed-mapping deletion is atomic
+     */
+    default boolean supportsConditionalStreamIdMappingDeletion() {
+        return false;
+    }
 
     /**
      * Retrieves a map of all stream IDs and their associated keys.
@@ -293,6 +605,9 @@ public interface StorageApi extends Closeable {
 
     /**
      * Deletes the specified stream.
+     *
+     * <p>The operation is idempotent: an already absent stream is a successful result.
+     *
      * @param streamId The ID of the stream to delete
      * @return A CompletableFuture that completes when the stream is deleted
      */
@@ -301,12 +616,23 @@ public interface StorageApi extends Closeable {
     }
 
     /**
-     * Deletes the specified stream with the specified key.
+     * Deletes the specified stream through the legacy optional-key API.
+     *
+     * <p>The operation is idempotent when {@code key} is empty. A supplied key cannot safely be
+     * checked and removed by this method: the mapping may be rebound to a replacement lifecycle
+     * between validation and deletion. Lifecycle-aware callers must first use {@link
+     * #fenceStreamIdMappingState(String, long, StreamIdMappingOwner)}, retain the returned durable
+     * fence in their cleanup journal, delete the physical stream through {@link
+     * #deleteStream(long)}, and acknowledge that exact fence only after cleanup succeeds.
+     * Implementations should fail closed when {@code key} is present.
      *
      * @param streamId The ID of the stream to delete
-     * @param key The key of the stream. If the key is present, the stream will be deleted only if the key matches.
+     * @param key An obsolete keyed-mapping argument; only {@link Optional#empty()} is safe
      * @return A CompletableFuture that completes when the stream is deleted
+     * @throws UnsupportedOperationException if {@code key} is present
+     * @deprecated use {@link #deleteStream(long)} and the durable mapping-fence API separately
      */
+    @Deprecated
     CompletableFuture<Void> deleteStream(long streamId, Optional<String> key);
 
     /**

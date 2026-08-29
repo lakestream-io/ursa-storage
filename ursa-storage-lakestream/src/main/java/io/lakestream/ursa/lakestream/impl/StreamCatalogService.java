@@ -226,8 +226,7 @@ public class StreamCatalogService {
 
             IndexedStreamCatalog catalog = new IndexedStreamCatalog(
                 oxiaClient, catalogPaths, logStorage, logFactory,
-                stateManager, storageApi::generateStreamId, storageApi::getStreamIdByKey,
-                storageApi::deleteStreamIdMapping, readerFactory, cache, owned);
+                stateManager, storageApi, readerFactory, cache, owned);
             owned.addAll(additionalOwnedResources);
             additionalResourcesTransferred = true;
             return catalog;

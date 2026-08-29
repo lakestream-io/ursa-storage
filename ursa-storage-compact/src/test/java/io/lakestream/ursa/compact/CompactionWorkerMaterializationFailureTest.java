@@ -10,6 +10,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
@@ -19,6 +20,10 @@ import static org.mockito.Mockito.when;
 
 import io.lakestream.api.Stream;
 import io.lakestream.api.StreamCatalog;
+import io.lakestream.api.StreamIdentifier;
+import io.lakestream.api.exception.NoSuchStreamException;
+import io.lakestream.api.exception.PartitionLifecycleFencedException;
+import io.lakestream.api.exception.StreamPermanentlyDeletedException;
 import io.lakestream.api.materialization.ResolvedMaterialization;
 import io.lakestream.api.materialization.TableCatalog;
 import io.lakestream.api.materialization.TableCatalogType;
@@ -184,6 +189,116 @@ public class CompactionWorkerMaterializationFailureTest {
 
         verify(compactTaskManager).deleteCompactTask(task);
         verify(compactionTaskProvider, never()).quarantineTopic(any(), anyLong());
+    }
+
+    @Test
+    public void permanentlyDeletedRegistrationDeletesTerminalTask() throws Exception {
+        StreamIdentifier id = new StreamIdentifier("default", "deleted-topic");
+        runCatalogFailureAndAssertTaskDeleted(
+            new StreamPermanentlyDeletedException(id), true);
+    }
+
+    @Test
+    public void partitionLifecycleFenceDeletesTerminalTask() throws Exception {
+        StreamIdentifier id = new StreamIdentifier("default", "fenced-topic");
+        runCatalogFailureAndAssertTaskDeleted(
+            new PartitionLifecycleFencedException(
+                id, 0, "partition was deleted in this registration generation"), true);
+    }
+
+    @Test
+    public void missingStreamDuringLoadKeepsTaskForRetry() throws Exception {
+        StreamIdentifier id = new StreamIdentifier("default", "missing-topic");
+        runCatalogFailureAndAssertTaskRetained(new NoSuchStreamException(id));
+    }
+
+    private void runCatalogFailureAndAssertTaskDeleted(
+            RuntimeException catalogFailure, boolean failRegistration) throws Exception {
+        CompactionWorker worker = createWorker();
+        String topic = "default/catalog-failure-topic-partition-0";
+        CompactStreamTask task = new CompactStreamTask();
+        task.setTopic(topic);
+        task.setTaskName("catalog-failure-task");
+        task.setStatus(CompactStreamTask.INIT);
+        task.setStreamId(17L);
+        task.setStartOffset(0L);
+        task.setEndOffset(5L);
+
+        PackagedCompactStreamTask packagedTask = new PackagedCompactStreamTask();
+        packagedTask.setTaskName("catalog-failure-package");
+        packagedTask.setSubTasks(List.of("catalog-failure-subtask"));
+        when(compactionTaskProvider.getTask()).thenReturn(packagedTask).thenReturn(null);
+        when(compactTaskManager.getCompactStreamTask("catalog-failure-subtask"))
+            .thenReturn(CompletableFuture.completedFuture(task));
+        when(compactionTaskProvider.getQuarantinedTopic(topic)).thenReturn(null);
+        when(compactTaskManager.tryLockTask(packagedTask.getTaskName())).thenReturn(true);
+
+        if (failRegistration) {
+            when(streamCatalog.registerExternalPartition(any(), anyInt(), anyLong(), any()))
+                .thenReturn(CompletableFuture.failedFuture(catalogFailure));
+        } else {
+            when(streamCatalog.registerExternalPartition(any(), anyInt(), anyLong(), any()))
+                .thenReturn(CompletableFuture.completedFuture(null));
+            when(streamCatalog.loadStream(any()))
+                .thenReturn(CompletableFuture.failedFuture(catalogFailure));
+        }
+
+        CountDownLatch taskDeleted = new CountDownLatch(1);
+        when(compactTaskManager.deleteCompactTask(task)).thenAnswer(invocation -> {
+            taskDeleted.countDown();
+            return CompletableFuture.completedFuture(null);
+        });
+
+        Thread thread = new Thread(worker);
+        thread.start();
+        assertTrue(taskDeleted.await(10, TimeUnit.SECONDS));
+        thread.interrupt();
+        thread.join(2_000L);
+
+        verify(compactTaskManager).deleteCompactTask(task);
+        verify(compactionTaskProvider, never()).quarantineTopic(any(), anyLong());
+        verify(materializationService, never()).materialize(any());
+    }
+
+    private void runCatalogFailureAndAssertTaskRetained(
+            RuntimeException catalogFailure) throws Exception {
+        CompactionWorker worker = createWorker();
+        String topic = "default/catalog-retry-topic-partition-0";
+        CompactStreamTask task = new CompactStreamTask();
+        task.setTopic(topic);
+        task.setTaskName("catalog-retry-task");
+        task.setStatus(CompactStreamTask.INIT);
+        task.setStreamId(18L);
+        task.setStartOffset(0L);
+        task.setEndOffset(5L);
+
+        PackagedCompactStreamTask packagedTask = new PackagedCompactStreamTask();
+        packagedTask.setTaskName("catalog-retry-package");
+        packagedTask.setSubTasks(List.of("catalog-retry-subtask"));
+        when(compactionTaskProvider.getTask()).thenReturn(packagedTask).thenReturn(null);
+        when(compactTaskManager.getCompactStreamTask("catalog-retry-subtask"))
+            .thenReturn(CompletableFuture.completedFuture(task));
+        when(compactionTaskProvider.getQuarantinedTopic(topic)).thenReturn(null);
+        when(compactTaskManager.tryLockTask(packagedTask.getTaskName())).thenReturn(true);
+        when(streamCatalog.registerExternalPartition(any(), anyInt(), anyLong(), any()))
+            .thenReturn(CompletableFuture.completedFuture(null));
+        when(streamCatalog.loadStream(any()))
+            .thenReturn(CompletableFuture.failedFuture(catalogFailure));
+        CountDownLatch quarantined = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            quarantined.countDown();
+            return null;
+        }).when(compactionTaskProvider).quarantineTopic(any(), anyLong());
+
+        Thread thread = new Thread(worker);
+        thread.start();
+        assertTrue(quarantined.await(10, TimeUnit.SECONDS));
+        thread.interrupt();
+        thread.join(2_000L);
+
+        verify(compactTaskManager, never()).deleteCompactTask(task);
+        verify(compactionTaskProvider).quarantineTopic(eq(topic), anyLong());
+        verify(materializationService, never()).materialize(any());
     }
 
     @Test

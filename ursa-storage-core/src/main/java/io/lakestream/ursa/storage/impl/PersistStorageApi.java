@@ -46,7 +46,6 @@ import io.oxia.client.api.PutResult;
 import io.oxia.client.api.RangeScanConsumer;
 import io.oxia.client.api.exceptions.KeyAlreadyExistsException;
 import io.oxia.client.api.exceptions.UnexpectedVersionIdException;
-import io.oxia.client.api.options.DeleteOption;
 import io.oxia.client.api.options.DeleteRangeOption;
 import io.oxia.client.api.options.GetOption;
 import io.oxia.client.api.options.PutOption;
@@ -56,11 +55,13 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.collections4.map.HashedMap;
@@ -68,6 +69,11 @@ import org.apache.commons.lang3.tuple.Pair;
 
 @Slf4j
 public class PersistStorageApi implements StorageApi {
+
+    private static final int MAX_CONDITIONAL_MAPPING_DELETE_RETRIES = 3;
+    private static final long CONDITIONAL_MAPPING_DELETE_RETRY_DELAY_MS = 10L;
+    private static final int MAX_KEYED_ALLOCATION_RETRIES = 3;
+    private static final long KEYED_ALLOCATION_RETRY_DELAY_MS = 10L;
 
     private final StorageFormat storageFormat;
     private final AsyncOxiaClient oxiaClient;
@@ -147,18 +153,95 @@ public class PersistStorageApi implements StorageApi {
             OBJECT_MAPPER.readerFor(StreamProperties.class);
     private static final ObjectWriter STREAM_PROPERTIES_WRITER =
             OBJECT_MAPPER.writerFor(StreamProperties.class);
+    private static final ObjectReader STREAM_ID_MAPPING_READER =
+            OBJECT_MAPPER.readerFor(PersistedStreamIdMapping.class);
+    private static final ObjectWriter STREAM_ID_MAPPING_WRITER =
+            OBJECT_MAPPER.writerFor(PersistedStreamIdMapping.class);
+
+    private enum StreamIdMappingState {
+        ACTIVE,
+        TOMBSTONE
+    }
+
+    private record PersistedStreamIdMapping(
+            int version, StreamIdMappingState state, long streamId,
+            String incarnationId, String ownerToken, long ownerGeneration) {
+
+        private static final int CURRENT_VERSION = 1;
+
+        private PersistedStreamIdMapping {
+            if (version != CURRENT_VERSION) {
+                throw new IllegalArgumentException(
+                    "Unsupported keyed stream-ID mapping version: " + version);
+            }
+            Objects.requireNonNull(state, "state");
+            Objects.requireNonNull(incarnationId, "incarnationId");
+            Objects.requireNonNull(ownerToken, "ownerToken");
+        }
+
+        static PersistedStreamIdMapping active(
+                long streamId, StreamIdMappingOwner owner) {
+            return new PersistedStreamIdMapping(
+                CURRENT_VERSION, StreamIdMappingState.ACTIVE, streamId,
+                owner.incarnationId(), owner.ownerToken(), owner.ownerGeneration());
+        }
+
+        static PersistedStreamIdMapping tombstone(StreamIdMappingFence fence) {
+            StreamIdMappingOwner owner = fence.owner();
+            return new PersistedStreamIdMapping(
+                CURRENT_VERSION, StreamIdMappingState.TOMBSTONE, fence.streamId(),
+                owner.incarnationId(), owner.ownerToken(), owner.ownerGeneration());
+        }
+
+        static PersistedStreamIdMapping legacyActive(long streamId) {
+            return active(streamId, StreamIdMappingOwner.legacy());
+        }
+
+        StreamIdMappingOwner owner() {
+            return new StreamIdMappingOwner(incarnationId, ownerToken, ownerGeneration);
+        }
+
+        StreamIdMappingFence fence() {
+            if (state != StreamIdMappingState.TOMBSTONE) {
+                throw new IllegalStateException("Active mapping is not a fence");
+            }
+            return new StreamIdMappingFence(streamId, owner());
+        }
+    }
 
     @VisibleForTesting
     static StreamProperties deserializeStreamProperties(byte[] value) throws IOException {
         return STREAM_PROPERTIES_READER.readValue(value);
     }
 
+    private static PersistedStreamIdMapping deserializeStreamIdMapping(byte[] value) {
+        String legacyValue = new String(value, StandardCharsets.UTF_8);
+        try {
+            return PersistedStreamIdMapping.legacyActive(Long.parseLong(legacyValue));
+        } catch (NumberFormatException ignored) {
+            try {
+                return STREAM_ID_MAPPING_READER.readValue(value);
+            } catch (IOException | RuntimeException e) {
+                throw new IllegalStateException("Invalid keyed stream-ID mapping value", e);
+            }
+        }
+    }
+
+    private static byte[] serializeStreamIdMapping(PersistedStreamIdMapping mapping) {
+        try {
+            return STREAM_ID_MAPPING_WRITER.writeValueAsBytes(mapping);
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to serialize keyed stream-ID mapping", e);
+        }
+    }
+
     private CompletableFuture<Long> registerStream(long streamId, String key) {
         StreamProperties value = new StreamProperties(key);
         try {
             return oxiaClient.put(STREAM_REGISTER_PATH + "/" + streamId,
-                            STREAM_PROPERTIES_WRITER.writeValueAsBytes(value))
-                    .thenApply(x -> streamId);
+                            STREAM_PROPERTIES_WRITER.writeValueAsBytes(value),
+                            Set.of(PutOption.IfRecordDoesNotExist))
+                    .thenApply(result -> streamId);
         } catch (IOException e) {
             return CompletableFuture.failedFuture(
                     new StreamPropertiesSerDeException("Failed to register stream id: " + key, e));
@@ -187,10 +270,65 @@ public class PersistStorageApi implements StorageApi {
 
     @Override
     public CompletableFuture<Long> generateStreamId(Optional<String> key) {
-        return internalGenerateStreamId(key).thenApply(streamId -> {
-            streamStateManager.setState(streamId, LogState.NORMAL);
-            return streamId;
+        return allocateStreamId(key).thenApply(StreamIdAllocation::streamId);
+    }
+
+    @Override
+    public CompletableFuture<StreamIdAllocation> allocateStreamId(Optional<String> key) {
+        return internalAllocateStreamId(key, 0).thenApply(allocation -> {
+            streamStateManager.setState(allocation.streamId(), LogState.NORMAL);
+            return allocation;
         });
+    }
+
+    @Override
+    public CompletableFuture<StreamIdAllocation> allocateStreamId(
+            String key, StreamIdMappingOwner owner,
+            Optional<StreamIdMappingFence> acknowledgedFence) {
+        Objects.requireNonNull(key, "key");
+        Objects.requireNonNull(owner, "owner");
+        Objects.requireNonNull(acknowledgedFence, "acknowledgedFence");
+        if (key.isBlank()) {
+            return CompletableFuture.failedFuture(
+                new IllegalArgumentException("key must not be blank"));
+        }
+        if (owner.isLegacy()) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException(
+                "Legacy mapping owner cannot allocate lifecycle-aware stream IDs"));
+        }
+        return internalAllocateOwnedStreamId(
+                key, owner, acknowledgedFence, 0)
+            .thenApply(allocation -> {
+                streamStateManager.setState(allocation.streamId(), LogState.NORMAL);
+                return allocation;
+            });
+    }
+
+    @Override
+    public CompletableFuture<Void> bindStreamIdMapping(
+            String key, long streamId, StreamIdMappingOwner owner,
+            Optional<StreamIdMappingFence> acknowledgedFence) {
+        Objects.requireNonNull(key, "key");
+        Objects.requireNonNull(owner, "owner");
+        Objects.requireNonNull(acknowledgedFence, "acknowledgedFence");
+        if (key.isBlank()) {
+            return CompletableFuture.failedFuture(
+                new IllegalArgumentException("key must not be blank"));
+        }
+        if (streamId < 0) {
+            return CompletableFuture.failedFuture(
+                new IllegalArgumentException("streamId must be non-negative"));
+        }
+        if (owner.isLegacy()) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException(
+                "Legacy mapping owner cannot bind lifecycle-aware stream IDs"));
+        }
+        return internalBindStreamIdMapping(
+                key, streamId, owner, acknowledgedFence, 0)
+            .thenApply(allocation -> {
+                streamStateManager.setState(allocation.streamId(), LogState.NORMAL);
+                return null;
+            });
     }
 
     @Override
@@ -199,19 +337,396 @@ public class PersistStorageApi implements StorageApi {
         return oxiaClient.get(keyPath, Set.of(GetOption.PartitionKey(STREAM_ID_GENERATOR_PATH)))
             .thenCompose(result -> {
                 if (result == null) {
-                    return CompletableFuture.failedFuture(
-                        new CompletionException(new NoSuchKeyException("No stream id found for key: " + key)));
+                    return noSuchStreamIdMapping(key);
                 }
-                return CompletableFuture.completedFuture(
-                        Long.parseLong(new String(result.value(), StandardCharsets.UTF_8)));
+                PersistedStreamIdMapping mapping = deserializeStreamIdMapping(result.value());
+                if (mapping.state() == StreamIdMappingState.TOMBSTONE) {
+                    return noSuchStreamIdMapping(key);
+                }
+                return CompletableFuture.completedFuture(mapping.streamId());
             });
+    }
+
+    private static CompletableFuture<Long> noSuchStreamIdMapping(String key) {
+        return CompletableFuture.failedFuture(
+            new CompletionException(new NoSuchKeyException("No stream id found for key: " + key)));
     }
 
     @Override
     public CompletableFuture<Void> deleteStreamIdMapping(String key) {
-        return oxiaClient.delete(STREAM_ID_GENERATOR_PATH + "/" + key,
-                Set.of(DeleteOption.PartitionKey(STREAM_ID_GENERATOR_PATH)))
+        return CompletableFuture.failedFuture(new UnsupportedOperationException(
+            "Unconditional keyed stream-ID deletion is disabled; use a durable mapping fence"));
+    }
+
+    @Override
+    public CompletableFuture<Void> deleteStreamIdMapping(String key, long expectedStreamId) {
+        return fenceStreamIdMappingState(key, expectedStreamId, Optional.empty(), 0)
             .thenApply(__ -> null);
+    }
+
+    @Override
+    public boolean supportsConditionalStreamIdMappingDeletion() {
+        return true;
+    }
+
+    @Override
+    public boolean supportsFencedStreamIdMappings() {
+        return true;
+    }
+
+    @Override
+    public CompletableFuture<StreamIdMappingFenceResult> fenceStreamIdMappingState(
+            String key, long expectedStreamId, StreamIdMappingOwner expectedOwner) {
+        Objects.requireNonNull(expectedOwner, "expectedOwner");
+        if (expectedOwner.isLegacy() && expectedStreamId == -1) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException(
+                "Legacy mapping owner cannot capture an absent mapping fence"));
+        }
+        return fenceStreamIdMappingState(
+            key, expectedStreamId, Optional.of(expectedOwner), 0);
+    }
+
+    private CompletableFuture<StreamIdMappingFenceResult> fenceStreamIdMappingState(
+            String key, long expectedStreamId,
+            Optional<StreamIdMappingOwner> expectedOwner, int retryAttempt) {
+        String keyPath = STREAM_ID_GENERATOR_PATH + "/" + key;
+        Set<GetOption> getOptions = Set.of(GetOption.PartitionKey(STREAM_ID_GENERATOR_PATH));
+        return oxiaClient.get(keyPath, getOptions).thenCompose(result -> {
+            if (result == null) {
+                StreamIdMappingFence absentFence = new StreamIdMappingFence(
+                    -1, expectedOwner.orElse(StreamIdMappingOwner.legacy()));
+                return writeStreamIdMappingFence(
+                    key, keyPath, null, absentFence, expectedStreamId,
+                    expectedOwner, retryAttempt);
+            }
+            PersistedStreamIdMapping current = deserializeStreamIdMapping(result.value());
+            if (current.state() == StreamIdMappingState.TOMBSTONE) {
+                return CompletableFuture.completedFuture(
+                    new StreamIdMappingFenceResult.Fenced(current.fence()));
+            }
+            boolean sameExpectedOwner = expectedOwner.isEmpty()
+                || current.owner().equals(expectedOwner.orElseThrow());
+            boolean adoptExactLegacy = current.streamId() == expectedStreamId
+                && expectedOwner.isPresent() && current.owner().isLegacy();
+            boolean captureLateSameOwnerAllocation = expectedStreamId == -1
+                && expectedOwner.isPresent()
+                && current.owner().equals(expectedOwner.orElseThrow());
+            if ((!sameExpectedOwner || current.streamId() != expectedStreamId)
+                    && !adoptExactLegacy && !captureLateSameOwnerAllocation) {
+                return CompletableFuture.completedFuture(
+                    new StreamIdMappingFenceResult.PreservedActive(
+                        new ActiveStreamIdMapping(current.streamId(), current.owner())));
+            }
+            StreamIdMappingFence fence = new StreamIdMappingFence(
+                current.streamId(), expectedOwner.orElse(current.owner()));
+            return writeStreamIdMappingFence(
+                key, keyPath, result, fence, expectedStreamId,
+                expectedOwner, retryAttempt);
+        });
+    }
+
+    private CompletableFuture<StreamIdMappingFenceResult> writeStreamIdMappingFence(
+            String key, String keyPath, GetResult current,
+            StreamIdMappingFence fence, long expectedStreamId,
+            Optional<StreamIdMappingOwner> expectedOwner, int retryAttempt) {
+        Set<PutOption> putOptions = current == null
+            ? Set.of(PutOption.IfRecordDoesNotExist,
+                PutOption.PartitionKey(STREAM_ID_GENERATOR_PATH))
+            : Set.of(PutOption.IfVersionIdEquals(current.version().versionId()),
+                PutOption.PartitionKey(STREAM_ID_GENERATOR_PATH));
+        return oxiaClient.put(keyPath,
+                serializeStreamIdMapping(PersistedStreamIdMapping.tombstone(fence)), putOptions)
+            .handle((write, failure) -> failure == null ? null
+                : FutureUtils.unwrapCompletionException(failure))
+            .thenCompose(failure -> {
+                if (failure == null) {
+                    return CompletableFuture.completedFuture(
+                        new StreamIdMappingFenceResult.Fenced(fence));
+                }
+                Set<GetOption> getOptions = Set.of(
+                    GetOption.PartitionKey(STREAM_ID_GENERATOR_PATH));
+                return oxiaClient.get(keyPath, getOptions)
+                    .thenCompose(readback -> {
+                        if (readback != null) {
+                            PersistedStreamIdMapping observed =
+                                deserializeStreamIdMapping(readback.value());
+                            if (observed.state() == StreamIdMappingState.TOMBSTONE
+                                    && observed.fence().equals(fence)) {
+                                return CompletableFuture.completedFuture(
+                                    new StreamIdMappingFenceResult.Fenced(fence));
+                            }
+                        }
+                        if (failure instanceof UnexpectedVersionIdException
+                                || failure instanceof KeyAlreadyExistsException) {
+                            if (retryAttempt >= MAX_CONDITIONAL_MAPPING_DELETE_RETRIES) {
+                                return CompletableFuture.failedFuture(new IllegalStateException(
+                                    "Conditional keyed stream-ID fence exhausted retries for "
+                                        + keyPath, failure));
+                            }
+                            long delayMillis = CONDITIONAL_MAPPING_DELETE_RETRY_DELAY_MS
+                                << retryAttempt;
+                            log.warn("Retrying conditional keyed stream-ID fence for {} after "
+                                    + "a version conflict (attempt {}/{})", keyPath,
+                                retryAttempt + 1, MAX_CONDITIONAL_MAPPING_DELETE_RETRIES);
+                            return CompletableFuture.runAsync(
+                                    () -> { }, CompletableFuture.delayedExecutor(
+                                        delayMillis, TimeUnit.MILLISECONDS))
+                                .thenCompose(ignored -> fenceStreamIdMappingState(
+                                    key, expectedStreamId, expectedOwner,
+                                    retryAttempt + 1));
+                        }
+                        return CompletableFuture.failedFuture(failure);
+                    });
+            });
+    }
+
+    @Override
+    public CompletableFuture<Void> canonicalizeStreamIdMappingFence(
+            String key, StreamIdMappingFence expectedFence,
+            StreamIdMappingFence canonicalFence) {
+        Objects.requireNonNull(expectedFence, "expectedFence");
+        Objects.requireNonNull(canonicalFence, "canonicalFence");
+        if (!expectedFence.owner().equals(canonicalFence.owner())) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException(
+                "Stream-ID fence canonicalization requires the same lifecycle owner"));
+        }
+        return canonicalizeStreamIdMappingFence(
+            key, expectedFence, canonicalFence, 0);
+    }
+
+    private CompletableFuture<Void> canonicalizeStreamIdMappingFence(
+            String key, StreamIdMappingFence expectedFence,
+            StreamIdMappingFence canonicalFence, int retryAttempt) {
+        String keyPath = STREAM_ID_GENERATOR_PATH + "/" + key;
+        Set<GetOption> getOptions = Set.of(
+            GetOption.PartitionKey(STREAM_ID_GENERATOR_PATH));
+        return oxiaClient.get(keyPath, getOptions).thenCompose(result -> {
+            if (result == null) {
+                return CompletableFuture.failedFuture(new IllegalStateException(
+                    "Cannot canonicalize absent keyed stream-ID fence " + keyPath));
+            }
+            PersistedStreamIdMapping current = deserializeStreamIdMapping(result.value());
+            if (current.state() != StreamIdMappingState.TOMBSTONE) {
+                return CompletableFuture.failedFuture(new IllegalStateException(
+                    "Cannot canonicalize active keyed stream-ID mapping " + keyPath));
+            }
+            if (current.fence().equals(canonicalFence)) {
+                return CompletableFuture.completedFuture(null);
+            }
+            if (!current.fence().equals(expectedFence)) {
+                return CompletableFuture.failedFuture(new IllegalStateException(
+                    "Keyed stream-ID tombstone changed while canonicalizing " + keyPath));
+            }
+            Set<PutOption> putOptions = Set.of(
+                PutOption.IfVersionIdEquals(result.version().versionId()),
+                PutOption.PartitionKey(STREAM_ID_GENERATOR_PATH));
+            return oxiaClient.put(keyPath,
+                    serializeStreamIdMapping(PersistedStreamIdMapping.tombstone(canonicalFence)),
+                    putOptions)
+                .handle((write, failure) -> failure == null ? null
+                    : FutureUtils.unwrapCompletionException(failure))
+                .thenCompose(failure -> {
+                    if (failure == null) {
+                        return CompletableFuture.completedFuture(null);
+                    }
+                    if (failure instanceof UnexpectedVersionIdException
+                            && retryAttempt < MAX_CONDITIONAL_MAPPING_DELETE_RETRIES) {
+                        return canonicalizeStreamIdMappingFence(
+                            key, expectedFence, canonicalFence, retryAttempt + 1);
+                    }
+                    return CompletableFuture.failedFuture(failure);
+                });
+        });
+    }
+
+    private CompletableFuture<StreamIdAllocation> internalAllocateOwnedStreamId(
+            String streamKey, StreamIdMappingOwner owner,
+            Optional<StreamIdMappingFence> acknowledgedFence, int retryAttempt) {
+        String keyPath = STREAM_ID_GENERATOR_PATH + "/" + streamKey;
+        Set<GetOption> getOptions = Set.of(
+            GetOption.PartitionKey(STREAM_ID_GENERATOR_PATH));
+        return oxiaClient.get(keyPath, getOptions).thenCompose(result -> {
+            if (result == null) {
+                if (acknowledgedFence.isPresent()) {
+                    return CompletableFuture.failedFuture(new IllegalStateException(
+                        "Acknowledged keyed stream-ID fence is absent for " + keyPath));
+                }
+                return generateId().thenCompose(streamId -> installOwnedStreamIdMapping(
+                    streamKey, keyPath, streamId, owner, acknowledgedFence,
+                    null, retryAttempt, false));
+            }
+            PersistedStreamIdMapping current = deserializeStreamIdMapping(result.value());
+            if (current.state() == StreamIdMappingState.ACTIVE) {
+                if (current.owner().equals(owner)) {
+                    return completeOwnedKeyedAllocation(
+                        current.streamId(), streamKey, keyPath, owner, false);
+                }
+                return differentMappingOwner(streamKey, current);
+            }
+            if (acknowledgedFence.isEmpty()
+                    || !current.fence().equals(acknowledgedFence.orElseThrow())) {
+                return CompletableFuture.failedFuture(new IllegalStateException(
+                    "Keyed stream-ID tombstone was not acknowledged for " + keyPath));
+            }
+            return generateId().thenCompose(streamId -> installOwnedStreamIdMapping(
+                streamKey, keyPath, streamId, owner, acknowledgedFence,
+                result, retryAttempt, false));
+        });
+    }
+
+    private CompletableFuture<StreamIdAllocation> internalBindStreamIdMapping(
+            String streamKey, long streamId, StreamIdMappingOwner owner,
+            Optional<StreamIdMappingFence> acknowledgedFence, int retryAttempt) {
+        String keyPath = STREAM_ID_GENERATOR_PATH + "/" + streamKey;
+        Set<GetOption> getOptions = Set.of(
+            GetOption.PartitionKey(STREAM_ID_GENERATOR_PATH));
+        return oxiaClient.get(keyPath, getOptions).thenCompose(result -> {
+            if (result == null) {
+                if (acknowledgedFence.isPresent()) {
+                    return CompletableFuture.failedFuture(new IllegalStateException(
+                        "Acknowledged keyed stream-ID fence is absent for " + keyPath));
+                }
+                return installOwnedStreamIdMapping(
+                    streamKey, keyPath, streamId, owner, acknowledgedFence,
+                    null, retryAttempt, true);
+            }
+            PersistedStreamIdMapping current = deserializeStreamIdMapping(result.value());
+            if (current.state() == StreamIdMappingState.ACTIVE) {
+                if (current.streamId() != streamId) {
+                    return differentMappingOwner(streamKey, current);
+                }
+                if (current.owner().equals(owner)) {
+                    return completeOwnedKeyedAllocation(
+                        streamId, streamKey, keyPath, owner, false);
+                }
+                if (!current.owner().isLegacy()) {
+                    return differentMappingOwner(streamKey, current);
+                }
+                // A broker may have created the legacy numeric mapping before the catalog had an
+                // owner token. Adopt that exact ID with a versioned CAS; a different ID is never
+                // overwritten.
+                return installOwnedStreamIdMapping(
+                    streamKey, keyPath, streamId, owner, acknowledgedFence,
+                    result, retryAttempt, true);
+            }
+            if (acknowledgedFence.isEmpty()
+                    || !current.fence().equals(acknowledgedFence.orElseThrow())) {
+                return CompletableFuture.failedFuture(new IllegalStateException(
+                    "Keyed stream-ID tombstone was not acknowledged for " + keyPath));
+            }
+            return installOwnedStreamIdMapping(
+                streamKey, keyPath, streamId, owner, acknowledgedFence,
+                result, retryAttempt, true);
+        });
+    }
+
+    private CompletableFuture<StreamIdAllocation> installOwnedStreamIdMapping(
+            String streamKey, String keyPath, long streamId,
+            StreamIdMappingOwner owner,
+            Optional<StreamIdMappingFence> acknowledgedFence,
+            GetResult expectedCurrent, int retryAttempt, boolean bindExistingId) {
+        Set<PutOption> putOptions = expectedCurrent == null
+            ? Set.of(PutOption.IfRecordDoesNotExist,
+                PutOption.PartitionKey(STREAM_ID_GENERATOR_PATH))
+            : Set.of(PutOption.IfVersionIdEquals(expectedCurrent.version().versionId()),
+                PutOption.PartitionKey(STREAM_ID_GENERATOR_PATH));
+        PersistedStreamIdMapping desired =
+            PersistedStreamIdMapping.active(streamId, owner);
+        return oxiaClient.put(keyPath, serializeStreamIdMapping(desired), putOptions)
+            .handle((write, failure) -> new MappingWriteResult(
+                failure == null ? null : FutureUtils.unwrapCompletionException(failure)))
+            .thenCompose(write -> {
+                if (write.failure() == null) {
+                    return completeOwnedKeyedAllocation(
+                        streamId, streamKey, keyPath, owner, true);
+                }
+                Set<GetOption> getOptions = Set.of(
+                    GetOption.PartitionKey(STREAM_ID_GENERATOR_PATH));
+                return oxiaClient.get(keyPath, getOptions)
+                    .thenCompose(readback -> {
+                        if (readback != null) {
+                            PersistedStreamIdMapping current =
+                                deserializeStreamIdMapping(readback.value());
+                            if (current.state() == StreamIdMappingState.ACTIVE
+                                    && current.owner().equals(owner)) {
+                                if (bindExistingId && current.streamId() != streamId) {
+                                    return differentMappingOwner(streamKey, current);
+                                }
+                                return completeOwnedKeyedAllocation(
+                                    current.streamId(), streamKey, keyPath, owner,
+                                    current.streamId() == streamId);
+                            }
+                            if (current.state() == StreamIdMappingState.ACTIVE) {
+                                return differentMappingOwner(streamKey, current);
+                            }
+                        }
+                        if (!(write.failure() instanceof UnexpectedVersionIdException)
+                                && !(write.failure() instanceof KeyAlreadyExistsException)) {
+                            return CompletableFuture.failedFuture(write.failure());
+                        }
+                        if (retryAttempt >= MAX_KEYED_ALLOCATION_RETRIES) {
+                            return CompletableFuture.failedFuture(new IllegalStateException(
+                                "Lifecycle-aware keyed stream-ID allocation exhausted retries for "
+                                    + keyPath, write.failure()));
+                        }
+                        if (bindExistingId) {
+                            return internalBindStreamIdMapping(
+                                streamKey, streamId, owner,
+                                acknowledgedFence, retryAttempt + 1);
+                        }
+                        return internalAllocateOwnedStreamId(
+                            streamKey, owner, acknowledgedFence, retryAttempt + 1);
+                    });
+            });
+    }
+
+    private CompletableFuture<StreamIdAllocation> completeOwnedKeyedAllocation(
+            long streamId, String streamKey, String keyPath,
+            StreamIdMappingOwner owner, boolean createdKeyedMapping) {
+        return ensureStreamRegistered(streamId, streamKey)
+            .thenCompose(registeredStreamId -> validateOwnedKeyedAllocation(
+                registeredStreamId, keyPath, owner, createdKeyedMapping));
+    }
+
+    private CompletableFuture<StreamIdAllocation> validateOwnedKeyedAllocation(
+            long streamId, String keyPath, StreamIdMappingOwner owner,
+            boolean createdKeyedMapping) {
+        Set<GetOption> getOptions = Set.of(
+            GetOption.PartitionKey(STREAM_ID_GENERATOR_PATH));
+        return oxiaClient.get(keyPath, getOptions)
+            .handle((current, failure) -> new MappingReadResult(
+                current, failure == null ? null
+                    : FutureUtils.unwrapCompletionException(failure)))
+            .thenCompose(read -> {
+                Throwable invalidation = read.failure();
+                if (invalidation == null && read.result() != null) {
+                    try {
+                        PersistedStreamIdMapping mapping =
+                            deserializeStreamIdMapping(read.result().value());
+                        if (mapping.state() == StreamIdMappingState.ACTIVE
+                                && mapping.streamId() == streamId
+                                && mapping.owner().equals(owner)) {
+                            return CompletableFuture.completedFuture(
+                                new StreamIdAllocation(streamId, createdKeyedMapping));
+                        }
+                    } catch (RuntimeException e) {
+                        invalidation = e;
+                    }
+                }
+                if (invalidation == null) {
+                    invalidation = new IllegalStateException(
+                        "Keyed stream-ID mapping changed while registering " + keyPath);
+                }
+                return CompletableFuture.failedFuture(
+                    new KeyedAllocationInvalidatedException(
+                        new StreamIdAllocation(streamId, createdKeyedMapping), invalidation));
+            });
+    }
+
+    private static <T> CompletableFuture<T> differentMappingOwner(
+            String streamKey, PersistedStreamIdMapping current) {
+        return CompletableFuture.failedFuture(new StreamIdMappingConflictException(
+            streamKey, new ActiveStreamIdMapping(current.streamId(), current.owner())));
     }
 
     @Override
@@ -238,40 +753,177 @@ public class PersistStorageApi implements StorageApi {
     }
 
 
-    private CompletableFuture<Long> internalGenerateStreamId(Optional<String> key) {
+    private CompletableFuture<StreamIdAllocation> internalAllocateStreamId(
+            Optional<String> key, int retryAttempt) {
         if (key.isPresent()) {
-            String keyPath = STREAM_ID_GENERATOR_PATH + "/" + key.get();
+            String streamKey = key.orElseThrow();
+            String keyPath = STREAM_ID_GENERATOR_PATH + "/" + streamKey;
             return oxiaClient.get(keyPath, Set.of(GetOption.PartitionKey(STREAM_ID_GENERATOR_PATH)))
                 .thenCompose(result -> {
                     if (result == null) {
                         return generateId()
-                            .thenCompose(streamId ->
-                                oxiaClient.put(keyPath, streamId.toString().getBytes(StandardCharsets.UTF_8),
-                                        Set.of(PutOption.IfRecordDoesNotExist,
-                                            PutOption.PartitionKey(STREAM_ID_GENERATOR_PATH)))
-                                    .handle((r, e) -> {
-                                        if (e != null) {
-                                            if (e.getCause() instanceof KeyAlreadyExistsException) {
-                                                return null;
-                                            } else {
-                                                throw new CompletionException(e);
-                                            }
-                                        }
-                                        return r;
-                                    }).thenCompose(pr -> {
-                                        if (pr == null) {
-                                            return generateStreamId(key);
-                                        } else {
-                                            return registerStream(streamId, key.orElse(null));
-                                        }
-                                    }));
-                    } else {
-                        return CompletableFuture.completedFuture(
-                            Long.parseLong(new String(result.value(), StandardCharsets.UTF_8)));
+                            .thenCompose(streamId -> createKeyedStreamIdMapping(
+                                streamKey, keyPath, streamId, retryAttempt));
                     }
+                    PersistedStreamIdMapping mapping =
+                        deserializeStreamIdMapping(result.value());
+                    if (mapping.state() == StreamIdMappingState.TOMBSTONE) {
+                        return CompletableFuture.failedFuture(new IllegalStateException(
+                            "Keyed stream-ID mapping is fenced at " + keyPath));
+                    }
+                    return completeKeyedAllocation(
+                        mapping.streamId(), streamKey, keyPath, false);
                 });
         }
-        return generateId().thenCompose(streamId -> registerStream(streamId, null));
+        return generateId().thenCompose(streamId -> registerStream(streamId, null)
+            .thenApply(registeredStreamId ->
+                new StreamIdAllocation(registeredStreamId, false)));
+    }
+
+    private CompletableFuture<StreamIdAllocation> createKeyedStreamIdMapping(
+            String streamKey, String keyPath, long streamId, int retryAttempt) {
+        Set<GetOption> getOptions = Set.of(GetOption.PartitionKey(STREAM_ID_GENERATOR_PATH));
+        return oxiaClient.put(keyPath, Long.toString(streamId).getBytes(StandardCharsets.UTF_8),
+                Set.of(PutOption.IfRecordDoesNotExist,
+                    PutOption.PartitionKey(STREAM_ID_GENERATOR_PATH)))
+            .handle((result, failure) -> new MappingWriteResult(
+                failure == null ? null : FutureUtils.unwrapCompletionException(failure)))
+            .thenCompose(write -> {
+                if (write.failure() == null) {
+                    return completeKeyedAllocation(
+                        streamId, streamKey, keyPath, true);
+                }
+                return oxiaClient.get(keyPath, getOptions)
+                    .handle((current, readFailure) -> new MappingReadResult(
+                        current, readFailure == null ? null
+                            : FutureUtils.unwrapCompletionException(readFailure)))
+                    .thenCompose(read -> {
+                        if (read.failure() != null) {
+                            write.failure().addSuppressed(read.failure());
+                            return CompletableFuture.failedFuture(write.failure());
+                        }
+                        if (read.result() != null) {
+                            PersistedStreamIdMapping mapping =
+                                deserializeStreamIdMapping(read.result().value());
+                            if (mapping.state() == StreamIdMappingState.ACTIVE
+                                    && mapping.streamId() == streamId) {
+                                return completeKeyedAllocation(
+                                    streamId, streamKey, keyPath, true);
+                            }
+                        }
+                        if (read.result() == null
+                                && !(write.failure() instanceof KeyAlreadyExistsException)) {
+                            return CompletableFuture.failedFuture(write.failure());
+                        }
+                        if (retryAttempt >= MAX_KEYED_ALLOCATION_RETRIES) {
+                            return CompletableFuture.failedFuture(new IllegalStateException(
+                                "Keyed stream-ID allocation exhausted retries for " + keyPath,
+                                write.failure()));
+                        }
+                        long delayMillis = KEYED_ALLOCATION_RETRY_DELAY_MS << retryAttempt;
+                        log.warn("Retrying keyed stream-ID allocation for {} after a mapping "
+                                + "conflict (attempt {}/{})", keyPath, retryAttempt + 1,
+                            MAX_KEYED_ALLOCATION_RETRIES);
+                        return CompletableFuture.runAsync(
+                                () -> { }, CompletableFuture.delayedExecutor(
+                                    delayMillis, TimeUnit.MILLISECONDS))
+                            .thenCompose(ignored -> internalAllocateStreamId(
+                                Optional.of(streamKey), retryAttempt + 1));
+                    });
+            });
+    }
+
+    private CompletableFuture<Long> ensureStreamRegistered(
+            long streamId, String key) {
+        return registerStream(streamId, key)
+            .handle((registered, failure) -> new RegistrationWriteResult(
+                registered, failure == null ? null
+                    : FutureUtils.unwrapCompletionException(failure)))
+            .thenCompose(write -> {
+                if (write.failure() == null) {
+                    return CompletableFuture.completedFuture(write.registration());
+                }
+                String path = STREAM_REGISTER_PATH + "/" + streamId;
+                return oxiaClient.get(path)
+                    .handle((current, readFailure) -> new MappingReadResult(
+                        current, readFailure == null ? null
+                            : FutureUtils.unwrapCompletionException(readFailure)))
+                    .thenCompose(read -> {
+                        if (read.failure() != null) {
+                            write.failure().addSuppressed(read.failure());
+                            return CompletableFuture.failedFuture(write.failure());
+                        }
+                        if (read.result() != null) {
+                            try {
+                                StreamProperties current = deserializeStreamProperties(
+                                    read.result().value());
+                                if (Objects.equals(current.key(), key)) {
+                                    return CompletableFuture.completedFuture(streamId);
+                                }
+                            } catch (IOException e) {
+                                write.failure().addSuppressed(e);
+                            }
+                        }
+                        return CompletableFuture.failedFuture(write.failure());
+                    });
+            });
+    }
+
+    private CompletableFuture<StreamIdAllocation> completeKeyedAllocation(
+            long streamId, String streamKey, String keyPath,
+            boolean createdKeyedMapping) {
+        return ensureStreamRegistered(streamId, streamKey)
+            .thenCompose(registeredStreamId -> validateKeyedAllocation(
+                registeredStreamId, keyPath, createdKeyedMapping));
+    }
+
+    private CompletableFuture<StreamIdAllocation> validateKeyedAllocation(
+            long streamId, String keyPath,
+            boolean createdKeyedMapping) {
+        Set<GetOption> getOptions = Set.of(
+            GetOption.PartitionKey(STREAM_ID_GENERATOR_PATH));
+        return oxiaClient.get(keyPath, getOptions)
+            .handle((current, failure) -> new MappingReadResult(
+                current, failure == null ? null
+                    : FutureUtils.unwrapCompletionException(failure)))
+            .thenCompose(read -> {
+                Throwable invalidation = read.failure();
+                if (invalidation == null && read.result() != null) {
+                    try {
+                        PersistedStreamIdMapping mapping =
+                            deserializeStreamIdMapping(read.result().value());
+                        if (mapping.state() == StreamIdMappingState.ACTIVE
+                                && mapping.streamId() == streamId) {
+                            return CompletableFuture.completedFuture(
+                                new StreamIdAllocation(
+                                    streamId, createdKeyedMapping));
+                        }
+                    } catch (RuntimeException e) {
+                        invalidation = e;
+                    }
+                }
+                if (invalidation == null) {
+                    invalidation = new IllegalStateException(
+                        "Keyed stream-ID mapping changed while registering " + keyPath);
+                }
+                // Registration is shared by every allocator that observes the same keyed mapping.
+                // Even when this call created it, a concurrent allocator may already have reused
+                // and published the registration. Only the lifecycle-aware catalog can prove that
+                // the stream ID is no longer referenced, so this layer must preserve it.
+                return CompletableFuture.failedFuture(
+                    new KeyedAllocationInvalidatedException(
+                        new StreamIdAllocation(streamId, createdKeyedMapping), invalidation));
+            });
+    }
+
+    private record MappingWriteResult(Throwable failure) {
+    }
+
+    private record MappingReadResult(GetResult result, Throwable failure) {
+    }
+
+    private record RegistrationWriteResult(
+            Long registration, Throwable failure) {
     }
 
     private CompletableFuture<Long> generateId() {
@@ -836,22 +1488,27 @@ public class PersistStorageApi implements StorageApi {
     }
 
     @Override
-    public CompletableFuture<Void> deleteStream(long streamId, Optional<String> key) {
-        CompletableFuture<Void> future = new CompletableFuture<>();
-        if (key.isPresent()) {
-            future = oxiaClient.delete(STREAM_ID_GENERATOR_PATH + "/" + key.get(),
-                    Set.of(DeleteOption.PartitionKey(STREAM_ID_GENERATOR_PATH))).thenApply(x -> null);
-        } else {
-            future.complete(null);
-        }
-        return future.thenCompose(__ -> oxiaClient.deleteRange(
+    public CompletableFuture<Void> deleteStream(long streamId) {
+        return oxiaClient.deleteRange(
                 getSmallestStreamIdKey(streamId),
                 getLargestStreamIdKey(streamId),
-                Set.of(DeleteRangeOption.PartitionKey(String.valueOf(streamId)))))
+                Set.of(DeleteRangeOption.PartitionKey(String.valueOf(streamId))))
             .thenCompose(__ -> removeStream(streamId))
             .thenRun(() -> {
                 storageFormat.removeCachedKey(streamId);
             });
+    }
+
+    @Override
+    @Deprecated
+    public CompletableFuture<Void> deleteStream(long streamId, Optional<String> key) {
+        Objects.requireNonNull(key, "key");
+        if (key.isPresent()) {
+            return CompletableFuture.failedFuture(new UnsupportedOperationException(
+                "Keyed stream deletion is disabled; fence and acknowledge the mapping "
+                    + "through the durable lifecycle API"));
+        }
+        return deleteStream(streamId);
     }
 
     @Override

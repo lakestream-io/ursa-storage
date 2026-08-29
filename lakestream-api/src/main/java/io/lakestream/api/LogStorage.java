@@ -140,8 +140,12 @@ public interface LogStorage extends Closeable {
     /**
      * Deletes the log entirely.
      *
+     * <p>This operation must be idempotent: deleting a log that is already absent must complete
+     * successfully. Lifecycle cleanup can crash after the physical deletion but before its durable
+     * acknowledgement, so recovery is required to replay the same deletion safely.
+     *
      * @param logId the log to delete
-     * @return a future that completes when the log is deleted
+     * @return a future that completes when the log is absent
      */
     CompletableFuture<Void> deleteLog(LogId logId);
 

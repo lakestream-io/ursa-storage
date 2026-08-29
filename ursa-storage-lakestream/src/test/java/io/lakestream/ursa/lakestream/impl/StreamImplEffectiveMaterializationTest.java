@@ -65,9 +65,12 @@ class StreamImplEffectiveMaterializationTest {
     @BeforeEach
     void setUp() {
         catalogPaths = new DefaultCatalogPaths();
-        catalog = new IndexedStreamCatalog(oxiaClient, catalogPaths, logStorage,
-            logId -> null, null,
+        catalog = IndexedStreamCatalog.withConditionalStreamIdMappingDeletion(
+            oxiaClient, catalogPaths, logStorage,
+            (name, logId, reader) -> null, null,
             key -> CompletableFuture.completedFuture(nextStreamId++),
+            key -> CompletableFuture.completedFuture(-1L),
+            (key, expectedStreamId) -> CompletableFuture.completedFuture(null),
             null, null, List.of());
         catalog.initialize("test-catalog", Map.of()).join();
         streamId = new StreamIdentifier("ns-1", "topic-a");
@@ -81,6 +84,12 @@ class StreamImplEffectiveMaterializationTest {
             return CompletableFuture.completedFuture(new GetResult(key, value, DUMMY_VERSION));
         });
         when(oxiaClient.put(any(String.class), any(byte[].class))).thenAnswer(inv -> {
+            String key = inv.getArgument(0);
+            byte[] value = inv.getArgument(1);
+            store.put(key, value);
+            return CompletableFuture.completedFuture(new PutResult(key, DUMMY_VERSION));
+        });
+        when(oxiaClient.put(any(String.class), any(byte[].class), any())).thenAnswer(inv -> {
             String key = inv.getArgument(0);
             byte[] value = inv.getArgument(1);
             store.put(key, value);

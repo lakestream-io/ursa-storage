@@ -17,6 +17,7 @@ import io.lakestream.api.ExternalStreamRegistry;
 import io.lakestream.api.StreamIdentifier;
 import io.opentelemetry.api.OpenTelemetry;
 import io.oxia.client.api.AsyncOxiaClient;
+import io.oxia.client.api.GetResult;
 import io.oxia.client.api.PutResult;
 import io.oxia.client.api.Version;
 import io.oxia.client.api.options.PutOption;
@@ -50,10 +51,22 @@ class ExternalStreamRegistryServiceTest {
         properties.setProperty("oxiaStorageConfig", "{\"requestTimeout\":\"5s\"}");
         properties.setProperty("backendStorageType", "this-is-never-parsed");
         String configPath = "/admin/streams/public/default/topic";
-        when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(null));
+        AtomicReference<byte[]> storedConfig = new AtomicReference<>();
+        when(oxiaClient.get(configPath)).thenAnswer(ignored ->
+            CompletableFuture.completedFuture(storedConfig.get() == null ? null
+                : new GetResult(configPath, storedConfig.get(), VERSION)));
         when(oxiaClient.put(eq(configPath), any(byte[].class),
                 eq(Set.of(PutOption.IfRecordDoesNotExist))))
-            .thenReturn(CompletableFuture.completedFuture(new PutResult(configPath, VERSION)));
+            .thenAnswer(invocation -> {
+                storedConfig.set(invocation.getArgument(1, byte[].class));
+                return CompletableFuture.completedFuture(new PutResult(configPath, VERSION));
+            });
+        when(oxiaClient.put(eq(configPath), any(byte[].class),
+                eq(Set.of(PutOption.IfVersionIdEquals(VERSION.versionId())))))
+            .thenAnswer(invocation -> {
+                storedConfig.set(invocation.getArgument(1, byte[].class));
+                return CompletableFuture.completedFuture(new PutResult(configPath, VERSION));
+            });
 
         ExternalStreamRegistry registry = service.open(
             "oxia://localhost/catalog", new DefaultCatalogPaths(), properties,
@@ -65,6 +78,8 @@ class ExternalStreamRegistryServiceTest {
         assertThat(capturedConfig.get()).isEqualTo("{\"requestTimeout\":\"5s\"}");
         verify(oxiaClient).put(eq(configPath), any(byte[].class),
             eq(Set.of(PutOption.IfRecordDoesNotExist)));
+        verify(oxiaClient).put(eq(configPath), any(byte[].class),
+            eq(Set.of(PutOption.IfVersionIdEquals(VERSION.versionId()))));
 
         registry.close();
         registry.close();
