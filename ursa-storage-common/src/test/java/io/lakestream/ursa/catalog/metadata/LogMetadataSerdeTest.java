@@ -72,6 +72,24 @@ class LogMetadataSerdeTest {
     }
 
     @Test
+    void persistsRetiredMappingPurgeIntentWhenTrue() throws Exception {
+        assertMetadata(new LogMetadata(4L, Map.of(), OptionalLong.empty(),
+                        "incarnation-1", "owner-1", 7L, true, Set.of(), Set.of(),
+                        Set.of(new LogMetadata.RetiredStreamMapping(
+                            -1L, "native/pending", true)),
+                        Set.of("native/pending")),
+                "{\"streamId\":4,\"properties\":{},\"terminatedOffset\":null,"
+                        + "\"registrationIncarnationId\":\"incarnation-1\","
+                        + "\"registrationOwnerToken\":\"owner-1\","
+                        + "\"registrationOwnerGeneration\":7,"
+                        + "\"retiredStreamMappings\":["
+                        + "{\"streamId\":-1,\"mappingKey\":\"native/pending\","
+                        + "\"purge\":true}],"
+                        + "\"retiredMappingKeys\":[\"native/pending\"],"
+                        + "\"deleted\":true}");
+    }
+
+    @Test
     void readsLegacyJsonWithoutRegistrationAndDeletionFields() throws Exception {
         byte[] content = "{\"streamId\":3,\"properties\":{},\"terminatedOffset\":4}"
                 .getBytes(StandardCharsets.UTF_8);

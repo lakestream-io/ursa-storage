@@ -311,7 +311,10 @@ public class LogMetadata {
     }
 
     /** A fenced mapping cleanup that remains replayable after lifecycle reincarnation. */
-    public record RetiredStreamMapping(long streamId, String mappingKey, boolean purge)
+    public record RetiredStreamMapping(
+            long streamId,
+            String mappingKey,
+            @JsonInclude(JsonInclude.Include.NON_DEFAULT) boolean purge)
             implements Comparable<RetiredStreamMapping> {
 
         /** Reads the historical exact-ID journal representation, whose purge intent is separate. */
