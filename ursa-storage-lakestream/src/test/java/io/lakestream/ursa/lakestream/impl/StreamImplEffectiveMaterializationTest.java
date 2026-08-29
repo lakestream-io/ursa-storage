@@ -65,7 +65,8 @@ class StreamImplEffectiveMaterializationTest {
     @BeforeEach
     void setUp() {
         catalogPaths = new DefaultCatalogPaths();
-        catalog = new IndexedStreamCatalog(oxiaClient, catalogPaths, logStorage,
+        catalog = IndexedStreamCatalog.withConditionalStreamIdMappingDeletion(
+            oxiaClient, catalogPaths, logStorage,
             (name, logId, reader) -> null, null,
             key -> CompletableFuture.completedFuture(nextStreamId++),
             key -> CompletableFuture.completedFuture(-1L),

@@ -29,6 +29,7 @@ import io.oxia.client.api.exceptions.UnexpectedVersionIdException;
 import io.oxia.client.api.options.DeleteOption;
 import io.oxia.client.api.options.PutOption;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -61,11 +62,12 @@ class IndexedStreamConfigStoreDeletionFenceTest {
 
     private StreamIdentifier id;
     private IndexedStreamConfigStore store;
+    private DefaultCatalogPaths paths;
     private String configPath;
 
     @BeforeEach
     void setUp() {
-        DefaultCatalogPaths paths = new DefaultCatalogPaths();
+        paths = new DefaultCatalogPaths();
         id = new StreamIdentifier("public/default", "orders-topic-id");
         store = new IndexedStreamConfigStore(oxiaClient, paths);
         configPath = paths.streamConfigPath(id);
@@ -380,6 +382,103 @@ class IndexedStreamConfigStoreDeletionFenceTest {
     }
 
     @Test
+    void provisioningOwnershipRequiresExactOwnerTokenGenerationAndVersion() {
+        AtomicReference<GetResult> current = new AtomicReference<>();
+        when(oxiaClient.get(configPath)).thenAnswer(ignored ->
+            CompletableFuture.completedFuture(current.get()));
+        IndexedStreamConfigStore.ProvisioningClaim expected =
+            claim("attempt-1", VERSION_1);
+
+        current.set(provisioning(VERSION_1, "attempt-2", 1L));
+        assertProvisioningOwnershipLost(expected);
+
+        current.set(provisioning(VERSION_1, "attempt-1", 2L));
+        assertProvisioningOwnershipLost(expected);
+
+        current.set(provisioning(VERSION_2, "attempt-1", 1L));
+        assertProvisioningOwnershipLost(expected);
+
+        current.set(provisioning(VERSION_1, "attempt-1", 1L));
+        store.verifyProvisioningOwnership(id, expected).join();
+    }
+
+    @Test
+    void activeSnapshotVerificationRejectsSameLifecycleAtNewVersion() {
+        when(oxiaClient.get(configPath))
+            .thenReturn(CompletableFuture.completedFuture(
+                externalActive(VERSION_1, 1, "owner", 1L, Map.of())))
+            .thenReturn(CompletableFuture.completedFuture(
+                externalActive(VERSION_2, 2, "owner", 1L, Map.of())));
+
+        IndexedStreamConfigStore.ActiveStreamConfig snapshot =
+            store.readActive(id).join();
+
+        assertThatThrownBy(() -> store.verifyActiveOwnership(id, snapshot).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(NoSuchStreamException.class);
+    }
+
+    @Test
+    void conflictingConfigUpdateWaitsForAsynchronousRetryAndThenSucceeds() {
+        List<Long> backoffs = new ArrayList<>();
+        CompletableFuture<Void> retryGate = new CompletableFuture<>();
+        store = new IndexedStreamConfigStore(oxiaClient, paths, delayMillis -> {
+            backoffs.add(delayMillis);
+            return retryGate;
+        });
+        when(oxiaClient.get(configPath))
+            .thenReturn(CompletableFuture.completedFuture(
+                externalActive(VERSION_1, 1, "owner", 1L, Map.of())))
+            .thenReturn(CompletableFuture.completedFuture(
+                externalActive(VERSION_2, 1, "owner", 1L, Map.of())));
+        when(oxiaClient.put(eq(configPath), any(byte[].class),
+                eq(Set.of(PutOption.IfVersionIdEquals(VERSION_1.versionId())))))
+            .thenReturn(CompletableFuture.failedFuture(
+                new UnexpectedVersionIdException(configPath, VERSION_1.versionId())));
+        when(oxiaClient.put(eq(configPath), any(byte[].class),
+                eq(Set.of(PutOption.IfVersionIdEquals(VERSION_2.versionId())))))
+            .thenReturn(CompletableFuture.completedFuture(
+                new PutResult(configPath, version(3))));
+
+        CompletableFuture<Void> update = store.setProperties(id, Map.of("tier", "hot"));
+
+        assertThat(update.isDone()).isFalse();
+        assertThat(backoffs).containsExactly(
+            IndexedStreamConfigStore.INITIAL_RETRY_BACKOFF_MILLIS);
+        retryGate.complete(null);
+        update.join();
+        verify(oxiaClient, times(2)).put(eq(configPath), any(byte[].class), any());
+    }
+
+    @Test
+    void conflictingCreationClaimStopsAfterBoundedBackoffRetries() {
+        List<Long> backoffs = new ArrayList<>();
+        store = new IndexedStreamConfigStore(oxiaClient, paths, delayMillis -> {
+            backoffs.add(delayMillis);
+            return CompletableFuture.completedFuture(null);
+        });
+        when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(
+            provisioning(VERSION_1, "attempt-1")));
+        when(oxiaClient.put(eq(configPath), any(byte[].class), any()))
+            .thenReturn(CompletableFuture.failedFuture(
+                new UnexpectedVersionIdException(configPath, VERSION_1.versionId())));
+
+        assertThatThrownBy(() -> store.claimCreation(
+                id, 1, Map.of(), Optional.empty(), "attempt-2").join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(UnexpectedVersionIdException.class);
+
+        assertThat(backoffs).containsExactly(
+            IndexedStreamConfigStore.INITIAL_RETRY_BACKOFF_MILLIS,
+            IndexedStreamConfigStore.INITIAL_RETRY_BACKOFF_MILLIS * 2,
+            IndexedStreamConfigStore.INITIAL_RETRY_BACKOFF_MILLIS * 4);
+        verify(oxiaClient, times(IndexedStreamConfigStore.MAX_CONFIG_WRITE_RETRIES + 1))
+            .put(eq(configPath), any(byte[].class), any());
+        verify(oxiaClient, times((IndexedStreamConfigStore.MAX_CONFIG_WRITE_RETRIES + 1) * 2))
+            .get(configPath);
+    }
+
+    @Test
     void ambiguousGenericCreateClaimsOnlyItsOwnPersistedAttempt() {
         RuntimeException ambiguous = new RuntimeException("request outcome unknown");
         Set<PutOption> createOnly = Set.of(PutOption.IfRecordDoesNotExist);
@@ -528,6 +627,22 @@ class IndexedStreamConfigStoreDeletionFenceTest {
     }
 
     @Test
+    void unregisteredStreamAllowsNamespaceDrop() {
+        String configPrefix = paths.streamConfigPrefix(id.namespace());
+        byte[] unregistered = streamConfigBytes(
+            1, Map.of(), "incarnation", "owner", 2L, 2L,
+            IndexedStreamConfigStore.CreationKind.EXTERNAL,
+            IndexedStreamConfigStore.ProvisioningState.UNREGISTERED);
+        when(oxiaClient.list(configPrefix, configPrefix + "\uffff"))
+            .thenReturn(CompletableFuture.completedFuture(List.of(configPath)));
+        when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(
+            new GetResult(configPath, unregistered, VERSION_2)));
+
+        assertThat(store.namespaceContainsNonTombstoneStream(id.namespace()).join())
+            .isFalse();
+    }
+
+    @Test
     void readsTreatPermanentTombstoneAsAbsent() {
         when(oxiaClient.get(configPath))
             .thenReturn(CompletableFuture.completedFuture(tombstone(VERSION_2)));
@@ -536,6 +651,28 @@ class IndexedStreamConfigStoreDeletionFenceTest {
             .isInstanceOf(CompletionException.class)
             .hasCauseInstanceOf(NoSuchStreamException.class);
         assertThat(store.exists(id).join()).isFalse();
+    }
+
+    @Test
+    void emptyWhitespaceAndNonObjectConfigsAreRejected() {
+        AtomicReference<byte[]> current = new AtomicReference<>();
+        when(oxiaClient.get(configPath)).thenAnswer(ignored ->
+            CompletableFuture.completedFuture(
+                new GetResult(configPath, current.get(), VERSION_1)));
+
+        for (byte[] invalid : List.of(
+                new byte[0], "   \n".getBytes(StandardCharsets.UTF_8),
+                "[]".getBytes(StandardCharsets.UTF_8),
+                "\"text\"".getBytes(StandardCharsets.UTF_8),
+                "null".getBytes(StandardCharsets.UTF_8))) {
+            current.set(invalid);
+            assertThatThrownBy(() -> store.read(id).join())
+                .isInstanceOf(CompletionException.class)
+                .hasRootCauseInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> store.exists(id).join())
+                .isInstanceOf(CompletionException.class)
+                .hasRootCauseInstanceOf(IllegalArgumentException.class);
+        }
     }
 
     @Test
@@ -581,7 +718,7 @@ class IndexedStreamConfigStoreDeletionFenceTest {
     }
 
     @Test
-    void provisioningIsInvisibleAndCannotBeMutatedOrExternallyRegistered() {
+    void nativeProvisioningIsInvisibleAndCannotBeMutatedOrExternallyRegistered() {
         when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(
             provisioning(VERSION_1, "attempt")));
 
@@ -604,6 +741,47 @@ class IndexedStreamConfigStoreDeletionFenceTest {
 
         verify(oxiaClient, never()).put(eq(configPath), any(byte[].class), any());
         verify(oxiaClient, never()).delete(eq(configPath), any());
+    }
+
+    @Test
+    void externalProvisioningCannotBeUnregisteredOrPermanentlyDeleted() {
+        when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(
+            new GetResult(configPath, provisioningBytes(
+                "external-owner", 3L,
+                IndexedStreamConfigStore.CreationKind.EXTERNAL), VERSION_1)));
+
+        assertThatThrownBy(() -> store.unregisterExternalStream(id).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(AlreadyExistsException.class);
+        assertThatThrownBy(() -> store.permanentlyDeleteExternalStream(id).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(AlreadyExistsException.class);
+
+        verify(oxiaClient, never()).put(eq(configPath), any(byte[].class), any());
+        verify(oxiaClient, never()).delete(eq(configPath), any());
+    }
+
+    @Test
+    void resumedExternalProvisioningCanBeTakenOverUsingRetainedSpec() {
+        byte[] unregistered = streamConfigBytes(
+            2, Map.of("tier", "hot"), "incarnation", "owner-4", 4L, 4L,
+            IndexedStreamConfigStore.CreationKind.EXTERNAL,
+            IndexedStreamConfigStore.ProvisioningState.UNREGISTERED);
+        mockVersionedRecord(unregistered);
+
+        IndexedStreamConfigStore.ProvisioningClaim resumed = store.claimCreation(
+            id, 3, Map.of("tier", "cold"), Optional.empty(),
+            IndexedStreamConfigStore.CreationKind.EXTERNAL, "owner-5").join();
+        IndexedStreamConfigStore.ProvisioningClaim recovered = store.claimCreation(
+            id, 3, Map.of("tier", "cold"), Optional.empty(),
+            IndexedStreamConfigStore.CreationKind.EXTERNAL, "owner-6").join();
+
+        assertThat(resumed.config().properties()).containsEntry("tier", "hot");
+        assertThat(recovered.config().properties()).containsEntry("tier", "hot");
+        assertThat(recovered.ownerToken()).isEqualTo("owner-6");
+        assertThat(recovered.ownerGeneration())
+            .isEqualTo(resumed.ownerGeneration() + 1);
+        assertThat(recovered.config().partitions()).isEqualTo(3);
     }
 
     @Test
@@ -685,6 +863,33 @@ class IndexedStreamConfigStoreDeletionFenceTest {
         assertThat(json(state.get().value()).path("_provisioningState").asText())
             .isEqualTo("DROPPED");
         assertThat(store.exists(id).join()).isFalse();
+    }
+
+    @Test
+    void purgingDropIntentSurvivesTakeoverAndCompletion() throws Exception {
+        byte[] activeConfig = ("{\"partitions\":1,\"properties\":{},"
+            + "\"_incarnationId\":\"incarnation\","
+            + "\"_ownerToken\":\"create-owner\","
+            + "\"_ownerGeneration\":1,"
+            + "\"_creationKind\":\"NATIVE_CREATE\"}")
+            .getBytes(StandardCharsets.UTF_8);
+        AtomicReference<VersionedValue> state = mockVersionedRecord(activeConfig);
+
+        IndexedStreamConfigStore.DropClaim first =
+            store.beginDrop(id, "drop-a", true).join().orElseThrow();
+        assertThat(first.config().purgeRequested()).isTrue();
+
+        IndexedStreamConfigStore.DropClaim takeover =
+            store.beginDrop(id, "drop-b", false).join().orElseThrow();
+        assertThat(takeover.config().purgeRequested()).isTrue();
+        store.completeDrop(id, takeover).join();
+
+        assertThat(json(state.get().value()).path("_purgeRequested").asBoolean())
+            .isTrue();
+        IndexedStreamConfigStore.CompletedDrop completed =
+            store.readCompletedPurgingDrop(id).join().orElseThrow();
+        assertThat(completed.config().purgeRequested()).isTrue();
+        store.verifyCompletedDrop(id, completed).join();
     }
 
     @Test
@@ -871,6 +1076,14 @@ class IndexedStreamConfigStoreDeletionFenceTest {
             IndexedStreamConfigStore.CreationKind.NATIVE_CREATE,
             1L,
             version.versionId());
+    }
+
+    private void assertProvisioningOwnershipLost(
+            IndexedStreamConfigStore.ProvisioningClaim claim) {
+        assertThatThrownBy(() -> store.verifyProvisioningOwnership(id, claim).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(
+                IndexedStreamConfigStore.ProvisioningOwnershipLostException.class);
     }
 
     private AtomicReference<VersionedValue> mockVersionedRecord(byte[] initialValue) {

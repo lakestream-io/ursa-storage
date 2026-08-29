@@ -33,10 +33,13 @@ import io.lakestream.api.exception.NoSuchStreamException;
 import io.lakestream.api.materialization.TableCatalog;
 import io.lakestream.api.materialization.TableMaterializationPolicy;
 import io.lakestream.ursa.catalog.metadata.LogMetadata;
+import io.lakestream.ursa.catalog.metadata.LogMetadata.RetiredStreamMapping;
 import io.lakestream.ursa.catalog.metadata.LogMetadataSerde;
 import io.lakestream.ursa.lakestream.impl.materialization.MaterializationJson;
 import io.lakestream.ursa.lakestream.reader.CompactedObjectReader;
 import io.lakestream.ursa.lakestream.reader.CompactedObjectReaderFactory;
+import io.lakestream.ursa.storage.StorageApi.KeyedAllocationInvalidatedException;
+import io.lakestream.ursa.storage.StorageApi.StreamIdAllocation;
 import io.lakestream.ursa.storage.impl.EntryIndexCache;
 import io.lakestream.ursa.storage.impl.exception.NoSuchKeyException;
 import io.oxia.client.api.AsyncOxiaClient;
@@ -53,9 +56,12 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -81,6 +87,8 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
     private static final LogMetadataSerde LOG_METADATA_SERDE = LogMetadataSerde.INSTANCE;
     private static final int STREAM_VISIBILITY_READ_BATCH_SIZE = 32;
     private static final int MAX_EXTERNAL_DELETION_CONTEXT_RETRIES = 3;
+    private static final int MAX_PARTITION_METADATA_WRITE_RETRIES = 3;
+    private static final long PARTITION_METADATA_RETRY_DELAY_MILLIS = 10L;
     /**
      * Placeholder {@link LogId} for a partition that is not yet registered, used by
      * {@link #getLayoutTolerant} so a stream can be loaded for materialization before every sibling
@@ -102,9 +110,12 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
     private final LogStateManager logStateManager;
     private final Function<Optional<String>, CompletableFuture<Long>> streamIdGenerator;
     @Nullable
+    private final Function<String, CompletableFuture<StreamIdAllocation>> keyedStreamIdAllocator;
+    @Nullable
     private final Function<String, CompletableFuture<Long>> streamIdLookup;
     @Nullable
     private final BiFunction<String, Long, CompletableFuture<Void>> streamIdMappingDeleter;
+    private final boolean supportsKeyedLifecycle;
     @Nullable
     private final CompactedObjectReaderFactory readerFactory;
     @Nullable
@@ -132,7 +143,8 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
                                 List<AutoCloseable> ownedResources) {
         this(oxiaClient, catalogPaths, logStorage, logFactory,
             (name, logId, reader) -> logFactory.apply(logId), false, logStateManager,
-            streamIdGenerator, readerFactory, entryIndexCache, null, null, ownedResources);
+            streamIdGenerator, null, readerFactory, entryIndexCache, null, null,
+            false, ownedResources);
     }
 
     public IndexedStreamCatalog(AsyncOxiaClient oxiaClient, CatalogPaths catalogPaths,
@@ -145,25 +157,111 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
                                 List<AutoCloseable> ownedResources) {
         this(oxiaClient, catalogPaths, logStorage, logId -> namedLogFactory.create(null, logId, null),
             namedLogFactory, true, logStateManager, streamIdGenerator,
-            readerFactory, entryIndexCache, null, null, ownedResources);
+            null, readerFactory, entryIndexCache, null, null, false, ownedResources);
     }
 
+    /**
+     * Creates a read-only-compatible catalog using the legacy unconditional mapping deleter.
+     *
+     * <p>An unconditional deleter cannot satisfy the stream-ID fencing contract. The catalog can
+     * therefore still be constructed for binary and source compatibility, but keyed lifecycle
+     * mutations fail before invoking any persistence callback.
+     *
+     * @deprecated use a constructor that accepts a conditional {@link BiFunction} deleter
+     */
+    @Deprecated
     public IndexedStreamCatalog(AsyncOxiaClient oxiaClient, CatalogPaths catalogPaths,
                                 LogStorage logStorage,
                                 LogFactory namedLogFactory,
                                 @Nullable LogStateManager logStateManager,
                                 Function<Optional<String>, CompletableFuture<Long>> streamIdGenerator,
+                                @Nullable Function<String, CompletableFuture<Long>> streamIdLookup,
+                                @Nullable Function<String, CompletableFuture<Void>>
+                                    streamIdMappingDeleter,
+                                @Nullable CompactedObjectReaderFactory readerFactory,
+                                @Nullable EntryIndexCache entryIndexCache,
+                                List<AutoCloseable> ownedResources) {
+        this(oxiaClient, catalogPaths, logStorage, logId -> namedLogFactory.create(null, logId, null),
+            namedLogFactory, true, logStateManager, streamIdGenerator,
+            key -> streamIdGenerator.apply(Optional.of(key))
+                .thenApply(streamId -> new StreamIdAllocation(streamId, false)),
+            readerFactory, entryIndexCache,
+            streamIdLookup,
+            streamIdMappingDeleter == null ? null
+                : (key, ignoredStreamId) -> streamIdMappingDeleter.apply(key),
+            false, ownedResources);
+    }
+
+    /**
+     * Creates a catalog with conditional keyed-mapping deletion and a keyed allocator derived
+     * from the generic stream-ID generator.
+     *
+     * <p>A named factory keeps this additive API source-compatible with the legacy constructor,
+     * whose unconditional deleter has the same parameter count but a different functional type.
+     */
+    public static IndexedStreamCatalog withConditionalStreamIdMappingDeletion(
+            AsyncOxiaClient oxiaClient, CatalogPaths catalogPaths,
+            LogStorage logStorage, LogFactory namedLogFactory,
+            @Nullable LogStateManager logStateManager,
+            Function<Optional<String>, CompletableFuture<Long>> streamIdGenerator,
+            Function<String, CompletableFuture<Long>> streamIdLookup,
+            BiFunction<String, Long, CompletableFuture<Void>> streamIdMappingDeleter,
+            @Nullable CompactedObjectReaderFactory readerFactory,
+            @Nullable EntryIndexCache entryIndexCache,
+            List<AutoCloseable> ownedResources) {
+        Objects.requireNonNull(streamIdLookup, "streamIdLookup");
+        Objects.requireNonNull(streamIdMappingDeleter, "streamIdMappingDeleter");
+        return new IndexedStreamCatalog(
+            oxiaClient, catalogPaths, logStorage, namedLogFactory, logStateManager,
+            streamIdGenerator,
+            key -> streamIdGenerator.apply(Optional.of(key))
+                .thenApply(streamId -> new StreamIdAllocation(streamId, false)),
+            streamIdLookup, streamIdMappingDeleter, readerFactory, entryIndexCache,
+            ownedResources);
+    }
+
+    /**
+     * Creates a catalog with explicit keyed stream-ID lifecycle callbacks.
+     *
+     * <p>The mapping deleter must delete only when the current mapping still references the
+     * supplied stream ID. Passing a callback that performs an unconditional delete violates the
+     * fencing contract required by stream creation and deletion.
+     */
+    public IndexedStreamCatalog(AsyncOxiaClient oxiaClient, CatalogPaths catalogPaths,
+                                LogStorage logStorage,
+                                LogFactory namedLogFactory,
+                                @Nullable LogStateManager logStateManager,
+                                Function<Optional<String>, CompletableFuture<Long>> streamIdGenerator,
+                                Function<String, CompletableFuture<StreamIdAllocation>> keyedStreamIdAllocator,
                                 Function<String, CompletableFuture<Long>> streamIdLookup,
                                 BiFunction<String, Long, CompletableFuture<Void>> streamIdMappingDeleter,
                                 @Nullable CompactedObjectReaderFactory readerFactory,
                                 @Nullable EntryIndexCache entryIndexCache,
                                 List<AutoCloseable> ownedResources) {
+        this(oxiaClient, catalogPaths, logStorage, namedLogFactory, logStateManager,
+            streamIdGenerator, keyedStreamIdAllocator, streamIdLookup,
+            streamIdMappingDeleter, readerFactory, entryIndexCache, ownedResources, true);
+    }
+
+    IndexedStreamCatalog(AsyncOxiaClient oxiaClient, CatalogPaths catalogPaths,
+                         LogStorage logStorage,
+                         LogFactory namedLogFactory,
+                         @Nullable LogStateManager logStateManager,
+                         Function<Optional<String>, CompletableFuture<Long>> streamIdGenerator,
+                         Function<String, CompletableFuture<StreamIdAllocation>> keyedStreamIdAllocator,
+                         Function<String, CompletableFuture<Long>> streamIdLookup,
+                         BiFunction<String, Long, CompletableFuture<Void>> streamIdMappingDeleter,
+                         @Nullable CompactedObjectReaderFactory readerFactory,
+                         @Nullable EntryIndexCache entryIndexCache,
+                         List<AutoCloseable> ownedResources,
+                         boolean supportsKeyedLifecycle) {
         this(oxiaClient, catalogPaths, logStorage, logId -> namedLogFactory.create(null, logId, null),
             namedLogFactory, true, logStateManager, streamIdGenerator,
+            Objects.requireNonNull(keyedStreamIdAllocator, "keyedStreamIdAllocator"),
             readerFactory, entryIndexCache,
             Objects.requireNonNull(streamIdLookup, "streamIdLookup"),
             Objects.requireNonNull(streamIdMappingDeleter, "streamIdMappingDeleter"),
-            ownedResources);
+            supportsKeyedLifecycle, ownedResources);
     }
 
     private IndexedStreamCatalog(AsyncOxiaClient oxiaClient, CatalogPaths catalogPaths,
@@ -173,10 +271,13 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
                                 boolean supportsReaderAwareLogCreation,
                                 @Nullable LogStateManager logStateManager,
                                 Function<Optional<String>, CompletableFuture<Long>> streamIdGenerator,
+                                @Nullable Function<String,
+                                    CompletableFuture<StreamIdAllocation>> keyedStreamIdAllocator,
                                 @Nullable CompactedObjectReaderFactory readerFactory,
                                 @Nullable EntryIndexCache entryIndexCache,
                                 @Nullable Function<String, CompletableFuture<Long>> streamIdLookup,
                                 @Nullable BiFunction<String, Long, CompletableFuture<Void>> streamIdMappingDeleter,
+                                boolean supportsKeyedLifecycle,
                                 List<AutoCloseable> ownedResources) {
         this.oxiaClient = oxiaClient;
         this.catalogPaths = catalogPaths;
@@ -187,8 +288,10 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
         this.supportsReaderAwareLogCreation = supportsReaderAwareLogCreation;
         this.logStateManager = logStateManager;
         this.streamIdGenerator = streamIdGenerator;
+        this.keyedStreamIdAllocator = keyedStreamIdAllocator;
         this.streamIdLookup = streamIdLookup;
         this.streamIdMappingDeleter = streamIdMappingDeleter;
+        this.supportsKeyedLifecycle = supportsKeyedLifecycle;
         this.readerFactory = readerFactory;
         this.entryIndexCache = entryIndexCache;
         this.ownedResources = ownedResources != null ? ownedResources : List.of();
@@ -341,7 +444,6 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
                 id, numPartitions, properties, materialization,
                 IndexedStreamConfigStore.CreationKind.NATIVE_CREATE, ownerToken)
             .thenCompose(claim -> createPartitions(id, claim)
-                .thenCompose(ignored -> retagNativePartitions(id, claim))
                 .thenCompose(ignored -> streamConfigStore.verifyProvisioningOwnership(id, claim))
                 .thenCompose(ignored -> streamConfigStore.finalizeCreation(id, claim))
                 .thenCompose(outcome -> outcome.active()
@@ -360,13 +462,94 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
             chain = chain
                 .thenCompose(ignored ->
                     streamConfigStore.verifyProvisioningOwnership(id, claim))
-                .thenCompose(ignored -> allocateKeyedStreamId(allocationKey))
-                .thenCompose(streamId -> verifyAndWriteNativePartitionAfterAllocation(
-                    id, partIdx, allocationKey, streamId, claim))
+                .thenCompose(ignored ->
+                    prepareRetiredNativePartition(id, partIdx, claim))
+                .thenCompose(prepared -> allocateKeyedStreamId(allocationKey)
+                    .thenApply(streamId -> {
+                        if (prepared.retiredStreamIds().contains(streamId)) {
+                            throw new RetiredStreamIdAllocationException(
+                                new StreamIdAllocation(streamId, false),
+                                "Native partition " + id.fullName() + "-partition-"
+                                    + partIdx
+                                    + " cannot reuse a retired physical stream ID");
+                        }
+                        return streamId;
+                    })
+                    .handle((streamId, failure) -> new NativeAllocationAttempt(
+                        streamId, unwrapNullable(failure))))
+                .thenCompose(attempt -> {
+                    if (attempt.failure() == null) {
+                        return verifyAndWriteNativePartitionAfterAllocation(
+                            id, partIdx, allocationKey, attempt.streamId(), claim);
+                    }
+                    Throwable cause = rootCause(attempt.failure());
+                    if (cause instanceof KeyedAllocationInvalidatedException invalidated) {
+                        return compensateRejectedNativeAllocation(
+                            id, partIdx, allocationKey,
+                            invalidated.allocation().streamId(), claim, cause);
+                    }
+                    if (cause instanceof RetiredStreamIdAllocationException retired) {
+                        return compensateRetiredNativeAllocation(
+                            id, partIdx, allocationKey,
+                            retired.allocation().streamId(), claim, cause);
+                    }
+                    return CompletableFuture.failedFuture(cause);
+                })
                 .thenCompose(ignored ->
                     streamConfigStore.verifyProvisioningOwnership(id, claim));
         }
         return chain;
+    }
+
+    private CompletableFuture<PreparedNativePartition> prepareRetiredNativePartition(
+            StreamIdentifier id, int partitionIndex,
+            IndexedStreamConfigStore.ProvisioningClaim claim) {
+        String path = catalogPaths.partitionMetadataPath(id, partitionIndex);
+        Supplier<CompletableFuture<Void>> ownershipVerifier =
+            () -> streamConfigStore.verifyProvisioningOwnership(id, claim);
+        return ownershipVerifier.get()
+            .thenCompose(ignored -> oxiaClient.get(path))
+            .thenCompose(existing -> {
+                if (existing == null) {
+                    return ownershipVerifier.get().thenApply(ignored ->
+                        new PreparedNativePartition(Set.of()));
+                }
+                final LogMetadata metadata;
+                try {
+                    metadata = LOG_METADATA_SERDE.deserialize(path, existing.value());
+                } catch (Exception e) {
+                    return CompletableFuture.failedFuture(e);
+                }
+                if (!hasRetiredCleanup(metadata)) {
+                    Set<Long> retiredStreamIds = metadata.deleted()
+                        ? retiredStreamIdsWith(
+                            metadata.retiredStreamIds(), metadata.streamId())
+                        : metadata.retiredStreamIds();
+                    return ownershipVerifier.get().thenApply(ignored ->
+                        new PreparedNativePartition(retiredStreamIds));
+                }
+                return sweepRetiredAllocations(
+                    id, partitionIndex, ownershipVerifier, Set.of())
+                    .thenApply(cleaned -> new PreparedNativePartition(
+                        cleaned.retiredStreamIds()));
+            });
+    }
+
+    private CompletableFuture<Void> compensateRetiredNativeAllocation(
+            StreamIdentifier id, int partitionIndex, String allocationKey, long streamId,
+            IndexedStreamConfigStore.ProvisioningClaim claim, Throwable failure) {
+        return claimAndCleanupOrphanedAllocation(
+                id, partitionIndex, allocationKey, streamId,
+                Optional.of(claim.incarnationId()), Optional.of(claim.ownerToken()),
+                claim.ownerGeneration(), AllocationCleanupProtection.missingMetadata(),
+                () -> streamConfigStore.verifyProvisioningOwnership(id, claim))
+            .handle((ignored, cleanupFailure) -> {
+                if (cleanupFailure != null) {
+                    addSuppressed(failure, cleanupFailure);
+                }
+                return null;
+            })
+            .thenCompose(ignored -> CompletableFuture.failedFuture(failure));
     }
 
     private CompletableFuture<Void> verifyAndWriteNativePartitionAfterAllocation(
@@ -385,25 +568,95 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
                     return CompletableFuture.failedFuture(cause);
                 }
                 return compensateRejectedNativeAllocation(
-                    id, allocationKey, streamId, claim, cause);
+                    id, partitionIndex, allocationKey, streamId, claim, cause);
             });
     }
 
     private CompletableFuture<Void> compensateRejectedNativeAllocation(
-            StreamIdentifier id, String allocationKey, long streamId,
+            StreamIdentifier id, int partitionIndex, String allocationKey, long streamId,
             IndexedStreamConfigStore.ProvisioningClaim claim,
             Throwable ownershipFailure) {
-        return streamConfigStore.canCleanupRejectedNativeAllocation(id, claim)
-            .thenCompose(canCleanup -> {
-                if (!canCleanup) {
+        return readLifecycleContextForCleanup(id, ownershipFailure)
+            .thenCompose(read -> {
+                if (read.context() == null) {
                     return CompletableFuture.failedFuture(ownershipFailure);
                 }
-                return logStorage.deleteLog(LogId.of(streamId))
-                    .thenCompose(ignored -> streamIdMappingDeleter.apply(
-                        allocationKey, streamId))
+                IndexedStreamConfigStore.LifecycleContext lifecycle = read.context();
+                Optional<IndexedStreamConfigStore.StreamConfigData> current =
+                    lifecycle.config();
+                CompletableFuture<AllocationCleanup> disposition;
+                if (current.isPresent() && sameNativeLifecycle(
+                        current.orElseThrow(), claim)) {
+                    IndexedStreamConfigStore.ProvisioningState state =
+                        current.orElseThrow().provisioningState();
+                    if (state == IndexedStreamConfigStore.ProvisioningState.PROVISIONING) {
+                        return CompletableFuture.failedFuture(ownershipFailure);
+                    }
+                    if (state == IndexedStreamConfigStore.ProvisioningState.ACTIVE) {
+                        return claimAndCleanupOrphanedAllocation(
+                                id, partitionIndex, allocationKey, streamId,
+                                Optional.of(claim.incarnationId()),
+                                Optional.of(claim.ownerToken()), claim.ownerGeneration(),
+                                AllocationCleanupProtection.active(current.orElseThrow()),
+                                orphanedAllocationSweepVerifier(id, lifecycle))
+                            .handle((ignored, cleanupFailure) -> {
+                                if (cleanupFailure != null) {
+                                    addSuppressed(ownershipFailure, cleanupFailure);
+                                }
+                                return null;
+                            })
+                            .thenCompose(ignored ->
+                                CompletableFuture.failedFuture(ownershipFailure));
+                    }
+                    if (state != IndexedStreamConfigStore.ProvisioningState.ABORTING
+                            && state != IndexedStreamConfigStore.ProvisioningState.DROPPED) {
+                        return CompletableFuture.failedFuture(ownershipFailure);
+                    }
+                    IndexedStreamConfigStore.NativeCleanupContext cleanupContext =
+                        new IndexedStreamConfigStore.NativeCleanupContext(
+                            current, lifecycle.versionId());
+                    disposition = claimRejectedNativeAllocation(
+                        id, partitionIndex, allocationKey, streamId, cleanupContext,
+                        new PartitionMetadataRetry());
+                } else {
+                    if (current.isPresent()
+                            && current.orElseThrow().provisioningState()
+                                == IndexedStreamConfigStore.ProvisioningState.PROVISIONING) {
+                        return CompletableFuture.failedFuture(ownershipFailure);
+                    }
+                    AllocationCleanupProtection protection = current.isPresent()
+                            && current.orElseThrow().provisioningState()
+                                == IndexedStreamConfigStore.ProvisioningState.ACTIVE
+                        ? AllocationCleanupProtection.active(current.orElseThrow())
+                        : AllocationCleanupProtection.none();
+                    return claimAndCleanupOrphanedAllocation(
+                            id, partitionIndex, allocationKey, streamId,
+                            Optional.of(claim.incarnationId()),
+                            Optional.of(claim.ownerToken()), claim.ownerGeneration(), protection,
+                            orphanedAllocationSweepVerifier(id, lifecycle))
+                        .handle((ignored, cleanupFailure) -> {
+                            if (cleanupFailure != null) {
+                                addSuppressed(ownershipFailure, cleanupFailure);
+                            }
+                            return null;
+                        })
+                        .thenCompose(ignored ->
+                            CompletableFuture.failedFuture(ownershipFailure));
+                }
+                Supplier<CompletableFuture<Void>> ownershipVerifier =
+                    () -> streamConfigStore.verifyNativeCleanupContext(
+                        id, new IndexedStreamConfigStore.NativeCleanupContext(
+                            current, lifecycle.versionId()));
+                return disposition
+                    .thenCompose(cleanupDisposition -> cleanupClaimedAllocation(
+                        id, partitionIndex, allocationKey, streamId,
+                        cleanupDisposition, ownershipVerifier))
                     .handle((ignored, cleanupFailure) -> {
                         if (cleanupFailure != null) {
-                            ownershipFailure.addSuppressed(rootCause(cleanupFailure));
+                            Throwable cause = rootCause(cleanupFailure);
+                            if (cause != ownershipFailure) {
+                                ownershipFailure.addSuppressed(cause);
+                            }
                         }
                         return null;
                     })
@@ -412,43 +665,221 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
             });
     }
 
-    private CompletableFuture<Void> retagNativePartitions(
-            StreamIdentifier id, IndexedStreamConfigStore.ProvisioningClaim claim) {
-        CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
-        for (int i = 0; i < claim.config().partitions(); i++) {
-            int partitionIndex = i;
-            String allocationKey = nativePartitionAllocationKey(id, claim, partitionIndex);
-            chain = chain
-                .thenCompose(ignored ->
-                    streamConfigStore.verifyProvisioningOwnership(id, claim))
-                .thenCompose(ignored -> readNativePartitionStreamIdForRetag(
-                    id, partitionIndex, allocationKey))
-                .thenCompose(streamId -> writePartitionMetadataForNativeClaim(
-                    id, partitionIndex, streamId, claim))
-                .thenApply(ignored -> null);
-        }
-        return chain;
+    private static boolean sameNativeLifecycle(
+            IndexedStreamConfigStore.StreamConfigData config,
+            IndexedStreamConfigStore.ProvisioningClaim claim) {
+        return config.creationKind().orElse(null)
+                == IndexedStreamConfigStore.CreationKind.NATIVE_CREATE
+            && config.incarnationId().equals(Optional.of(claim.incarnationId()));
     }
 
-    private CompletableFuture<Long> readNativePartitionStreamIdForRetag(
-            StreamIdentifier id, int partitionIndex, String allocationKey) {
+    private CompletableFuture<AllocationCleanup> claimRejectedNativeAllocation(
+            StreamIdentifier id, int partitionIndex, String allocationKey, long streamId,
+            IndexedStreamConfigStore.NativeCleanupContext context,
+            PartitionMetadataRetry retryState) {
+        IndexedStreamConfigStore.StreamConfigData config =
+            context.config().orElseThrow();
         String path = catalogPaths.partitionMetadataPath(id, partitionIndex);
-        return oxiaClient.get(path).thenCompose(result -> {
-            if (result != null) {
+        Supplier<CompletableFuture<Void>> ownershipVerifier =
+            () -> streamConfigStore.verifyNativeCleanupContext(id, context);
+        return ownershipVerifier.get()
+            .thenCompose(ignored -> oxiaClient.get(path))
+            .thenCompose(existing -> {
+                if (existing == null) {
+                    Set<RetiredStreamMapping> retiredStreamMappings =
+                        retiredStreamMappingsWith(Set.of(), allocationKey, streamId);
+                    Set<String> retiredMappingKeys =
+                        retiredMappingKeysWith(Set.of(), allocationKey);
+                    LogMetadata desired = deletionMetadata(
+                        streamId, config, Set.of(streamId), Set.of(streamId),
+                        retiredStreamMappings, retiredMappingKeys);
+                    return persistPartitionMetadata(
+                        id, partitionIndex, desired,
+                        Set.of(PutOption.IfRecordDoesNotExist), ownershipVerifier,
+                        ignored -> AllocationCleanup.DELETE_LOG_AND_MAPPING,
+                        () -> claimRejectedNativeAllocation(
+                            id, partitionIndex, allocationKey, streamId, context,
+                            retryState),
+                        retryState);
+                }
+
+                final LogMetadata current;
                 try {
-                    LogMetadata metadata = LOG_METADATA_SERDE.deserialize(path, result.value());
-                    if (!metadata.deleted()) {
-                        return CompletableFuture.completedFuture(metadata.streamId());
-                    }
+                    current = LOG_METADATA_SERDE.deserialize(path, existing.value());
                 } catch (Exception e) {
                     return CompletableFuture.failedFuture(e);
                 }
+                if (!metadataCanBeFencedByDeletion(current, config)) {
+                    return CompletableFuture.completedFuture(AllocationCleanup.PRESERVE);
+                }
+
+                long primaryStreamId = current.streamId() >= 0
+                    ? current.streamId() : streamId;
+                Set<Long> retiredStreamIds = retiredStreamIdsWith(
+                    current.retiredStreamIds(), primaryStreamId, streamId);
+                Set<Long> purgeableRetiredStreamIds =
+                    current.purgeableRetiredStreamIds();
+                if (config.purgeRequested()) {
+                    purgeableRetiredStreamIds = purgeAllRetiredStreamIds(
+                        purgeableRetiredStreamIds, retiredStreamIds);
+                } else if (!current.retiredStreamIds().contains(streamId)
+                        && (current.streamId() < 0 || streamId != current.streamId())) {
+                    purgeableRetiredStreamIds = retiredStreamIdsWith(
+                        purgeableRetiredStreamIds, streamId);
+                }
+                Set<RetiredStreamMapping> retiredStreamMappings =
+                    retiredStreamMappingsWith(
+                        current.retiredStreamMappings(), allocationKey, streamId);
+                Set<String> retiredMappingKeys = retiredMappingKeysWith(
+                    current.retiredMappingKeys(), allocationKey);
+                LogMetadata desired = deletionMetadata(
+                    primaryStreamId, config, retiredStreamIds,
+                    purgeableRetiredStreamIds, retiredStreamMappings,
+                    retiredMappingKeys);
+                AllocationCleanup cleanup =
+                    purgeableRetiredStreamIds.contains(streamId)
+                        ? AllocationCleanup.DELETE_LOG_AND_MAPPING
+                        : AllocationCleanup.DELETE_MAPPING_ONLY;
+                if (samePersistedRegistration(current, desired)) {
+                    return ownershipVerifier.get().thenApply(ignored -> cleanup);
+                }
+                AllocationCleanup finalCleanup = cleanup;
+                return persistPartitionMetadata(
+                    id, partitionIndex, desired,
+                    Set.of(PutOption.IfVersionIdEquals(existing.version().versionId())),
+                    ownershipVerifier, ignored -> finalCleanup,
+                    () -> claimRejectedNativeAllocation(
+                        id, partitionIndex, allocationKey, streamId, context,
+                        retryState),
+                    retryState);
+            });
+    }
+
+    private CompletableFuture<AllocationCleanup> claimOrphanedAllocation(
+            StreamIdentifier id, int partitionIndex, String mappingKey, long streamId,
+            Optional<String> fallbackIncarnation, Optional<String> fallbackOwner,
+            long fallbackGeneration, AllocationCleanupProtection protection,
+            PartitionMetadataRetry retryState) {
+        String path = catalogPaths.partitionMetadataPath(id, partitionIndex);
+        Supplier<CompletableFuture<Void>> noOwnershipFence =
+            () -> CompletableFuture.completedFuture(null);
+        return oxiaClient.get(path).thenCompose(existing -> {
+            Set<RetiredStreamMapping> newMappings =
+                retiredStreamMappingsWith(Set.of(), mappingKey, streamId);
+            Set<String> newMappingKeys = retiredMappingKeysWith(Set.of(), mappingKey);
+            if (existing == null) {
+                if (protection.preserveMissingMetadata()) {
+                    return CompletableFuture.completedFuture(AllocationCleanup.PRESERVE);
+                }
+                LogMetadata desired = new LogMetadata(
+                    streamId, Map.of(), OptionalLong.empty(),
+                    fallbackIncarnation.orElse(null), fallbackOwner.orElse(null),
+                    fallbackGeneration >= 0 ? fallbackGeneration : null, true,
+                    Set.of(streamId), Set.of(streamId), newMappings, newMappingKeys);
+                return persistPartitionMetadata(
+                    id, partitionIndex, desired,
+                    Set.of(PutOption.IfRecordDoesNotExist), noOwnershipFence,
+                    ignored -> AllocationCleanup.DELETE_LOG_AND_MAPPING,
+                    () -> claimOrphanedAllocation(
+                        id, partitionIndex, mappingKey, streamId, fallbackIncarnation,
+                        fallbackOwner, fallbackGeneration,
+                        protection, retryState), retryState);
             }
-            if (streamIdLookup != null) {
-                return streamIdLookup.apply(allocationKey);
+
+            final LogMetadata current;
+            try {
+                current = LOG_METADATA_SERDE.deserialize(path, existing.value());
+            } catch (Exception e) {
+                return CompletableFuture.failedFuture(e);
             }
-            return CompletableFuture.failedFuture(new NoSuchStreamException(id));
+            if (protection.protects(current)) {
+                return CompletableFuture.completedFuture(AllocationCleanup.PRESERVE);
+            }
+            boolean ownedByRejectedAttempt = !current.deleted()
+                && current.streamId() == streamId
+                && metadataRegistrationMatches(
+                    current, fallbackIncarnation, fallbackOwner, fallbackGeneration);
+            if (!current.deleted() && current.streamId() == streamId
+                    && (protection.activeConfig().isPresent()
+                        || !ownedByRejectedAttempt)) {
+                return CompletableFuture.completedFuture(AllocationCleanup.PRESERVE);
+            }
+            Set<Long> retiredStreamIds = retiredStreamIdsWith(
+                current.retiredStreamIds(), streamId);
+            Set<Long> purgeableRetiredStreamIds =
+                current.purgeableRetiredStreamIds();
+            if (!current.retiredStreamIds().contains(streamId)
+                    && (ownedByRejectedAttempt || current.streamId() < 0
+                        || current.streamId() != streamId)) {
+                purgeableRetiredStreamIds = retiredStreamIdsWith(
+                    purgeableRetiredStreamIds, streamId);
+            }
+            Set<RetiredStreamMapping> retiredStreamMappings =
+                new TreeSet<>(current.retiredStreamMappings());
+            retiredStreamMappings.addAll(newMappings);
+            Set<String> retiredMappingKeys =
+                new TreeSet<>(current.retiredMappingKeys());
+            retiredMappingKeys.addAll(newMappingKeys);
+            LogMetadata desired = ownedByRejectedAttempt
+                ? new LogMetadata(
+                    current.streamId(), current.properties(), current.terminatedOffset(),
+                    current.registrationIncarnationId(),
+                    current.registrationOwnerToken(),
+                    current.registrationOwnerGeneration(), true, retiredStreamIds,
+                    purgeableRetiredStreamIds, retiredStreamMappings,
+                    retiredMappingKeys)
+                : withRetiredCleanup(
+                    current, retiredStreamIds, purgeableRetiredStreamIds,
+                    retiredStreamMappings, retiredMappingKeys);
+            AllocationCleanup disposition = purgeableRetiredStreamIds.contains(streamId)
+                ? AllocationCleanup.DELETE_LOG_AND_MAPPING
+                : AllocationCleanup.DELETE_MAPPING_ONLY;
+            if (samePersistedRegistration(current, desired)) {
+                return CompletableFuture.completedFuture(disposition);
+            }
+            return persistPartitionMetadata(
+                id, partitionIndex, desired,
+                Set.of(PutOption.IfVersionIdEquals(existing.version().versionId())),
+                noOwnershipFence, ignored -> disposition,
+                () -> claimOrphanedAllocation(
+                    id, partitionIndex, mappingKey, streamId, fallbackIncarnation,
+                    fallbackOwner, fallbackGeneration,
+                    protection, retryState), retryState);
         });
+    }
+
+    private CompletableFuture<Void> claimAndCleanupOrphanedAllocation(
+            StreamIdentifier id, int partitionIndex, String mappingKey, long streamId,
+            Optional<String> fallbackIncarnation, Optional<String> fallbackOwner,
+            long fallbackGeneration, AllocationCleanupProtection protection,
+            Supplier<CompletableFuture<Void>> fixedPointVerifier) {
+        return claimOrphanedAllocation(
+                id, partitionIndex, mappingKey, streamId,
+                fallbackIncarnation, fallbackOwner, fallbackGeneration,
+                protection,
+                new PartitionMetadataRetry())
+            .thenCompose(disposition -> cleanupClaimedAllocation(
+                id, partitionIndex, mappingKey, streamId, disposition,
+                fixedPointVerifier));
+    }
+
+    private CompletableFuture<Void> cleanupClaimedAllocation(
+            StreamIdentifier id, int partitionIndex, String mappingKey, long streamId,
+            AllocationCleanup disposition,
+            Supplier<CompletableFuture<Void>> fixedPointVerifier) {
+        if (!disposition.deleteLog() && !disposition.deleteMapping()) {
+            return CompletableFuture.completedFuture(null);
+        }
+        return sweepRetiredAllocations(
+            id, partitionIndex, fixedPointVerifier, Set.of()).thenApply(value -> null);
+    }
+
+    private Supplier<CompletableFuture<Void>> orphanedAllocationSweepVerifier(
+            StreamIdentifier id, IndexedStreamConfigStore.LifecycleContext lifecycle) {
+        IndexedStreamConfigStore.NativeCleanupContext context =
+            new IndexedStreamConfigStore.NativeCleanupContext(
+                lifecycle.config(), lifecycle.versionId());
+        return () -> streamConfigStore.verifyNativeCleanupContext(id, context);
     }
 
     private static String nativePartitionAllocationKey(
@@ -518,7 +949,7 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
                     new ExternalWriteAttempt(null, unwrapNullable(failure)))
                 .thenCompose(attempt -> attempt.failure() == null
                     ? prepareRetiredExternalPartition(
-                        id, partitionIndex, registration)
+                        id, partitionIndex, registration, Set.of(streamId))
                         .thenCompose(ignored ->
                             writePartitionMetadataForExternalRegistration(
                                 id, partitionIndex, streamId, registration))
@@ -560,27 +991,40 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
                 .thenCompose(attempt -> attempt.failure() == null
                     ? allocateExternalReplacementStreamId(
                         id, partitionIndex, logName, registration)
-                        .handle((allocation, failure) -> new ExternalOpenAttempt(
-                            allocation, null, unwrapNullable(failure)))
+                        .handle((allocation, failure) -> {
+                            Throwable cause = unwrapNullable(failure);
+                            StreamIdAllocation recoverableAllocation = allocation;
+                            if (recoverableAllocation == null
+                                    && cause instanceof KeyedAllocationInvalidatedException
+                                        invalidated) {
+                                recoverableAllocation = invalidated.allocation();
+                            } else if (recoverableAllocation == null
+                                    && cause instanceof RetiredStreamIdAllocationException
+                                        retired) {
+                                recoverableAllocation = retired.allocation();
+                            }
+                            return new ExternalOpenAttempt(
+                                recoverableAllocation, null, cause);
+                        })
                     : CompletableFuture.completedFuture(attempt))
                 .thenCompose(attempt -> attempt.failure() == null
                     ? writePartitionMetadataForExternalRegistration(
-                        id, partitionIndex, attempt.streamId(), registration)
+                        id, partitionIndex, attempt.allocation().streamId(), registration)
                         .handle((write, failure) -> new ExternalOpenAttempt(
-                            attempt.streamId(), write, unwrapNullable(failure)))
+                            attempt.allocation(), write, unwrapNullable(failure)))
                     : CompletableFuture.completedFuture(attempt))
                 .thenCompose(attempt -> attempt.failure() == null
                     ? completeExternalRegistration(id, registration)
                         .handle((ignored, failure) -> new ExternalOpenAttempt(
-                            attempt.streamId(), attempt.write(), unwrapNullable(failure)))
+                            attempt.allocation(), attempt.write(), unwrapNullable(failure)))
                     : CompletableFuture.completedFuture(attempt))
                 .thenCompose(attempt -> {
                     if (attempt.failure() != null) {
                         return compensateRejectedOpen(
-                            id, partitionIndex, attempt);
+                            id, partitionIndex, registration, attempt);
                     }
                     return CompletableFuture.completedFuture(createLog(
-                        logName, LogId.of(attempt.streamId())));
+                        logName, LogId.of(attempt.allocation().streamId())));
                 }));
     }
 
@@ -588,35 +1032,42 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
         return streamIdGenerator.apply(Optional.of(logName));
     }
 
-    private CompletableFuture<Long> allocateExternalReplacementStreamId(
+    private CompletableFuture<StreamIdAllocation> allocateExternalKeyedStreamId(
+            String logName) {
+        return keyedStreamIdAllocator.apply(logName);
+    }
+
+    private CompletableFuture<StreamIdAllocation> allocateExternalReplacementStreamId(
             StreamIdentifier id, int partitionIndex, String logName,
             IndexedStreamConfigStore.ExternalRegistration registration) {
-        return prepareRetiredExternalPartition(id, partitionIndex, registration)
-            .thenCompose(retiredStreamId -> allocateKeyedStreamId(logName)
-                .thenApply(streamId -> {
-                    if (retiredStreamId.isPresent()
-                            && retiredStreamId.getAsLong() == streamId) {
-                        throw new AlreadyExistsException(
+        return prepareRetiredExternalPartition(
+                id, partitionIndex, registration, Set.of())
+            .thenCompose(prepared -> allocateExternalKeyedStreamId(logName)
+                .thenApply(allocation -> {
+                    if (prepared.retiredStreamIds().contains(allocation.streamId())) {
+                        throw new RetiredStreamIdAllocationException(
+                            allocation,
                             "Deleted external partition " + id.fullName() + "-partition-"
                                 + partitionIndex + " must use a fresh physical stream ID");
                     }
                     // The write path verifies ownership before its metadata CAS. Keeping the
                     // allocated ID in the open attempt lets a raced deletion compensate the
                     // keyed allocation instead of leaking it when that verification fails.
-                    return streamId;
+                    return allocation;
                 }));
     }
 
-    private CompletableFuture<OptionalLong> prepareRetiredExternalPartition(
+    private CompletableFuture<PreparedExternalPartition> prepareRetiredExternalPartition(
             StreamIdentifier id, int partitionIndex,
-            IndexedStreamConfigStore.ExternalRegistration registration) {
+            IndexedStreamConfigStore.ExternalRegistration registration,
+            Set<Long> protectedStreamIds) {
         String metadataPath = catalogPaths.partitionMetadataPath(id, partitionIndex);
-        String mappingKey = catalogPaths.compactedReaderName(id, partitionIndex);
         return streamConfigStore.verifyExternalRegistration(id, registration)
             .thenCompose(ignored -> oxiaClient.get(metadataPath))
             .thenCompose(existing -> {
                 if (existing == null) {
-                    return CompletableFuture.completedFuture(OptionalLong.empty());
+                    return CompletableFuture.completedFuture(
+                        new PreparedExternalPartition(Set.of()));
                 }
                 final LogMetadata metadata;
                 try {
@@ -625,27 +1076,28 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
                 } catch (Exception e) {
                     return CompletableFuture.failedFuture(e);
                 }
-                if (!metadata.deleted()) {
-                    return CompletableFuture.completedFuture(OptionalLong.empty());
-                }
-                if (!deletedMetadataCanBeReplaced(metadata, registration)) {
+                if (metadata.deleted()
+                        && !deletedMetadataCanBeReplaced(metadata, registration)) {
                     return CompletableFuture.failedFuture(new AlreadyExistsException(
                         "Deleted partition metadata is not replaceable by the current external "
                             + "registration: " + id.fullName() + "-partition-"
                             + partitionIndex));
                 }
-                long retiredStreamId = metadata.streamId();
-                return streamConfigStore.verifyExternalRegistration(id, registration)
-                    .thenCompose(ignored -> retiredStreamId >= 0
-                        ? logStorage.deleteLog(LogId.of(retiredStreamId))
-                        : CompletableFuture.completedFuture(null))
-                    .thenCompose(ignored -> retiredStreamId >= 0
-                        ? streamIdMappingDeleter.apply(mappingKey, retiredStreamId)
-                        : CompletableFuture.completedFuture(null))
-                    .thenCompose(ignored ->
-                        streamConfigStore.verifyExternalRegistration(id, registration))
-                    .thenApply(ignored -> retiredStreamId >= 0
-                        ? OptionalLong.of(retiredStreamId) : OptionalLong.empty());
+                if (!hasRetiredCleanup(metadata)) {
+                    Set<Long> retiredStreamIds = metadata.deleted()
+                        ? retiredStreamIdsWith(
+                            metadata.retiredStreamIds(), metadata.streamId())
+                        : metadata.retiredStreamIds();
+                    return CompletableFuture.completedFuture(
+                        new PreparedExternalPartition(
+                            retiredStreamIds));
+                }
+                return sweepRetiredAllocations(
+                        id, partitionIndex,
+                        () -> streamConfigStore.verifyExternalRegistration(id, registration),
+                        protectedStreamIds)
+                    .thenApply(cleaned -> new PreparedExternalPartition(
+                        cleaned.retiredStreamIds()));
             });
     }
 
@@ -698,38 +1150,526 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
 
     private <T> CompletableFuture<T> compensateRejectedOpen(
             StreamIdentifier id, int partitionIndex,
+            IndexedStreamConfigStore.ExternalRegistration registration,
             ExternalOpenAttempt attempt) {
         Throwable failure = rootCause(attempt.failure());
-        if (attempt.streamId() == null
+        if (failure instanceof RetiredStreamIdAllocationException retired) {
+            String logName = catalogPaths.compactedReaderName(id, partitionIndex);
+            return claimAndCleanupOrphanedAllocation(
+                    id, partitionIndex, logName, retired.allocation().streamId(),
+                    registration.incarnationId(), registration.ownerToken(),
+                    registration.ownerGeneration(),
+                    AllocationCleanupProtection.missingMetadata(),
+                    () -> streamConfigStore.verifyExternalRegistration(id, registration))
+                .handle((ignored, cleanupFailure) -> {
+                    if (cleanupFailure != null) {
+                        addSuppressed(failure, cleanupFailure);
+                    }
+                    return null;
+                })
+                .thenCompose(ignored -> CompletableFuture.failedFuture(failure));
+        }
+        if (attempt.allocation() == null
                 || streamIdLookup == null || streamIdMappingDeleter == null) {
             return CompletableFuture.failedFuture(failure);
         }
-        return streamConfigStore.readExternalDeletionContext(id)
-            .handle((context, readFailure) -> readFailure == null ? context : null)
-            .thenCompose(context -> {
-                if (context == null
-                        || context.config().provisioningState()
-                            == IndexedStreamConfigStore.ProvisioningState.ACTIVE) {
+        String mappingKey = catalogPaths.compactedReaderName(id, partitionIndex);
+        return readLifecycleContextForCleanup(id, failure)
+            .thenCompose(read -> {
+                if (read.context() == null) {
                     return CompletableFuture.failedFuture(failure);
                 }
-                return deleteExternalPartition(id, partitionIndex)
-                    .handle((ignored, cleanupFailure) -> {
-                        if (cleanupFailure != null) {
-                            failure.addSuppressed(rootCause(cleanupFailure));
+                IndexedStreamConfigStore.LifecycleContext lifecycle = read.context();
+                Optional<IndexedStreamConfigStore.StreamConfigData> current =
+                    lifecycle.config();
+                CompletableFuture<Void> cleanup;
+                if (current.isPresent() && sameExternalLifecycle(
+                        current.orElseThrow(), registration)) {
+                    IndexedStreamConfigStore.ProvisioningState state =
+                        current.orElseThrow().provisioningState();
+                    if (state == IndexedStreamConfigStore.ProvisioningState.PROVISIONING) {
+                        return CompletableFuture.failedFuture(failure);
+                    }
+                    if (state == IndexedStreamConfigStore.ProvisioningState.ACTIVE) {
+                        cleanup = claimAndCleanupOrphanedAllocation(
+                            id, partitionIndex, mappingKey,
+                            attempt.allocation().streamId(), registration.incarnationId(),
+                            registration.ownerToken(), registration.ownerGeneration(),
+                            AllocationCleanupProtection.active(current.orElseThrow()),
+                            orphanedAllocationSweepVerifier(id, lifecycle));
+                    } else if (state == IndexedStreamConfigStore.ProvisioningState.ABORTING
+                            || state == IndexedStreamConfigStore.ProvisioningState.DROPPED
+                            || state == IndexedStreamConfigStore.ProvisioningState.UNREGISTERED
+                            || state == IndexedStreamConfigStore.ProvisioningState
+                                .PERMANENTLY_DELETED) {
+                        cleanup = cleanupRejectedOpenAllocation(
+                            id, partitionIndex, attempt.allocation().streamId(),
+                            new IndexedStreamConfigStore.ExternalDeletionContext(
+                                current.orElseThrow(), lifecycle.versionId()));
+                    } else {
+                        return CompletableFuture.failedFuture(failure);
+                    }
+                } else {
+                    if (current.isPresent()
+                            && current.orElseThrow().provisioningState()
+                                == IndexedStreamConfigStore.ProvisioningState.PROVISIONING) {
+                        return CompletableFuture.failedFuture(failure);
+                    }
+                    AllocationCleanupProtection protection = current.isPresent()
+                            && current.orElseThrow().provisioningState()
+                                == IndexedStreamConfigStore.ProvisioningState.ACTIVE
+                        ? AllocationCleanupProtection.active(current.orElseThrow())
+                        : AllocationCleanupProtection.none();
+                    cleanup = claimAndCleanupOrphanedAllocation(
+                        id, partitionIndex, mappingKey,
+                        attempt.allocation().streamId(), registration.incarnationId(),
+                        registration.ownerToken(), registration.ownerGeneration(), protection,
+                        orphanedAllocationSweepVerifier(id, lifecycle));
+                }
+                return cleanup.handle((ignored, cleanupFailure) -> {
+                    if (cleanupFailure != null) {
+                        Throwable cause = rootCause(cleanupFailure);
+                        if (cause != failure) {
+                            failure.addSuppressed(cause);
                         }
-                        return null;
-                    })
+                    }
+                    return null;
+                })
                     .thenCompose(ignored -> CompletableFuture.failedFuture(failure));
             });
+    }
+
+    private static boolean sameExternalLifecycle(
+            IndexedStreamConfigStore.StreamConfigData config,
+            IndexedStreamConfigStore.ExternalRegistration registration) {
+        return config.creationKind().orElse(IndexedStreamConfigStore.CreationKind.EXTERNAL)
+                == IndexedStreamConfigStore.CreationKind.EXTERNAL
+            && config.incarnationId().equals(registration.incarnationId());
+    }
+
+    private CompletableFuture<Void> cleanupRejectedOpenAllocation(
+            StreamIdentifier id, int partitionIndex, long streamId,
+            IndexedStreamConfigStore.ExternalDeletionContext context) {
+        IndexedStreamConfigStore.ProvisioningState state =
+            context.config().provisioningState();
+        if (state != IndexedStreamConfigStore.ProvisioningState.ABORTING
+                && state != IndexedStreamConfigStore.ProvisioningState.DROPPED
+                && state != IndexedStreamConfigStore.ProvisioningState.PERMANENTLY_DELETED) {
+            return CompletableFuture.completedFuture(null);
+        }
+        String logName = catalogPaths.compactedReaderName(id, partitionIndex);
+        if (state == IndexedStreamConfigStore.ProvisioningState.PERMANENTLY_DELETED) {
+            return deleteExternalPartitionWithResolvedMapping(
+                id, partitionIndex, logName, context, OptionalLong.of(streamId), true,
+                MAX_EXTERNAL_DELETION_CONTEXT_RETRIES);
+        }
+        return cleanupRejectedOpenAllocation(
+            id, partitionIndex, logName, streamId, context,
+            MAX_EXTERNAL_DELETION_CONTEXT_RETRIES);
+    }
+
+    private CompletableFuture<Void> cleanupRejectedOpenAllocation(
+            StreamIdentifier id, int partitionIndex, String logName, long streamId,
+            IndexedStreamConfigStore.ExternalDeletionContext context,
+            int remainingContextRetries) {
+        return claimUnpublishedExternalAllocation(
+                id, partitionIndex, streamId, context, new PartitionMetadataRetry())
+            .thenCompose(disposition -> cleanupClaimedAllocation(
+                id, partitionIndex, logName, streamId, disposition,
+                () -> streamConfigStore.verifyExternalDeletionContext(id, context)))
+            .handle((ignored, failure) -> unwrapNullable(failure))
+            .thenCompose(failure -> {
+                if (failure == null) {
+                    return CompletableFuture.completedFuture(null);
+                }
+                Throwable cause = rootCause(failure);
+                if (!(cause instanceof IndexedStreamConfigStore
+                        .ExternalDeletionContextInvalidatedException)
+                        || remainingContextRetries == 0) {
+                    return CompletableFuture.failedFuture(cause);
+                }
+                return streamConfigStore.readExternalDeletionContext(id)
+                    .thenCompose(successor -> {
+                        if (!context.canRetryWith(successor)) {
+                            return CompletableFuture.failedFuture(cause);
+                        }
+                        if (successor.config().provisioningState()
+                                == IndexedStreamConfigStore.ProvisioningState
+                                    .PERMANENTLY_DELETED) {
+                            return deleteExternalPartitionWithResolvedMapping(
+                                id, partitionIndex, logName, successor,
+                                OptionalLong.of(streamId), true,
+                                remainingContextRetries - 1);
+                        }
+                        return cleanupRejectedOpenAllocation(
+                            id, partitionIndex, logName, streamId, successor,
+                            remainingContextRetries - 1);
+                    });
+            });
+    }
+
+    private CompletableFuture<AllocationCleanup> claimUnpublishedExternalAllocation(
+            StreamIdentifier id, int partitionIndex, long streamId,
+            IndexedStreamConfigStore.ExternalDeletionContext context,
+            PartitionMetadataRetry retryState) {
+        String path = catalogPaths.partitionMetadataPath(id, partitionIndex);
+        String mappingKey = catalogPaths.compactedReaderName(id, partitionIndex);
+        Supplier<CompletableFuture<Void>> ownershipVerifier =
+            () -> streamConfigStore.verifyExternalDeletionContext(id, context);
+        return ownershipVerifier.get()
+            .thenCompose(ignored -> oxiaClient.get(path))
+            .thenCompose(existing -> {
+                if (existing == null) {
+                    Set<RetiredStreamMapping> retiredStreamMappings =
+                        retiredStreamMappingsWith(Set.of(), mappingKey, streamId);
+                    Set<String> retiredMappingKeys =
+                        retiredMappingKeysWith(Set.of(), mappingKey);
+                    LogMetadata desired = externalDeletionMetadata(
+                        -1L, context, Set.of(streamId), Set.of(streamId),
+                        retiredStreamMappings, retiredMappingKeys);
+                    return persistPartitionMetadata(
+                        id, partitionIndex, desired,
+                        Set.of(PutOption.IfRecordDoesNotExist), ownershipVerifier,
+                        ignored -> AllocationCleanup.DELETE_LOG_AND_MAPPING,
+                        () -> claimUnpublishedExternalAllocation(
+                            id, partitionIndex, streamId, context, retryState),
+                        retryState);
+                }
+                final LogMetadata current;
+                try {
+                    current = LOG_METADATA_SERDE.deserialize(path, existing.value());
+                } catch (Exception e) {
+                    return CompletableFuture.failedFuture(e);
+                }
+                if (current.streamId() == streamId && !current.deleted()) {
+                    return CompletableFuture.completedFuture(
+                        AllocationCleanup.PRESERVE);
+                }
+                if (!metadataCanBeFencedByDeletion(current, context.config())) {
+                    return CompletableFuture.completedFuture(
+                        AllocationCleanup.PRESERVE);
+                }
+                Set<Long> retiredStreamIds = retiredStreamIdsWith(
+                    current.retiredStreamIds(), current.streamId(), streamId);
+                Set<Long> purgeableRetiredStreamIds =
+                    current.purgeableRetiredStreamIds();
+                if (context.config().purgeRequested()) {
+                    purgeableRetiredStreamIds = purgeAllRetiredStreamIds(
+                        purgeableRetiredStreamIds, retiredStreamIds);
+                } else if (!current.retiredStreamIds().contains(streamId)
+                        && (current.streamId() < 0 || current.streamId() != streamId)) {
+                    purgeableRetiredStreamIds = retiredStreamIdsWith(
+                        purgeableRetiredStreamIds, streamId);
+                }
+                Set<RetiredStreamMapping> retiredStreamMappings =
+                    retiredStreamMappingsWith(
+                        current.retiredStreamMappings(), mappingKey, streamId);
+                Set<String> retiredMappingKeys = retiredMappingKeysWith(
+                    current.retiredMappingKeys(), mappingKey);
+                LogMetadata desired = externalDeletionMetadata(
+                    current.streamId(), context, retiredStreamIds,
+                    purgeableRetiredStreamIds, retiredStreamMappings,
+                    retiredMappingKeys);
+                AllocationCleanup disposition = purgeableRetiredStreamIds.contains(streamId)
+                    ? AllocationCleanup.DELETE_LOG_AND_MAPPING
+                    : AllocationCleanup.DELETE_MAPPING_ONLY;
+                if (samePersistedRegistration(current, desired)) {
+                    return ownershipVerifier.get().thenApply(ignored -> disposition);
+                }
+                return persistPartitionMetadata(
+                    id, partitionIndex, desired,
+                    Set.of(PutOption.IfVersionIdEquals(existing.version().versionId())),
+                    ownershipVerifier,
+                    ignored -> disposition,
+                    () -> claimUnpublishedExternalAllocation(
+                        id, partitionIndex, streamId, context, retryState),
+                    retryState);
+            });
+    }
+
+    private CompletableFuture<LogMetadata> sweepRetiredAllocations(
+            StreamIdentifier id, int partitionIndex,
+            Supplier<CompletableFuture<Void>> ownershipVerifier,
+            Set<Long> protectedStreamIds) {
+        return sweepRetiredAllocations(
+            id, partitionIndex, ownershipVerifier, protectedStreamIds,
+            MAX_PARTITION_METADATA_WRITE_RETRIES);
+    }
+
+    private CompletableFuture<LogMetadata> sweepRetiredAllocations(
+            StreamIdentifier id, int partitionIndex,
+            Supplier<CompletableFuture<Void>> ownershipVerifier,
+            Set<Long> protectedStreamIds, int remainingAttempts) {
+        return readPersistedLogMetadata(id, partitionIndex, ownershipVerifier)
+            .thenCompose(before -> discoverRetiredMappings(
+                id, partitionIndex, before.metadata(), ownershipVerifier,
+                protectedStreamIds))
+            .thenCompose(ignored -> readPersistedLogMetadata(
+                id, partitionIndex, ownershipVerifier))
+            .thenCompose(discovered -> cleanupRetiredAllocations(
+                    discovered.metadata(), ownershipVerifier, protectedStreamIds)
+                .thenCompose(ignored -> readPersistedLogMetadata(
+                    id, partitionIndex, ownershipVerifier))
+                .thenCompose(after -> hasUnprotectedRetiredMapping(
+                        after.metadata(), protectedStreamIds)
+                    .thenCompose(hasMapping -> {
+                        boolean metadataChanged =
+                            after.versionId() != discovered.versionId();
+                        if (!metadataChanged && !hasMapping) {
+                            return CompletableFuture.completedFuture(after.metadata());
+                        }
+                        if (remainingAttempts == 0) {
+                            return CompletableFuture.failedFuture(
+                                new IllegalStateException(
+                                    "Retired allocation cleanup did not reach a fixed point for "
+                                        + id.fullName() + "-partition-" + partitionIndex));
+                        }
+                        return sweepRetiredAllocations(
+                            id, partitionIndex, ownershipVerifier, protectedStreamIds,
+                            remainingAttempts - 1);
+                    })));
+    }
+
+    private CompletableFuture<PersistedLogMetadata> readPersistedLogMetadata(
+            StreamIdentifier id, int partitionIndex,
+            Supplier<CompletableFuture<Void>> ownershipVerifier) {
+        String path = catalogPaths.partitionMetadataPath(id, partitionIndex);
+        return ownershipVerifier.get()
+            .thenCompose(ignored -> oxiaClient.get(path))
+            .thenCompose(result -> {
+                if (result == null) {
+                    return CompletableFuture.failedFuture(new NoSuchStreamException(id));
+                }
+                final LogMetadata metadata;
+                try {
+                    metadata = LOG_METADATA_SERDE.deserialize(path, result.value());
+                } catch (Exception e) {
+                    return CompletableFuture.failedFuture(e);
+                }
+                return ownershipVerifier.get().thenApply(ignored ->
+                    new PersistedLogMetadata(metadata, result.version().versionId()));
+            });
+    }
+
+    private CompletableFuture<Void> discoverRetiredMappings(
+            StreamIdentifier id, int partitionIndex, LogMetadata metadata,
+            Supplier<CompletableFuture<Void>> ownershipVerifier,
+            Set<Long> protectedStreamIds) {
+        CompletableFuture<Void> discovery = CompletableFuture.completedFuture(null);
+        for (String mappingKey : metadata.retiredMappingKeys()) {
+            discovery = discovery
+                .thenCompose(ignored -> ownershipVerifier.get())
+                .thenCompose(ignored -> lookupStreamIdMapping(mappingKey))
+                .thenCompose(mappedStreamId -> mappedStreamId.isEmpty()
+                    ? CompletableFuture.completedFuture(null)
+                    : claimDiscoveredRetiredMapping(
+                        id, partitionIndex, mappingKey, mappedStreamId.getAsLong(),
+                        ownershipVerifier, protectedStreamIds,
+                        new PartitionMetadataRetry()));
+        }
+        return discovery;
+    }
+
+    private CompletableFuture<Void> claimDiscoveredRetiredMapping(
+            StreamIdentifier id, int partitionIndex, String mappingKey, long streamId,
+            Supplier<CompletableFuture<Void>> ownershipVerifier,
+            Set<Long> protectedStreamIds, PartitionMetadataRetry retryState) {
+        String path = catalogPaths.partitionMetadataPath(id, partitionIndex);
+        return ownershipVerifier.get()
+            .thenCompose(ignored -> oxiaClient.get(path))
+            .thenCompose(result -> {
+                if (result == null) {
+                    return CompletableFuture.failedFuture(new NoSuchStreamException(id));
+                }
+                final LogMetadata current;
+                try {
+                    current = LOG_METADATA_SERDE.deserialize(path, result.value());
+                } catch (Exception e) {
+                    return CompletableFuture.failedFuture(e);
+                }
+                if (isProtectedStreamId(current, streamId, protectedStreamIds)) {
+                    return ownershipVerifier.get();
+                }
+                Set<Long> retiredStreamIds = retiredStreamIdsWith(
+                    current.retiredStreamIds(), streamId);
+                Set<Long> purgeableRetiredStreamIds =
+                    current.purgeableRetiredStreamIds();
+                if (!current.retiredStreamIds().contains(streamId)
+                        && (current.streamId() < 0 || current.streamId() != streamId)) {
+                    purgeableRetiredStreamIds = retiredStreamIdsWith(
+                        purgeableRetiredStreamIds, streamId);
+                }
+                Set<RetiredStreamMapping> retiredStreamMappings =
+                    retiredStreamMappingsWith(
+                        current.retiredStreamMappings(), mappingKey, streamId);
+                Set<String> retiredMappingKeys = retiredMappingKeysWith(
+                    current.retiredMappingKeys(), mappingKey);
+                LogMetadata desired = withRetiredCleanup(
+                    current, retiredStreamIds, purgeableRetiredStreamIds,
+                    retiredStreamMappings, retiredMappingKeys);
+                if (samePersistedRegistration(current, desired)) {
+                    return ownershipVerifier.get();
+                }
+                return persistPartitionMetadata(
+                    id, partitionIndex, desired,
+                    Set.of(PutOption.IfVersionIdEquals(result.version().versionId())),
+                    ownershipVerifier, ignored -> null,
+                    () -> claimDiscoveredRetiredMapping(
+                        id, partitionIndex, mappingKey, streamId, ownershipVerifier,
+                        protectedStreamIds, retryState), retryState);
+            });
+    }
+
+    private CompletableFuture<Void> cleanupRetiredAllocations(
+            LogMetadata metadata, Supplier<CompletableFuture<Void>> ownershipVerifier,
+            Set<Long> protectedStreamIds) {
+        CompletableFuture<Void> cleanup = CompletableFuture.completedFuture(null);
+        for (long streamId : metadata.purgeableRetiredStreamIds()) {
+            if (isProtectedStreamId(metadata, streamId, protectedStreamIds)) {
+                continue;
+            }
+            cleanup = cleanup
+                .thenCompose(ignored -> ownershipVerifier.get())
+                .thenCompose(ignored -> logStorage.deleteLog(LogId.of(streamId)));
+        }
+        for (RetiredStreamMapping mapping : metadata.retiredStreamMappings()) {
+            if (isProtectedStreamId(metadata, mapping.streamId(), protectedStreamIds)) {
+                continue;
+            }
+            cleanup = cleanup
+                .thenCompose(ignored -> ownershipVerifier.get())
+                .thenCompose(ignored -> streamIdMappingDeleter.apply(
+                    mapping.mappingKey(), mapping.streamId()));
+        }
+        return cleanup.thenCompose(ignored -> ownershipVerifier.get());
+    }
+
+    private CompletableFuture<Boolean> hasUnprotectedRetiredMapping(
+            LogMetadata metadata, Set<Long> protectedStreamIds) {
+        CompletableFuture<Boolean> result = CompletableFuture.completedFuture(false);
+        for (String mappingKey : metadata.retiredMappingKeys()) {
+            result = result.thenCompose(found -> found
+                ? CompletableFuture.completedFuture(true)
+                : lookupStreamIdMapping(mappingKey).thenApply(mapped ->
+                    mapped.isPresent() && !isProtectedStreamId(
+                        metadata, mapped.getAsLong(), protectedStreamIds)));
+        }
+        return result;
+    }
+
+    private CompletableFuture<OptionalLong> lookupStreamIdMapping(String mappingKey) {
+        return streamIdLookup.apply(mappingKey).handle((streamId, failure) -> {
+            if (failure == null) {
+                return OptionalLong.of(streamId);
+            }
+            Throwable cause = rootCause(failure);
+            if (cause instanceof NoSuchKeyException) {
+                return OptionalLong.empty();
+            }
+            throw new CompletionException(cause);
+        });
+    }
+
+    private static boolean isProtectedStreamId(
+            LogMetadata metadata, long streamId, Set<Long> protectedStreamIds) {
+        return (!metadata.deleted() && metadata.streamId() == streamId)
+            || (protectedStreamIds.contains(streamId)
+                && !metadata.retiredStreamIds().contains(streamId));
+    }
+
+    private static boolean hasRetiredCleanup(LogMetadata metadata) {
+        return !metadata.purgeableRetiredStreamIds().isEmpty()
+            || !metadata.retiredStreamMappings().isEmpty()
+            || !metadata.retiredMappingKeys().isEmpty();
+    }
+
+    private record LifecycleContextRead(
+            @Nullable IndexedStreamConfigStore.LifecycleContext context,
+            @Nullable Throwable failure) {
+    }
+
+    private record PersistedLogMetadata(LogMetadata metadata, long versionId) {
     }
 
     private record ExternalWriteAttempt(
             @Nullable PartitionMetadataWrite write, @Nullable Throwable failure) {
     }
 
+    private record NativeAllocationAttempt(
+            @Nullable Long streamId, @Nullable Throwable failure) {
+    }
+
     private record ExternalOpenAttempt(
-            @Nullable Long streamId, @Nullable PartitionMetadataWrite write,
+            @Nullable StreamIdAllocation allocation, @Nullable PartitionMetadataWrite write,
             @Nullable Throwable failure) {
+    }
+
+    private record PreparedNativePartition(Set<Long> retiredStreamIds) {
+    }
+
+    private record PreparedExternalPartition(Set<Long> retiredStreamIds) {
+    }
+
+    private record AllocationCleanup(boolean deleteLog, boolean deleteMapping) {
+
+        private static final AllocationCleanup PRESERVE =
+            new AllocationCleanup(false, false);
+        private static final AllocationCleanup DELETE_MAPPING_ONLY =
+            new AllocationCleanup(false, true);
+        private static final AllocationCleanup DELETE_LOG_AND_MAPPING =
+            new AllocationCleanup(true, true);
+    }
+
+    private record AllocationCleanupProtection(
+            boolean preserveMissingMetadata,
+            Optional<IndexedStreamConfigStore.StreamConfigData> activeConfig) {
+
+        private AllocationCleanupProtection {
+            Objects.requireNonNull(activeConfig, "activeConfig");
+        }
+
+        private static AllocationCleanupProtection none() {
+            return new AllocationCleanupProtection(false, Optional.empty());
+        }
+
+        private static AllocationCleanupProtection missingMetadata() {
+            return new AllocationCleanupProtection(true, Optional.empty());
+        }
+
+        private static AllocationCleanupProtection active(
+                IndexedStreamConfigStore.StreamConfigData config) {
+            if (config.provisioningState()
+                    != IndexedStreamConfigStore.ProvisioningState.ACTIVE) {
+                throw new IllegalArgumentException("Cleanup protection requires ACTIVE config");
+            }
+            return new AllocationCleanupProtection(true, Optional.of(config));
+        }
+
+        private boolean protects(LogMetadata metadata) {
+            if (activeConfig.isEmpty()) {
+                return false;
+            }
+            IndexedStreamConfigStore.StreamConfigData config = activeConfig.orElseThrow();
+            return metadata.deleted() || !metadataRegistrationMatches(
+                metadata, config.incarnationId(), config.ownerToken(), config.ownerGeneration());
+        }
+    }
+
+    private static final class RetiredStreamIdAllocationException
+            extends AlreadyExistsException {
+
+        private final StreamIdAllocation allocation;
+
+        private RetiredStreamIdAllocationException(
+                StreamIdAllocation allocation, String message) {
+            super(message);
+            this.allocation = allocation;
+        }
+
+        private StreamIdAllocation allocation() {
+            return allocation;
+        }
+
     }
 
     private static final class ExternalFinalizationUnknownException extends RuntimeException {
@@ -745,9 +1685,10 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
         if (partitionIndex < 0) {
             throw new IllegalArgumentException("partitionIndex must be non-negative");
         }
-        if (streamIdLookup == null || streamIdMappingDeleter == null) {
-            return CompletableFuture.failedFuture(new UnsupportedOperationException(
-                "External partition deletion requires keyed stream-ID lifecycle support"));
+        UnsupportedOperationException capabilityFailure = keyedLifecycleCapabilityFailure(
+            "External partition deletion");
+        if (capabilityFailure != null) {
+            return CompletableFuture.failedFuture(capabilityFailure);
         }
 
         String logName = catalogPaths.compactedReaderName(id, partitionIndex);
@@ -761,28 +1702,21 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
             StreamIdentifier id, int partitionIndex, String logName,
             IndexedStreamConfigStore.ExternalDeletionContext context,
             int remainingContextRetries) {
-        return externalMappingForDelete(logName)
-            .thenCompose(mappedStreamId -> tombstoneExternalPartition(
-                id, partitionIndex, context, mappedStreamId))
-            .thenCompose(tombstone -> {
-                CompletableFuture<Void> cleanup = tombstone.streamId() >= 0
-                    ? logStorage.deleteLog(LogId.of(tombstone.streamId()))
-                    : CompletableFuture.completedFuture(null);
-                if (tombstone.mappingStreamId() >= 0
-                        && tombstone.mappingStreamId() != tombstone.streamId()) {
-                    cleanup = cleanup.thenCompose(ignored ->
-                        logStorage.deleteLog(LogId.of(tombstone.mappingStreamId())));
-                }
-                return cleanup
-                    .thenCompose(ignored ->
-                        streamConfigStore.verifyExternalDeletionContext(id, context))
-                    .thenCompose(ignored -> tombstone.mappingStreamId() >= 0
-                        ? streamIdMappingDeleter.apply(
-                            logName, tombstone.mappingStreamId())
-                        : CompletableFuture.completedFuture(null))
-                    .thenCompose(ignored ->
-                        streamConfigStore.verifyExternalDeletionContext(id, context));
-            })
+        return deleteExternalPartitionWithResolvedMapping(
+            id, partitionIndex, logName, context, OptionalLong.empty(), false,
+            remainingContextRetries);
+    }
+
+    private CompletableFuture<Void> deleteExternalPartitionWithResolvedMapping(
+            StreamIdentifier id, int partitionIndex, String logName,
+            IndexedStreamConfigStore.ExternalDeletionContext context,
+            OptionalLong mappedStreamId, boolean mappingPinned,
+            int remainingContextRetries) {
+        return tombstoneExternalPartition(id, partitionIndex, context, mappedStreamId)
+            .thenCompose(tombstone -> sweepRetiredAllocations(
+                id, partitionIndex,
+                () -> streamConfigStore.verifyExternalDeletionContext(id, context),
+                Set.of()).thenApply(ignored -> null))
             .handle((ignored, failure) -> unwrapNullable(failure))
             .thenCompose(failure -> {
                 if (failure == null) {
@@ -795,25 +1729,19 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
                     return CompletableFuture.failedFuture(cause);
                 }
                 return streamConfigStore.readExternalDeletionContext(id)
-                    .thenCompose(successor -> context.canRetryWith(successor)
-                        ? deleteExternalPartitionWithContext(
+                    .thenCompose(successor -> {
+                        if (!context.canRetryWith(successor)) {
+                            return CompletableFuture.failedFuture(cause);
+                        }
+                        if (mappingPinned) {
+                            return deleteExternalPartitionWithResolvedMapping(
+                                id, partitionIndex, logName, successor,
+                                mappedStreamId, true, remainingContextRetries - 1);
+                        }
+                        return deleteExternalPartitionWithContext(
                             id, partitionIndex, logName, successor,
-                            remainingContextRetries - 1)
-                        : CompletableFuture.failedFuture(cause));
-            });
-    }
-
-    private CompletableFuture<OptionalLong> externalMappingForDelete(String logName) {
-        return streamIdLookup.apply(logName)
-            .handle((streamId, failure) -> {
-                if (failure == null) {
-                    return OptionalLong.of(streamId);
-                }
-                Throwable cause = rootCause(failure);
-                if (cause instanceof NoSuchKeyException) {
-                    return OptionalLong.empty();
-                }
-                throw new CompletionException(cause);
+                            remainingContextRetries - 1);
+                    });
             });
     }
 
@@ -821,23 +1749,45 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
             StreamIdentifier id, int partitionIndex,
             IndexedStreamConfigStore.ExternalDeletionContext context,
             OptionalLong mappedStreamId) {
+        return tombstoneExternalPartition(
+            id, partitionIndex, context, mappedStreamId,
+            new PartitionMetadataRetry());
+    }
+
+    private CompletableFuture<PartitionTombstone> tombstoneExternalPartition(
+            StreamIdentifier id, int partitionIndex,
+            IndexedStreamConfigStore.ExternalDeletionContext context,
+            OptionalLong mappedStreamId,
+            PartitionMetadataRetry retryState) {
         IndexedStreamConfigStore.StreamConfigData config = context.config();
         String path = catalogPaths.partitionMetadataPath(id, partitionIndex);
+        String mappingKey = catalogPaths.compactedReaderName(id, partitionIndex);
         return streamConfigStore.verifyExternalDeletionContext(id, context)
             .thenCompose(ignored -> oxiaClient.get(path))
             .thenCompose(existing -> {
                 if (existing == null) {
                     long streamId = mappedStreamId.orElse(-1L);
-                    LogMetadata tombstone = externalDeletionMetadata(streamId, context);
+                    Set<Long> retiredStreamIds = retiredStreamIdsWith(Set.of(), streamId);
+                    Set<Long> purgeableRetiredStreamIds = retiredStreamIdsWith(
+                        Set.of(), streamId);
+                    Set<RetiredStreamMapping> retiredStreamMappings =
+                        retiredStreamMappingsWith(Set.of(), mappingKey, streamId);
+                    Set<String> retiredMappingKeys =
+                        retiredMappingKeysWith(Set.of(), mappingKey);
+                    LogMetadata tombstone = externalDeletionMetadata(
+                        streamId, context, retiredStreamIds, purgeableRetiredStreamIds,
+                        retiredStreamMappings, retiredMappingKeys);
                     return persistPartitionMetadata(
                         id, partitionIndex, tombstone,
                         Set.of(PutOption.IfRecordDoesNotExist),
                         () -> streamConfigStore.verifyExternalDeletionContext(id, context),
+                        write -> new PartitionTombstone(
+                            streamId, retiredStreamIds,
+                            purgeableRetiredStreamIds, retiredStreamMappings,
+                            retiredMappingKeys, write),
                         () -> tombstoneExternalPartition(
-                            id, partitionIndex, context, mappedStreamId)
-                            .thenApply(PartitionTombstone::write))
-                        .thenApply(write -> new PartitionTombstone(
-                            streamId, mappedStreamId.orElse(streamId), write));
+                            id, partitionIndex, context, mappedStreamId, retryState),
+                        retryState);
                 }
                 final LogMetadata current;
                 try {
@@ -856,11 +1806,26 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
                 }
                 long streamId = current.streamId() >= 0
                     ? current.streamId() : mappedStreamId.orElse(-1L);
-                LogMetadata tombstone = externalDeletionMetadata(streamId, context);
+                Set<Long> retiredStreamIds = retiredStreamIdsWith(
+                    current.retiredStreamIds(), streamId,
+                    mappedStreamId.orElse(-1L));
+                Set<Long> purgeableRetiredStreamIds = purgeAllRetiredStreamIds(
+                    current.purgeableRetiredStreamIds(), retiredStreamIds);
+                Set<RetiredStreamMapping> retiredStreamMappings =
+                    retiredStreamMappingsWith(
+                        current.retiredStreamMappings(), mappingKey, streamId,
+                        mappedStreamId.orElse(-1L));
+                Set<String> retiredMappingKeys = retiredMappingKeysWith(
+                    current.retiredMappingKeys(), mappingKey);
+                LogMetadata tombstone = externalDeletionMetadata(
+                    streamId, context, retiredStreamIds, purgeableRetiredStreamIds,
+                    retiredStreamMappings, retiredMappingKeys);
                 if (samePersistedRegistration(current, tombstone)) {
                     return streamConfigStore.verifyExternalDeletionContext(id, context)
                         .thenApply(ignored -> new PartitionTombstone(
-                            streamId, mappedStreamId.orElse(streamId),
+                            streamId, retiredStreamIds,
+                            purgeableRetiredStreamIds, retiredStreamMappings,
+                            retiredMappingKeys,
                             new PartitionMetadataWrite(OptionalLong.of(
                                 existing.version().versionId()))));
                 }
@@ -871,22 +1836,37 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
                     id, partitionIndex, tombstone,
                     Set.of(PutOption.IfVersionIdEquals(existing.version().versionId())),
                     () -> streamConfigStore.verifyExternalDeletionContext(id, context),
+                    write -> new PartitionTombstone(
+                        streamId, retiredStreamIds,
+                        purgeableRetiredStreamIds, retiredStreamMappings,
+                        retiredMappingKeys, write),
                     () -> tombstoneExternalPartition(
-                        id, partitionIndex, context, mappedStreamId)
-                        .thenApply(PartitionTombstone::write))
-                    .thenApply(write -> new PartitionTombstone(
-                        streamId, mappedStreamId.orElse(streamId), write));
+                        id, partitionIndex, context, mappedStreamId, retryState),
+                    retryState);
             });
     }
 
     private static LogMetadata externalDeletionMetadata(
-            long streamId, IndexedStreamConfigStore.ExternalDeletionContext context) {
+            long streamId, IndexedStreamConfigStore.ExternalDeletionContext context,
+            Set<Long> retiredStreamIds, Set<Long> purgeableRetiredStreamIds) {
+        return externalDeletionMetadata(
+            streamId, context, retiredStreamIds, purgeableRetiredStreamIds,
+            Set.of(), Set.of());
+    }
+
+    private static LogMetadata externalDeletionMetadata(
+            long streamId, IndexedStreamConfigStore.ExternalDeletionContext context,
+            Set<Long> retiredStreamIds, Set<Long> purgeableRetiredStreamIds,
+            Set<RetiredStreamMapping> retiredStreamMappings,
+            Set<String> retiredMappingKeys) {
         IndexedStreamConfigStore.StreamConfigData config = context.config();
         return new LogMetadata(
             streamId, Map.of(), OptionalLong.empty(),
             config.incarnationId().orElse(null),
             config.ownerToken().orElse(null),
-            config.ownerGeneration() >= 0 ? config.ownerGeneration() : null, true);
+            config.ownerGeneration() >= 0 ? config.ownerGeneration() : null, true,
+            retiredStreamIdsWith(retiredStreamIds, streamId),
+            purgeableRetiredStreamIds, retiredStreamMappings, retiredMappingKeys);
     }
 
     private static Throwable rootCause(Throwable failure) {
@@ -896,6 +1876,40 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
             current = current.getCause();
         }
         return current;
+    }
+
+    private CompletableFuture<LifecycleContextRead> readLifecycleContextForCleanup(
+            StreamIdentifier id, Throwable originalFailure) {
+        return streamConfigStore.readLifecycleContext(id)
+            .handle((context, failure) -> new LifecycleContextRead(
+                context, unwrapNullable(failure)))
+            .thenCompose(first -> {
+                if (first.failure() == null) {
+                    return CompletableFuture.completedFuture(first);
+                }
+                addSuppressed(originalFailure, first.failure());
+                return streamConfigStore.readLifecycleContext(id)
+                    .handle((context, retryFailure) -> {
+                        if (retryFailure != null) {
+                            addSuppressed(originalFailure, retryFailure);
+                            return new LifecycleContextRead(null, retryFailure);
+                        }
+                        return new LifecycleContextRead(context, null);
+                    });
+            });
+    }
+
+    private static void addSuppressed(Throwable target, Throwable failure) {
+        Throwable cause = rootCause(failure);
+        if (cause == target) {
+            return;
+        }
+        for (Throwable suppressed : target.getSuppressed()) {
+            if (suppressed == cause) {
+                return;
+            }
+        }
+        target.addSuppressed(cause);
     }
 
     private CompletableFuture<PartitionMetadataWrite> writePartitionMetadataForNativeClaim(
@@ -926,6 +1940,19 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
             long ownerGeneration, long metadataSourceGeneration,
             IndexedStreamConfigStore.CreationKind creationKind,
             Supplier<CompletableFuture<Void>> ownershipVerifier) {
+        return writePartitionMetadataForRegistration(
+            id, partitionIndex, streamId, incarnationId, ownerToken,
+            ownerGeneration, metadataSourceGeneration, creationKind,
+            ownershipVerifier, new PartitionMetadataRetry());
+    }
+
+    private CompletableFuture<PartitionMetadataWrite> writePartitionMetadataForRegistration(
+            StreamIdentifier id, int partitionIndex, long streamId,
+            Optional<String> incarnationId, Optional<String> ownerToken,
+            long ownerGeneration, long metadataSourceGeneration,
+            IndexedStreamConfigStore.CreationKind creationKind,
+            Supplier<CompletableFuture<Void>> ownershipVerifier,
+            PartitionMetadataRetry retryState) {
         if (incarnationId.isPresent() != ownerToken.isPresent()) {
             return CompletableFuture.failedFuture(new IllegalStateException(
                 "Registration identity must contain both incarnation and owner"));
@@ -948,7 +1975,7 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
                             id, partitionIndex, streamId, incarnationId, ownerToken,
                             ownerGeneration, metadataSourceGeneration,
                             creationKind,
-                            ownershipVerifier));
+                            ownershipVerifier, retryState), retryState);
                 }
                 final LogMetadata current;
                 try {
@@ -960,6 +1987,17 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
                     return partitionMetadataConflict(
                         id, partitionIndex, streamId, current.streamId(),
                         "has a partial registration identity");
+                }
+                Set<Long> currentRetiredStreamIds = current.deleted()
+                    ? retiredStreamIdsWith(
+                        current.retiredStreamIds(), current.streamId())
+                    : current.retiredStreamIds();
+                Set<Long> currentPurgeableRetiredStreamIds =
+                    current.purgeableRetiredStreamIds();
+                if (currentRetiredStreamIds.contains(streamId)) {
+                    return partitionMetadataConflict(
+                        id, partitionIndex, streamId, current.streamId(),
+                        "cannot reuse retired physical stream ID " + streamId);
                 }
                 boolean desiredLegacy = incarnationId.isEmpty();
                 boolean currentLegacy = current.registrationIncarnationId() == null;
@@ -999,15 +2037,24 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
                             id, partitionIndex, streamId, current.streamId(),
                             "is fenced by a newer deleted stream lifecycle");
                     }
+                    if (creationKind == IndexedStreamConfigStore.CreationKind.EXTERNAL
+                            && current.streamId() >= 0
+                            && current.streamId() == streamId) {
+                        return partitionMetadataConflict(
+                            id, partitionIndex, streamId, current.streamId(),
+                            "deleted external partition must use a fresh physical stream ID");
+                    }
                     return replacePartitionMetadata(
                         id, partitionIndex,
                         registrationMetadata(
-                            streamId, incarnationId, ownerToken, ownerGeneration),
+                            streamId, incarnationId, ownerToken, ownerGeneration,
+                            currentRetiredStreamIds, currentPurgeableRetiredStreamIds,
+                            current.retiredStreamMappings(), current.retiredMappingKeys()),
                         existing.version().versionId(), ownershipVerifier,
                         () -> writePartitionMetadataForRegistration(
                             id, partitionIndex, streamId, incarnationId, ownerToken,
                             ownerGeneration, metadataSourceGeneration, creationKind,
-                            ownershipVerifier));
+                            ownershipVerifier, retryState), retryState);
                 }
                 long currentGeneration = current.registrationOwnerGeneration() == null
                     ? IndexedStreamConfigStore.LEGACY_METADATA_GENERATION
@@ -1050,41 +2097,129 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
                     ? new LogMetadata(
                         streamId, current.properties(), current.terminatedOffset(),
                         incarnationId.orElseThrow(), ownerToken.orElseThrow(),
-                        ownerGeneration, false)
+                        ownerGeneration, false, currentRetiredStreamIds,
+                        currentPurgeableRetiredStreamIds,
+                        current.retiredStreamMappings(), current.retiredMappingKeys())
                     : registrationMetadata(
-                        streamId, incarnationId, ownerToken, ownerGeneration);
+                        streamId, incarnationId, ownerToken, ownerGeneration,
+                        currentRetiredStreamIds, currentPurgeableRetiredStreamIds,
+                        current.retiredStreamMappings(), current.retiredMappingKeys());
                 return replacePartitionMetadata(
                     id, partitionIndex, replacement,
                     existing.version().versionId(), ownershipVerifier,
                     () -> writePartitionMetadataForRegistration(
                         id, partitionIndex, streamId, incarnationId, ownerToken,
                         ownerGeneration, metadataSourceGeneration, creationKind,
-                        ownershipVerifier));
+                        ownershipVerifier, retryState), retryState);
             });
     }
 
     private static LogMetadata registrationMetadata(
             long streamId, Optional<String> incarnationId, Optional<String> ownerToken,
             long ownerGeneration) {
+        return registrationMetadata(
+            streamId, incarnationId, ownerToken, ownerGeneration, Set.of(), Set.of(),
+            Set.of(), Set.of());
+    }
+
+    private static LogMetadata registrationMetadata(
+            long streamId, Optional<String> incarnationId, Optional<String> ownerToken,
+            long ownerGeneration, Set<Long> retiredStreamIds,
+            Set<Long> purgeableRetiredStreamIds) {
+        return registrationMetadata(
+            streamId, incarnationId, ownerToken, ownerGeneration, retiredStreamIds,
+            purgeableRetiredStreamIds, Set.of(), Set.of());
+    }
+
+    private static LogMetadata registrationMetadata(
+            long streamId, Optional<String> incarnationId, Optional<String> ownerToken,
+            long ownerGeneration, Set<Long> retiredStreamIds,
+            Set<Long> purgeableRetiredStreamIds,
+            Set<RetiredStreamMapping> retiredStreamMappings,
+            Set<String> retiredMappingKeys) {
         return new LogMetadata(
             streamId, Map.of(), OptionalLong.empty(),
             incarnationId.orElse(null), ownerToken.orElse(null),
-            ownerGeneration >= 0 ? ownerGeneration : null, false);
+            ownerGeneration >= 0 ? ownerGeneration : null, false, retiredStreamIds,
+            purgeableRetiredStreamIds, retiredStreamMappings, retiredMappingKeys);
+    }
+
+    private static Set<Long> retiredStreamIdsWith(
+            Set<Long> current, long... additionalStreamIds) {
+        TreeSet<Long> retiredStreamIds = new TreeSet<>(current);
+        for (long streamId : additionalStreamIds) {
+            if (streamId >= 0) {
+                retiredStreamIds.add(streamId);
+            }
+        }
+        return retiredStreamIds;
+    }
+
+    private static Set<Long> purgeAllRetiredStreamIds(
+            Set<Long> currentPurgeable, Set<Long> retiredStreamIds) {
+        TreeSet<Long> purgeableStreamIds = new TreeSet<>(currentPurgeable);
+        purgeableStreamIds.addAll(retiredStreamIds);
+        return purgeableStreamIds;
+    }
+
+    private static Set<RetiredStreamMapping> retiredStreamMappingsWith(
+            Set<RetiredStreamMapping> current, String mappingKey,
+            long... additionalStreamIds) {
+        TreeSet<RetiredStreamMapping> retiredStreamMappings = new TreeSet<>(current);
+        for (long streamId : additionalStreamIds) {
+            if (streamId >= 0) {
+                retiredStreamMappings.add(new RetiredStreamMapping(streamId, mappingKey));
+            }
+        }
+        return retiredStreamMappings;
+    }
+
+    private static Set<String> retiredMappingKeysWith(
+            Set<String> current, String mappingKey) {
+        TreeSet<String> retiredMappingKeys = new TreeSet<>(current);
+        retiredMappingKeys.add(mappingKey);
+        return retiredMappingKeys;
+    }
+
+    private static LogMetadata withRetiredCleanup(
+            LogMetadata current, Set<Long> retiredStreamIds,
+            Set<Long> purgeableRetiredStreamIds,
+            Set<RetiredStreamMapping> retiredStreamMappings,
+            Set<String> retiredMappingKeys) {
+        return new LogMetadata(
+            current.streamId(), current.properties(), current.terminatedOffset(),
+            current.registrationIncarnationId(), current.registrationOwnerToken(),
+            current.registrationOwnerGeneration(), current.deleted(), retiredStreamIds,
+            purgeableRetiredStreamIds, retiredStreamMappings, retiredMappingKeys);
     }
 
     private CompletableFuture<PartitionMetadataWrite> replacePartitionMetadata(
             StreamIdentifier id, int partitionIndex, LogMetadata desired,
             long expectedVersion, Supplier<CompletableFuture<Void>> ownershipVerifier,
-            Supplier<CompletableFuture<PartitionMetadataWrite>> retry) {
+            Supplier<CompletableFuture<PartitionMetadataWrite>> retry,
+            PartitionMetadataRetry retryState) {
         return persistPartitionMetadata(
             id, partitionIndex, desired,
-            Set.of(PutOption.IfVersionIdEquals(expectedVersion)), ownershipVerifier, retry);
+            Set.of(PutOption.IfVersionIdEquals(expectedVersion)), ownershipVerifier,
+            retry, retryState);
     }
 
     private CompletableFuture<PartitionMetadataWrite> persistPartitionMetadata(
             StreamIdentifier id, int partitionIndex, LogMetadata desired,
             Set<PutOption> options, Supplier<CompletableFuture<Void>> ownershipVerifier,
-            Supplier<CompletableFuture<PartitionMetadataWrite>> retry) {
+            Supplier<CompletableFuture<PartitionMetadataWrite>> retry,
+            PartitionMetadataRetry retryState) {
+        return persistPartitionMetadata(
+            id, partitionIndex, desired, options, ownershipVerifier,
+            Function.identity(), retry, retryState);
+    }
+
+    private <T> CompletableFuture<T> persistPartitionMetadata(
+            StreamIdentifier id, int partitionIndex, LogMetadata desired,
+            Set<PutOption> options, Supplier<CompletableFuture<Void>> ownershipVerifier,
+            Function<PartitionMetadataWrite, T> resultFactory,
+            Supplier<CompletableFuture<T>> retry,
+            PartitionMetadataRetry retryState) {
         String path = catalogPaths.partitionMetadataPath(id, partitionIndex);
         final byte[] bytes;
         try {
@@ -1098,12 +2233,13 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
             .thenCompose(outcome -> {
                 if (outcome.failure() == null) {
                     return ownershipVerifier.get().thenApply(ignored ->
-                        new PartitionMetadataWrite(OptionalLong.of(
-                            outcome.result().version().versionId())));
+                        resultFactory.apply(new PartitionMetadataWrite(OptionalLong.of(
+                            outcome.result().version().versionId()))));
                 }
                 if (outcome.failure() instanceof KeyAlreadyExistsException
                         || outcome.failure() instanceof UnexpectedVersionIdException) {
-                    return retry.get();
+                    return retryPartitionMetadataWrite(
+                        id, partitionIndex, outcome.failure(), retry, retryState);
                 }
                 return oxiaClient.get(path)
                     .handle((current, readFailure) ->
@@ -1127,16 +2263,41 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
                             return CompletableFuture.failedFuture(outcome.failure());
                         }
                         return ownershipVerifier.get().thenApply(ignored ->
-                            new PartitionMetadataWrite(OptionalLong.of(
-                                readback.result().version().versionId())));
+                            resultFactory.apply(new PartitionMetadataWrite(OptionalLong.of(
+                                readback.result().version().versionId()))));
                     });
             });
+    }
+
+    private <T> CompletableFuture<T> retryPartitionMetadataWrite(
+            StreamIdentifier id, int partitionIndex, Throwable failure,
+            Supplier<CompletableFuture<T>> retry,
+            PartitionMetadataRetry retryState) {
+        int retryAttempt = retryState.attempts().getAndIncrement();
+        if (retryAttempt >= MAX_PARTITION_METADATA_WRITE_RETRIES) {
+            log.warn("Exhausted {} partition metadata retries for {}-partition-{}",
+                MAX_PARTITION_METADATA_WRITE_RETRIES, id.fullName(), partitionIndex, failure);
+            return CompletableFuture.failedFuture(failure);
+        }
+        long delayMillis = PARTITION_METADATA_RETRY_DELAY_MILLIS << retryAttempt;
+        log.debug("Retrying partition metadata write for {}-partition-{} after {} ms "
+                + "(retry {}/{}): {}", id.fullName(), partitionIndex, delayMillis,
+            retryAttempt + 1, MAX_PARTITION_METADATA_WRITE_RETRIES, failure.toString());
+        return CompletableFuture.runAsync(
+                () -> { }, CompletableFuture.delayedExecutor(
+                    delayMillis, TimeUnit.MILLISECONDS))
+            .thenCompose(ignored -> retry.get());
     }
 
     private static boolean samePersistedRegistration(
             LogMetadata current, LogMetadata desired) {
         return current.streamId() == desired.streamId()
             && current.deleted() == desired.deleted()
+            && current.retiredStreamIds().equals(desired.retiredStreamIds())
+            && current.purgeableRetiredStreamIds().equals(
+                desired.purgeableRetiredStreamIds())
+            && current.retiredStreamMappings().equals(desired.retiredStreamMappings())
+            && current.retiredMappingKeys().equals(desired.retiredMappingKeys())
             && Objects.equals(current.registrationIncarnationId(),
                 desired.registrationIncarnationId())
             && Objects.equals(current.registrationOwnerToken(),
@@ -1183,6 +2344,13 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
             GetResult result, Throwable failure) {
     }
 
+    private record PartitionMetadataRetry(AtomicInteger attempts) {
+
+        private PartitionMetadataRetry() {
+            this(new AtomicInteger());
+        }
+    }
+
     private static Throwable unwrap(Throwable ex) {
         return ex instanceof CompletionException && ex.getCause() != null ? ex.getCause() : ex;
     }
@@ -1193,12 +2361,13 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
 
     @Override
     public CompletableFuture<Stream> loadStream(StreamIdentifier id) {
-        return streamConfigStore.read(id).thenCompose(config -> {
+        return streamConfigStore.readActive(id).thenCompose(active -> {
+            IndexedStreamConfigStore.StreamConfigData config = active.config();
             Partitioning partitioning = new Partitioning(
                 PartitioningStrategy.INDEXED,
                 Map.of("numPartitions", String.valueOf(config.partitions())));
             return buildStreamImpl(id, new StreamConfig(), partitioning, new SchemaConfig(),
-                config.properties(), LifecycleState.ACTIVE, config.materialization());
+                config.properties(), LifecycleState.ACTIVE, config.materialization(), active);
         });
     }
 
@@ -1207,11 +2376,30 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
                                                        Map<String, String> properties, LifecycleState state,
                                                        Optional<TableMaterializationPolicy> materialization) {
         return getLayoutTolerant(id).thenCompose(layout ->
-            createUnifiedReader(id, layout).thenApply(unifiedReader ->
+            buildStreamImpl(id, config, partitioning, schema, properties, state,
+                materialization, layout));
+    }
+
+    private CompletableFuture<Stream> buildStreamImpl(StreamIdentifier id, StreamConfig config,
+                                                       Partitioning partitioning, SchemaConfig schema,
+                                                       Map<String, String> properties, LifecycleState state,
+                                                       Optional<TableMaterializationPolicy> materialization,
+                                                       IndexedStreamConfigStore.ActiveStreamConfig active) {
+        return getLayoutTolerant(id, active).thenCompose(layout ->
+            buildStreamImpl(id, config, partitioning, schema, properties, state,
+                materialization, layout));
+    }
+
+    private CompletableFuture<Stream> buildStreamImpl(StreamIdentifier id, StreamConfig config,
+                                                       Partitioning partitioning, SchemaConfig schema,
+                                                       Map<String, String> properties, LifecycleState state,
+                                                       Optional<TableMaterializationPolicy> materialization,
+                                                       StreamLayout layout) {
+        return createUnifiedReader(id, layout).thenApply(unifiedReader ->
                 new StreamImpl(id, config, partitioning, schema, properties, state,
                     layout, logStorage, unifiedReader, entryIndexCache, logStateManager,
                     materialization, this::loadNamespaceMaterializationFromCache,
-                    this::clusterDefaultMaterialization, this::lookupTableCatalog)));
+                    this::clusterDefaultMaterialization, this::lookupTableCatalog));
     }
 
     /**
@@ -1286,17 +2474,22 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
 
     @Override
     public CompletableFuture<Boolean> dropStream(StreamIdentifier id, boolean purge) {
-        if (streamIdLookup == null || streamIdMappingDeleter == null) {
-            return CompletableFuture.failedFuture(new UnsupportedOperationException(
-                "Stream deletion requires keyed stream-ID lifecycle support"));
+        UnsupportedOperationException capabilityFailure = keyedLifecycleCapabilityFailure(
+            "Stream deletion");
+        if (capabilityFailure != null) {
+            return CompletableFuture.failedFuture(capabilityFailure);
         }
         String dropOwnerToken = UUID.randomUUID().toString();
-        return streamConfigStore.beginDrop(id, dropOwnerToken).thenCompose(optionalClaim -> {
+        return streamConfigStore.beginDrop(id, dropOwnerToken, purge).thenCompose(optionalClaim -> {
             if (optionalClaim.isEmpty()) {
-                return CompletableFuture.completedFuture(false);
+                return streamConfigStore.readCompletedDrop(id)
+                    .thenCompose(completed -> completed.isEmpty()
+                        ? CompletableFuture.completedFuture(false)
+                        : cleanupCompletedDrop(id, completed.orElseThrow())
+                            .thenApply(ignored -> false));
             }
             IndexedStreamConfigStore.DropClaim claim = optionalClaim.orElseThrow();
-            return cleanupDroppedStream(id, claim, purge)
+            return cleanupDroppedStream(id, claim, claim.config().purgeRequested())
                 .thenCompose(ignored -> streamConfigStore.verifyAbortingOwnership(id, claim))
                 .thenCompose(ignored -> streamConfigStore.completeDrop(id, claim))
                 .thenApply(ignored -> true);
@@ -1314,11 +2507,160 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
                     streamConfigStore.verifyAbortingOwnership(id, claim))
                 .thenCompose(ignored -> mappingForDrop(id, partitionIndex, claim))
                 .thenCompose(mapping -> tombstoneDroppedPartition(
-                    id, partitionIndex, claim, mapping)
+                    id, partitionIndex, claim, mapping, purge)
                     .thenCompose(tombstone -> cleanupDroppedPartition(
-                        id, partitionIndex, claim, tombstone, purge)));
+                        id, partitionIndex, claim, tombstone)));
         }
         return chain;
+    }
+
+    private CompletableFuture<Void> cleanupCompletedDrop(
+            StreamIdentifier id, IndexedStreamConfigStore.CompletedDrop completed) {
+        CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
+        for (int i = 0; i < completed.config().partitions(); i++) {
+            int partitionIndex = i;
+            chain = chain
+                .thenCompose(ignored ->
+                    streamConfigStore.verifyCompletedDrop(id, completed))
+                .thenCompose(ignored -> mappingForCompletedDrop(
+                    id, partitionIndex, completed.config()))
+                .thenCompose(mapping -> recoverCompletedDroppedPartition(
+                    id, partitionIndex, completed, mapping,
+                    new PartitionMetadataRetry()))
+                .thenCompose(tombstone -> cleanupCompletedDroppedPartition(
+                    id, partitionIndex, completed, tombstone));
+        }
+        return chain;
+    }
+
+    private CompletableFuture<OptionalLong> mappingForCompletedDrop(
+            StreamIdentifier id, int partitionIndex,
+            IndexedStreamConfigStore.StreamConfigData config) {
+        String mappingKey = dropMappingKey(id, partitionIndex, config);
+        return streamIdLookup.apply(mappingKey)
+            .handle((streamId, failure) -> {
+                if (failure == null) {
+                    return OptionalLong.of(streamId);
+                }
+                Throwable cause = rootCause(failure);
+                if (cause instanceof NoSuchKeyException) {
+                    return OptionalLong.empty();
+                }
+                throw new CompletionException(cause);
+            });
+    }
+
+    private CompletableFuture<PartitionTombstone> recoverCompletedDroppedPartition(
+            StreamIdentifier id, int partitionIndex,
+            IndexedStreamConfigStore.CompletedDrop completed,
+            OptionalLong mappedStreamId, PartitionMetadataRetry retryState) {
+        String path = catalogPaths.partitionMetadataPath(id, partitionIndex);
+        String mappingKey = dropMappingKey(id, partitionIndex, completed.config());
+        Supplier<CompletableFuture<Void>> ownershipVerifier =
+            () -> streamConfigStore.verifyCompletedDrop(id, completed);
+        return ownershipVerifier.get()
+            .thenCompose(ignored -> oxiaClient.get(path))
+            .thenCompose(existing -> {
+                if (existing == null) {
+                    long streamId = mappedStreamId.orElse(-1L);
+                    Set<Long> retiredStreamIds = retiredStreamIdsWith(
+                        Set.of(), streamId);
+                    Set<Long> purgeableRetiredStreamIds =
+                        completed.config().purgeRequested()
+                            ? retiredStreamIdsWith(Set.of(), streamId)
+                            : Set.of();
+                    Set<RetiredStreamMapping> retiredStreamMappings =
+                        retiredStreamMappingsWith(Set.of(), mappingKey, streamId);
+                    Set<String> retiredMappingKeys =
+                        retiredMappingKeysWith(Set.of(), mappingKey);
+                    LogMetadata tombstone = deletionMetadata(
+                        streamId, completed.config(), retiredStreamIds,
+                        purgeableRetiredStreamIds, retiredStreamMappings,
+                        retiredMappingKeys);
+                    return persistPartitionMetadata(
+                        id, partitionIndex, tombstone,
+                        Set.of(PutOption.IfRecordDoesNotExist), ownershipVerifier,
+                        write -> new PartitionTombstone(
+                            streamId, retiredStreamIds,
+                            purgeableRetiredStreamIds, retiredStreamMappings,
+                            retiredMappingKeys, write),
+                        () -> recoverCompletedDroppedPartition(
+                            id, partitionIndex, completed, mappedStreamId, retryState),
+                        retryState);
+                }
+
+                final LogMetadata current;
+                try {
+                    current = LOG_METADATA_SERDE.deserialize(path, existing.value());
+                } catch (Exception e) {
+                    return CompletableFuture.failedFuture(e);
+                }
+                if (!metadataCanBeFencedByDeletion(current, completed.config())) {
+                    return CompletableFuture.failedFuture(new AlreadyExistsException(
+                        "Partition metadata belongs to a different stream lifecycle: "
+                            + id.fullName() + "-partition-" + partitionIndex));
+                }
+
+                long streamId = current.streamId() >= 0
+                    ? current.streamId() : mappedStreamId.orElse(-1L);
+                Set<Long> retiredStreamIds = retiredStreamIdsWith(
+                    current.retiredStreamIds(), streamId,
+                    mappedStreamId.orElse(-1L));
+                Set<Long> purgeableRetiredStreamIds =
+                    current.purgeableRetiredStreamIds();
+                if (completed.config().purgeRequested()) {
+                    purgeableRetiredStreamIds = purgeAllRetiredStreamIds(
+                        purgeableRetiredStreamIds, retiredStreamIds);
+                } else if (mappedStreamId.isPresent()
+                        && !current.retiredStreamIds().contains(
+                            mappedStreamId.getAsLong())
+                        && (current.streamId() < 0
+                            || current.streamId() != mappedStreamId.getAsLong())) {
+                    purgeableRetiredStreamIds = retiredStreamIdsWith(
+                        purgeableRetiredStreamIds, mappedStreamId.getAsLong());
+                }
+                Set<RetiredStreamMapping> retiredStreamMappings =
+                    retiredStreamMappingsWith(
+                        current.retiredStreamMappings(), mappingKey, streamId,
+                        mappedStreamId.orElse(-1L));
+                Set<String> retiredMappingKeys = retiredMappingKeysWith(
+                    current.retiredMappingKeys(), mappingKey);
+                LogMetadata tombstone = deletionMetadata(
+                    streamId, completed.config(), retiredStreamIds,
+                    purgeableRetiredStreamIds, retiredStreamMappings,
+                    retiredMappingKeys);
+                Set<Long> finalPurgeableRetiredStreamIds =
+                    purgeableRetiredStreamIds;
+                PartitionTombstone recovered = new PartitionTombstone(
+                    streamId, retiredStreamIds, finalPurgeableRetiredStreamIds,
+                    retiredStreamMappings, retiredMappingKeys,
+                    new PartitionMetadataWrite(OptionalLong.of(
+                        existing.version().versionId())));
+                if (samePersistedRegistration(current, tombstone)) {
+                    return ownershipVerifier.get().thenApply(ignored -> recovered);
+                }
+                return persistPartitionMetadata(
+                    id, partitionIndex, tombstone,
+                    Set.of(PutOption.IfVersionIdEquals(existing.version().versionId())),
+                    ownershipVerifier,
+                    write -> new PartitionTombstone(
+                        streamId, retiredStreamIds,
+                        finalPurgeableRetiredStreamIds, retiredStreamMappings,
+                        retiredMappingKeys, write),
+                    () -> recoverCompletedDroppedPartition(
+                        id, partitionIndex, completed, mappedStreamId, retryState),
+                    retryState);
+            });
+    }
+
+    private CompletableFuture<Void> cleanupCompletedDroppedPartition(
+            StreamIdentifier id, int partitionIndex,
+            IndexedStreamConfigStore.CompletedDrop completed,
+            PartitionTombstone tombstone) {
+        return sweepRetiredAllocations(
+            id, partitionIndex,
+            () -> streamConfigStore.verifyCompletedDrop(id, completed),
+            Set.of()).thenApply(ignored -> null);
     }
 
     private CompletableFuture<OptionalLong> mappingForDrop(
@@ -1341,10 +2683,16 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
     private String dropMappingKey(
             StreamIdentifier id, int partitionIndex,
             IndexedStreamConfigStore.DropClaim claim) {
-        if (claim.config().creationKind().orElse(null)
+        return dropMappingKey(id, partitionIndex, claim.config());
+    }
+
+    private String dropMappingKey(
+            StreamIdentifier id, int partitionIndex,
+            IndexedStreamConfigStore.StreamConfigData config) {
+        if (config.creationKind().orElse(null)
                 == IndexedStreamConfigStore.CreationKind.NATIVE_CREATE) {
             return nativePartitionAllocationKey(
-                id, claim.config().incarnationId().orElseThrow(), partitionIndex);
+                id, config.incarnationId().orElseThrow(), partitionIndex);
         }
         return catalogPaths.compactedReaderName(id, partitionIndex);
     }
@@ -1352,23 +2700,50 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
     private CompletableFuture<PartitionTombstone> tombstoneDroppedPartition(
             StreamIdentifier id, int partitionIndex,
             IndexedStreamConfigStore.DropClaim claim,
-            OptionalLong mappedStreamId) {
+            OptionalLong mappedStreamId, boolean purge) {
+        return tombstoneDroppedPartition(
+            id, partitionIndex, claim, mappedStreamId, purge,
+            new PartitionMetadataRetry());
+    }
+
+    private CompletableFuture<PartitionTombstone> tombstoneDroppedPartition(
+            StreamIdentifier id, int partitionIndex,
+            IndexedStreamConfigStore.DropClaim claim,
+            OptionalLong mappedStreamId,
+            boolean purge,
+            PartitionMetadataRetry retryState) {
         String path = catalogPaths.partitionMetadataPath(id, partitionIndex);
+        String mappingKey = dropMappingKey(id, partitionIndex, claim);
         return streamConfigStore.verifyAbortingOwnership(id, claim)
             .thenCompose(ignored -> oxiaClient.get(path))
             .thenCompose(existing -> {
                 if (existing == null) {
                     long streamId = mappedStreamId.orElse(-1L);
-                    LogMetadata tombstone = deletionMetadata(streamId, claim);
+                    Set<Long> retiredStreamIds = retiredStreamIdsWith(Set.of(), streamId);
+                    Set<Long> purgeableRetiredStreamIds =
+                        purgeableRetiredStreamIdsForDrop(
+                            Set.of(), Set.of(), retiredStreamIds, streamId,
+                            mappedStreamId.orElse(-1L), purge);
+                    Set<RetiredStreamMapping> retiredStreamMappings =
+                        retiredStreamMappingsWith(
+                            Set.of(), mappingKey, streamId,
+                            mappedStreamId.orElse(-1L));
+                    Set<String> retiredMappingKeys =
+                        retiredMappingKeysWith(Set.of(), mappingKey);
+                    LogMetadata tombstone = deletionMetadata(
+                        streamId, claim, retiredStreamIds, purgeableRetiredStreamIds,
+                        retiredStreamMappings, retiredMappingKeys);
                     return persistPartitionMetadata(
                         id, partitionIndex, tombstone,
                         Set.of(PutOption.IfRecordDoesNotExist),
                         () -> streamConfigStore.verifyAbortingOwnership(id, claim),
+                        write -> new PartitionTombstone(
+                            streamId, retiredStreamIds,
+                            purgeableRetiredStreamIds, retiredStreamMappings,
+                            retiredMappingKeys, write),
                         () -> tombstoneDroppedPartition(
-                            id, partitionIndex, claim, mappedStreamId)
-                            .thenApply(PartitionTombstone::write))
-                        .thenApply(write -> new PartitionTombstone(
-                            streamId, mappedStreamId.orElse(streamId), write));
+                            id, partitionIndex, claim, mappedStreamId, purge, retryState),
+                        retryState);
                 }
                 final LogMetadata current;
                 try {
@@ -1378,11 +2753,28 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
                 }
                 long streamId = current.streamId() >= 0
                     ? current.streamId() : mappedStreamId.orElse(-1L);
-                LogMetadata tombstone = deletionMetadata(streamId, claim);
+                Set<Long> retiredStreamIds = retiredStreamIdsWith(
+                    current.retiredStreamIds(), streamId,
+                    mappedStreamId.orElse(-1L));
+                Set<Long> purgeableRetiredStreamIds =
+                    purgeableRetiredStreamIdsForDrop(
+                        current.purgeableRetiredStreamIds(), current.retiredStreamIds(),
+                        retiredStreamIds, streamId, mappedStreamId.orElse(-1L), purge);
+                Set<RetiredStreamMapping> retiredStreamMappings =
+                    retiredStreamMappingsWith(
+                        current.retiredStreamMappings(), mappingKey, streamId,
+                        mappedStreamId.orElse(-1L));
+                Set<String> retiredMappingKeys = retiredMappingKeysWith(
+                    current.retiredMappingKeys(), mappingKey);
+                LogMetadata tombstone = deletionMetadata(
+                    streamId, claim, retiredStreamIds, purgeableRetiredStreamIds,
+                    retiredStreamMappings, retiredMappingKeys);
                 if (samePersistedRegistration(current, tombstone)) {
                     return streamConfigStore.verifyAbortingOwnership(id, claim)
                         .thenApply(ignored -> new PartitionTombstone(
-                            streamId, mappedStreamId.orElse(streamId),
+                            streamId, retiredStreamIds,
+                            purgeableRetiredStreamIds, retiredStreamMappings,
+                            retiredMappingKeys,
                             new PartitionMetadataWrite(OptionalLong.of(
                                 existing.version().versionId()))));
                 }
@@ -1395,58 +2787,86 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
                     id, partitionIndex, tombstone,
                     Set.of(PutOption.IfVersionIdEquals(existing.version().versionId())),
                     () -> streamConfigStore.verifyAbortingOwnership(id, claim),
+                    write -> new PartitionTombstone(
+                        streamId, retiredStreamIds,
+                        purgeableRetiredStreamIds, retiredStreamMappings,
+                        retiredMappingKeys, write),
                     () -> tombstoneDroppedPartition(
-                        id, partitionIndex, claim, mappedStreamId)
-                        .thenApply(PartitionTombstone::write))
-                    .thenApply(write -> new PartitionTombstone(
-                        streamId, mappedStreamId.orElse(streamId), write));
+                        id, partitionIndex, claim, mappedStreamId, purge, retryState),
+                    retryState);
             });
     }
 
     private static LogMetadata deletionMetadata(
-            long streamId, IndexedStreamConfigStore.DropClaim claim) {
-        String incarnationId = claim.config().incarnationId().orElse(null);
+            long streamId, IndexedStreamConfigStore.DropClaim claim,
+            Set<Long> retiredStreamIds, Set<Long> purgeableRetiredStreamIds) {
+        return deletionMetadata(
+            streamId, claim.config(), retiredStreamIds, purgeableRetiredStreamIds);
+    }
+
+    private static LogMetadata deletionMetadata(
+            long streamId, IndexedStreamConfigStore.DropClaim claim,
+            Set<Long> retiredStreamIds, Set<Long> purgeableRetiredStreamIds,
+            Set<RetiredStreamMapping> retiredStreamMappings,
+            Set<String> retiredMappingKeys) {
+        return deletionMetadata(
+            streamId, claim.config(), retiredStreamIds, purgeableRetiredStreamIds,
+            retiredStreamMappings, retiredMappingKeys);
+    }
+
+    private static LogMetadata deletionMetadata(
+            long streamId, IndexedStreamConfigStore.StreamConfigData config,
+            Set<Long> retiredStreamIds, Set<Long> purgeableRetiredStreamIds) {
+        return deletionMetadata(
+            streamId, config, retiredStreamIds, purgeableRetiredStreamIds,
+            Set.of(), Set.of());
+    }
+
+    private static LogMetadata deletionMetadata(
+            long streamId, IndexedStreamConfigStore.StreamConfigData config,
+            Set<Long> retiredStreamIds, Set<Long> purgeableRetiredStreamIds,
+            Set<RetiredStreamMapping> retiredStreamMappings,
+            Set<String> retiredMappingKeys) {
+        String incarnationId = config.incarnationId().orElse(null);
         return new LogMetadata(
             streamId, Map.of(), OptionalLong.empty(),
-            incarnationId, incarnationId == null ? null : claim.ownerToken(),
-            incarnationId == null ? null : claim.config().ownerGeneration(), true);
+            incarnationId,
+            incarnationId == null ? null : config.ownerToken().orElseThrow(),
+            incarnationId == null ? null : config.ownerGeneration(), true,
+            retiredStreamIdsWith(retiredStreamIds, streamId),
+            purgeableRetiredStreamIds, retiredStreamMappings, retiredMappingKeys);
+    }
+
+    private static Set<Long> purgeableRetiredStreamIdsForDrop(
+            Set<Long> currentPurgeable, Set<Long> currentRetired,
+            Set<Long> retiredStreamIds, long primaryStreamId,
+            long mappedStreamId, boolean purge) {
+        if (purge) {
+            return purgeAllRetiredStreamIds(currentPurgeable, retiredStreamIds);
+        }
+        if (mappedStreamId >= 0 && mappedStreamId != primaryStreamId
+                && !currentRetired.contains(mappedStreamId)) {
+            return retiredStreamIdsWith(currentPurgeable, mappedStreamId);
+        }
+        return currentPurgeable;
     }
 
     private CompletableFuture<Void> cleanupDroppedPartition(
             StreamIdentifier id, int partitionIndex,
             IndexedStreamConfigStore.DropClaim claim,
-            PartitionTombstone tombstone, boolean purge) {
-        CompletableFuture<Void> cleanup = CompletableFuture.completedFuture(null);
-        if (purge && tombstone.streamId() >= 0) {
-            cleanup = cleanup
-                .thenCompose(ignored ->
-                    streamConfigStore.verifyAbortingOwnership(id, claim))
-                .thenCompose(ignored ->
-                    logStorage.deleteLog(LogId.of(tombstone.streamId())));
-            if (tombstone.mappingStreamId() >= 0
-                    && tombstone.mappingStreamId() != tombstone.streamId()) {
-                cleanup = cleanup.thenCompose(ignored ->
-                    logStorage.deleteLog(LogId.of(tombstone.mappingStreamId())));
-            }
-        }
-        if (tombstone.mappingStreamId() >= 0) {
-            String mappingKey = dropMappingKey(id, partitionIndex, claim);
-            cleanup = cleanup
-                .thenCompose(ignored ->
-                    streamConfigStore.verifyAbortingOwnership(id, claim))
-                .thenCompose(ignored -> streamIdMappingDeleter.apply(
-                    mappingKey, tombstone.mappingStreamId()));
-        }
-        return cleanup.thenCompose(ignored ->
-            streamConfigStore.verifyAbortingOwnership(id, claim));
+            PartitionTombstone tombstone) {
+        return sweepRetiredAllocations(
+            id, partitionIndex,
+            () -> streamConfigStore.verifyAbortingOwnership(id, claim),
+            Set.of()).thenApply(ignored -> null);
     }
 
     private record PartitionTombstone(
-            long streamId, long mappingStreamId, PartitionMetadataWrite write) {
-
-        private PartitionTombstone(long streamId, PartitionMetadataWrite write) {
-            this(streamId, streamId, write);
-        }
+            long streamId, Set<Long> retiredStreamIds,
+            Set<Long> purgeableRetiredStreamIds,
+            Set<RetiredStreamMapping> retiredStreamMappings,
+            Set<String> retiredMappingKeys,
+            PartitionMetadataWrite write) {
     }
 
     @Override
@@ -1468,20 +2888,18 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
 
     @Override
     public CompletableFuture<StreamLayout> getLayout(StreamIdentifier id) {
-        return readPartitionCount(id).thenCompose(numPartitions -> {
+        return streamConfigStore.readActive(id).thenCompose(active -> {
             List<CompletableFuture<LogId>> futures = new ArrayList<>();
-            for (int i = 0; i < numPartitions; i++) {
+            for (int i = 0; i < active.config().partitions(); i++) {
                 final int partIdx = i;
-                futures.add(readPartitionMetadata(id, partIdx)
-                    .thenApply(meta -> LogId.of(meta.streamId())));
+                futures.add(readPartitionMetadata(id, partIdx, active.config())
+                    .thenApply(meta -> LogId.of(meta.metadata().streamId())));
             }
             return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
-                .thenApply(v -> {
-                    List<LogId> logIds = futures.stream()
-                        .map(CompletableFuture::join)
-                        .toList();
-                    return new IndexedLayout(logIds);
-                });
+                .thenCompose(ignored -> streamConfigStore.verifyActiveOwnership(id, active))
+                .thenApply(ignored -> new IndexedLayout(futures.stream()
+                    .map(CompletableFuture::join)
+                    .toList()));
         });
     }
 
@@ -1499,28 +2917,33 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
      * the public {@link #getLayout} stays strict for native readers that need a complete layout.
      */
     private CompletableFuture<StreamLayout> getLayoutTolerant(StreamIdentifier id) {
-        return readPartitionCount(id).thenCompose(numPartitions -> {
-            List<CompletableFuture<LogId>> futures = new ArrayList<>();
-            for (int i = 0; i < numPartitions; i++) {
-                final int partIdx = i;
-                futures.add(readPartitionMetadata(id, partIdx)
-                    .handle((meta, ex) -> {
-                        if (ex != null) {
-                            if (unwrap(ex) instanceof NoSuchStreamException) {
-                                log.debug("Partition {} of {} not yet registered; using a placeholder in "
-                                    + "the materialization layout", partIdx, id.fullName());
-                                return UNREGISTERED_PARTITION;
-                            }
-                            throw new CompletionException(unwrap(ex));
+        return streamConfigStore.readActive(id).thenCompose(active ->
+            getLayoutTolerant(id, active));
+    }
+
+    private CompletableFuture<StreamLayout> getLayoutTolerant(
+            StreamIdentifier id, IndexedStreamConfigStore.ActiveStreamConfig active) {
+        List<CompletableFuture<LogId>> futures = new ArrayList<>();
+        for (int i = 0; i < active.config().partitions(); i++) {
+            final int partIdx = i;
+            futures.add(readPartitionMetadata(id, partIdx, active.config())
+                .handle((meta, ex) -> {
+                    if (ex != null) {
+                        if (unwrap(ex) instanceof NoSuchStreamException) {
+                            log.debug("Partition {} of {} not yet registered; using a placeholder in "
+                                + "the materialization layout", partIdx, id.fullName());
+                            return UNREGISTERED_PARTITION;
                         }
-                        return LogId.of(meta.streamId());
-                    }));
-            }
-            return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
-                .thenApply(v -> new IndexedLayout(futures.stream()
-                    .map(CompletableFuture::join)
-                    .toList()));
-        });
+                        throw new CompletionException(unwrap(ex));
+                    }
+                    return LogId.of(meta.metadata().streamId());
+                }));
+        }
+        return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+            .thenCompose(ignored -> streamConfigStore.verifyActiveOwnership(id, active))
+            .thenApply(ignored -> new IndexedLayout(futures.stream()
+                .map(CompletableFuture::join)
+                .toList()));
     }
 
     @Override
@@ -1579,6 +3002,14 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
     private CompletableFuture<Void> sealPartition(
             StreamIdentifier id, int partitionIndex,
             IndexedStreamConfigStore.ActiveStreamConfig active) {
+        return sealPartition(
+            id, partitionIndex, active, new PartitionMetadataRetry());
+    }
+
+    private CompletableFuture<Void> sealPartition(
+            StreamIdentifier id, int partitionIndex,
+            IndexedStreamConfigStore.ActiveStreamConfig active,
+            PartitionMetadataRetry retryState) {
         String path = catalogPaths.partitionMetadataPath(id, partitionIndex);
         return streamConfigStore.verifyActiveOwnership(id, active)
             .thenCompose(ignored ->
@@ -1589,7 +3020,9 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
                     metadata.streamId(), metadata.properties(), OptionalLong.of(0),
                     metadata.registrationIncarnationId(),
                     metadata.registrationOwnerToken(),
-                    metadata.registrationOwnerGeneration(), false);
+                    metadata.registrationOwnerGeneration(), false,
+                    metadata.retiredStreamIds(), metadata.purgeableRetiredStreamIds(),
+                    metadata.retiredStreamMappings(), metadata.retiredMappingKeys());
                 final byte[] bytes;
                 try {
                     bytes = LOG_METADATA_SERDE.serialize(path, sealed);
@@ -1605,9 +3038,11 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
                             return streamConfigStore.verifyActiveOwnership(id, active);
                         }
                         if (outcome.failure() instanceof UnexpectedVersionIdException) {
-                            return streamConfigStore.verifyActiveOwnership(id, active)
-                                .thenCompose(ignored ->
-                                    sealPartition(id, partitionIndex, active));
+                            return retryPartitionMetadataWrite(
+                                id, partitionIndex, outcome.failure(),
+                                () -> sealPartition(
+                                    id, partitionIndex, active, retryState),
+                                retryState);
                         }
                         return readPartitionMetadata(id, partitionIndex, active.config())
                             .handle((readback, readFailure) ->
@@ -1925,20 +3360,32 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
             if (result == null) {
                 throw new NoSuchStreamException(id);
             }
+            final LogMetadata metadata;
             try {
-                LogMetadata metadata = LOG_METADATA_SERDE.deserialize(path, result.value());
-                if (metadata.deleted() || !metadataMatchesActiveConfig(metadata, config)) {
-                    throw new NoSuchStreamException(id);
-                }
-                return new VersionedLogMetadata(
-                    metadata, result.version().versionId());
+                metadata = LOG_METADATA_SERDE.deserialize(path, result.value());
             } catch (Exception e) {
-                if (e instanceof NoSuchStreamException noSuchStreamException) {
-                    throw noSuchStreamException;
-                }
                 throw new RuntimeException("Failed to deserialize partition metadata: " + path, e);
             }
+            if (metadata.deleted()) {
+                throw new PartitionMetadataFenceViolationException(
+                    id, partitionIndex, "metadata is deleted");
+            }
+            if (!metadataMatchesActiveConfig(metadata, config)) {
+                throw new PartitionMetadataFenceViolationException(
+                    id, partitionIndex, "metadata belongs to a different stream lifecycle");
+            }
+            return new VersionedLogMetadata(
+                metadata, result.version().versionId());
         });
+    }
+
+    static final class PartitionMetadataFenceViolationException extends RuntimeException {
+
+        private PartitionMetadataFenceViolationException(
+                StreamIdentifier id, int partitionIndex, String reason) {
+            super("Partition metadata fence violation for " + id.fullName()
+                + "-partition-" + partitionIndex + ": " + reason);
+        }
     }
 
     private static boolean metadataMatchesActiveConfig(
@@ -1984,19 +3431,25 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
             return metadata.deleted();
         }
         if (metadata.registrationOwnerGeneration() == config.ownerGeneration()) {
-            return (config.provisioningState()
+            boolean sameOwner = Objects.equals(
+                metadata.registrationOwnerToken(), config.ownerToken().orElse(null));
+            if (!sameOwner) {
+                return false;
+            }
+            return config.provisioningState()
                     == IndexedStreamConfigStore.ProvisioningState.ACTIVE
-                    || config.provisioningState()
-                        == IndexedStreamConfigStore.ProvisioningState.UNREGISTERED)
-                && Objects.equals(metadata.registrationOwnerToken(),
-                    config.ownerToken().orElse(null));
+                || config.provisioningState()
+                    == IndexedStreamConfigStore.ProvisioningState.UNREGISTERED
+                || (metadata.deleted()
+                    && config.provisioningState().retainsExternalDeletionSpec());
         }
         return metadata.registrationOwnerGeneration() < config.ownerGeneration();
     }
 
     @Nullable
     private UnsupportedOperationException keyedLifecycleCapabilityFailure(String operation) {
-        return streamIdLookup == null || streamIdMappingDeleter == null
+        return !supportsKeyedLifecycle
+                || streamIdLookup == null || streamIdMappingDeleter == null
             ? new UnsupportedOperationException(
                 operation + " requires keyed stream-ID lifecycle support")
             : null;

@@ -14,6 +14,7 @@ import io.oxia.client.api.AsyncOxiaClient;
 import java.io.Closeable;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -83,6 +84,49 @@ public interface StorageApi extends Closeable {
     CompletableFuture<Long> generateStreamId(Optional<String> key);
 
     /**
+     * Allocates a stream ID and reports whether this invocation created its keyed mapping.
+     *
+     * <p>The default is deliberately conservative for existing implementations: without an
+     * atomic allocation result, callers must treat the returned mapping as reused and must not
+     * destructively compensate it after a higher-level operation is rejected.
+     *
+     * @param key the optional key to bind to the stream ID
+     * @return the allocated stream ID and keyed-mapping provenance
+     */
+    default CompletableFuture<StreamIdAllocation> allocateStreamId(Optional<String> key) {
+        return generateStreamId(key).thenApply(streamId ->
+            new StreamIdAllocation(streamId, false));
+    }
+
+    /** Result of a stream-ID allocation. */
+    record StreamIdAllocation(long streamId, boolean createdKeyedMapping) {
+    }
+
+    /**
+     * Reports that a keyed allocation became invalid after its stream registration was made
+     * durable.
+     *
+     * <p>The allocation is retained so a lifecycle-aware caller can safely compensate resources
+     * that this storage layer cannot delete without knowing whether the stream ID was published.
+     */
+    final class KeyedAllocationInvalidatedException extends RuntimeException {
+
+        private final StreamIdAllocation allocation;
+
+        public KeyedAllocationInvalidatedException(
+                StreamIdAllocation allocation, Throwable cause) {
+            super("Keyed stream-ID allocation was invalidated for stream ID "
+                + Objects.requireNonNull(allocation, "allocation").streamId(), cause);
+            this.allocation = allocation;
+        }
+
+        /** Returns the allocation that failed its final keyed-mapping validation. */
+        public StreamIdAllocation allocation() {
+            return allocation;
+        }
+    }
+
+    /**
      * Retrieves the stream ID associated with the specified key.
      *
      * @param key The key of the stream
@@ -108,8 +152,18 @@ public interface StorageApi extends Closeable {
      * @param key the key whose mapping should be deleted
      * @param expectedStreamId the stream ID that the caller still owns
      * @return a future that completes when the mapping is absent or owned by another stream ID
+     * @throws UnsupportedOperationException if the storage implementation does not support
+     *     conditional keyed-mapping deletion
      */
-    CompletableFuture<Void> deleteStreamIdMapping(String key, long expectedStreamId);
+    default CompletableFuture<Void> deleteStreamIdMapping(String key, long expectedStreamId) {
+        return CompletableFuture.failedFuture(new UnsupportedOperationException(
+            "Conditional keyed stream-ID deletion is not supported by this storage"));
+    }
+
+    /** Returns whether conditional keyed-mapping deletion is implemented. */
+    default boolean supportsConditionalStreamIdMappingDeletion() {
+        return false;
+    }
 
     /**
      * Retrieves a map of all stream IDs and their associated keys.

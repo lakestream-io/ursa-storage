@@ -20,6 +20,7 @@ import io.oxia.client.api.AsyncOxiaClient;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Properties;
 
 /**
@@ -227,8 +228,10 @@ public class StreamCatalogService {
             IndexedStreamCatalog catalog = new IndexedStreamCatalog(
                 oxiaClient, catalogPaths, logStorage, logFactory,
                 stateManager, storageApi::generateStreamId,
+                key -> storageApi.allocateStreamId(Optional.of(key)),
                 storageApi::getStreamIdByKey,
-                storageApi::deleteStreamIdMapping, readerFactory, cache, owned);
+                storageApi::deleteStreamIdMapping, readerFactory, cache, owned,
+                storageApi.supportsConditionalStreamIdMappingDeletion());
             owned.addAll(additionalOwnedResources);
             additionalResourcesTransferred = true;
             return catalog;

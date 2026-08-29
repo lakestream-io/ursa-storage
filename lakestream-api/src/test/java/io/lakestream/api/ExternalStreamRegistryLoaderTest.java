@@ -13,7 +13,9 @@ import java.net.URLClassLoader;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
+import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -82,6 +84,16 @@ class ExternalStreamRegistryLoaderTest {
         }
     }
 
+    @Test
+    void legacyRegistryUsesUnsupportedPermanentDeletionDefault() {
+        ExternalStreamRegistry registry = new LegacyExternalStreamRegistry();
+
+        assertThatThrownBy(() -> registry.permanentlyDeleteExternalStream(
+            new StreamIdentifier("namespace", "stream")))
+            .isInstanceOf(UnsupportedOperationException.class)
+            .hasMessageContaining("Permanent external stream deletion is not supported");
+    }
+
     private URLClassLoader providerClassLoader(Class<?>... providers) throws Exception {
         Path services = tempDir.resolve("META-INF/services");
         Files.createDirectories(services);
@@ -123,6 +135,24 @@ class ExternalStreamRegistryLoaderTest {
         public ExternalStreamRegistry openExternalStreamRegistry(
                 String catalogMetadataUri, Properties properties) {
             return null;
+        }
+    }
+
+    private static final class LegacyExternalStreamRegistry implements ExternalStreamRegistry {
+
+        @Override
+        public CompletableFuture<Void> registerExternalStream(
+                StreamIdentifier id, int partitionCount, Map<String, String> properties) {
+            return CompletableFuture.completedFuture(null);
+        }
+
+        @Override
+        public CompletableFuture<Void> unregisterExternalStream(StreamIdentifier id) {
+            return CompletableFuture.completedFuture(null);
+        }
+
+        @Override
+        public void close() {
         }
     }
 }

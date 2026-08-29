@@ -35,6 +35,8 @@ public final class LogMetadataSerde {
         if (content.length == 0) {
             return LogMetadata.EMPTY;
         }
-        return objectReader.readValue(content);
+        LogMetadata metadata = objectReader.readValue(content);
+        metadata.validateRegistrationIdentity();
+        return metadata;
     }
 }

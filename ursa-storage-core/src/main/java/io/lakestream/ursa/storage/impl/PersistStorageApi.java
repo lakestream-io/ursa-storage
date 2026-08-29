@@ -62,6 +62,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.collections4.map.HashedMap;
@@ -69,6 +70,11 @@ import org.apache.commons.lang3.tuple.Pair;
 
 @Slf4j
 public class PersistStorageApi implements StorageApi {
+
+    private static final int MAX_CONDITIONAL_MAPPING_DELETE_RETRIES = 3;
+    private static final long CONDITIONAL_MAPPING_DELETE_RETRY_DELAY_MS = 10L;
+    private static final int MAX_KEYED_ALLOCATION_RETRIES = 3;
+    private static final long KEYED_ALLOCATION_RETRY_DELAY_MS = 10L;
 
     private final StorageFormat storageFormat;
     private final AsyncOxiaClient oxiaClient;
@@ -160,7 +166,7 @@ public class PersistStorageApi implements StorageApi {
             return oxiaClient.put(STREAM_REGISTER_PATH + "/" + streamId,
                             STREAM_PROPERTIES_WRITER.writeValueAsBytes(value),
                             Set.of(PutOption.IfRecordDoesNotExist))
-                    .thenApply(x -> streamId);
+                    .thenApply(result -> streamId);
         } catch (IOException e) {
             return CompletableFuture.failedFuture(
                     new StreamPropertiesSerDeException("Failed to register stream id: " + key, e));
@@ -189,9 +195,14 @@ public class PersistStorageApi implements StorageApi {
 
     @Override
     public CompletableFuture<Long> generateStreamId(Optional<String> key) {
-        return internalGenerateStreamId(key).thenApply(streamId -> {
-            streamStateManager.setState(streamId, LogState.NORMAL);
-            return streamId;
+        return allocateStreamId(key).thenApply(StreamIdAllocation::streamId);
+    }
+
+    @Override
+    public CompletableFuture<StreamIdAllocation> allocateStreamId(Optional<String> key) {
+        return internalAllocateStreamId(key, 0).thenApply(allocation -> {
+            streamStateManager.setState(allocation.streamId(), LogState.NORMAL);
+            return allocation;
         });
     }
 
@@ -218,6 +229,16 @@ public class PersistStorageApi implements StorageApi {
 
     @Override
     public CompletableFuture<Void> deleteStreamIdMapping(String key, long expectedStreamId) {
+        return deleteStreamIdMapping(key, expectedStreamId, 0);
+    }
+
+    @Override
+    public boolean supportsConditionalStreamIdMappingDeletion() {
+        return true;
+    }
+
+    private CompletableFuture<Void> deleteStreamIdMapping(
+            String key, long expectedStreamId, int retryAttempt) {
         String keyPath = STREAM_ID_GENERATOR_PATH + "/" + key;
         Set<GetOption> getOptions = Set.of(GetOption.PartitionKey(STREAM_ID_GENERATOR_PATH));
         return oxiaClient.get(keyPath, getOptions).thenCompose(result -> {
@@ -240,7 +261,21 @@ public class PersistStorageApi implements StorageApi {
                         return CompletableFuture.completedFuture(null);
                     }
                     if (delete.failure() instanceof UnexpectedVersionIdException) {
-                        return deleteStreamIdMapping(key, expectedStreamId);
+                        if (retryAttempt >= MAX_CONDITIONAL_MAPPING_DELETE_RETRIES) {
+                            return CompletableFuture.failedFuture(new IllegalStateException(
+                                "Conditional keyed stream-ID delete exhausted retries for "
+                                    + keyPath, delete.failure()));
+                        }
+                        long delayMillis = CONDITIONAL_MAPPING_DELETE_RETRY_DELAY_MS
+                            << retryAttempt;
+                        log.warn("Retrying conditional keyed stream-ID delete for {} after "
+                                + "a version conflict (attempt {}/{})", keyPath,
+                            retryAttempt + 1, MAX_CONDITIONAL_MAPPING_DELETE_RETRIES);
+                        return CompletableFuture.runAsync(
+                                () -> { }, CompletableFuture.delayedExecutor(
+                                    delayMillis, TimeUnit.MILLISECONDS))
+                            .thenCompose(ignored -> deleteStreamIdMapping(
+                                key, expectedStreamId, retryAttempt + 1));
                     }
                     if (delete.failure() != null) {
                         return CompletableFuture.failedFuture(delete.failure());
@@ -293,7 +328,8 @@ public class PersistStorageApi implements StorageApi {
     }
 
 
-    private CompletableFuture<Long> internalGenerateStreamId(Optional<String> key) {
+    private CompletableFuture<StreamIdAllocation> internalAllocateStreamId(
+            Optional<String> key, int retryAttempt) {
         if (key.isPresent()) {
             String streamKey = key.orElseThrow();
             String keyPath = STREAM_ID_GENERATOR_PATH + "/" + streamKey;
@@ -302,18 +338,21 @@ public class PersistStorageApi implements StorageApi {
                     if (result == null) {
                         return generateId()
                             .thenCompose(streamId -> createKeyedStreamIdMapping(
-                                streamKey, keyPath, streamId));
+                                streamKey, keyPath, streamId, retryAttempt));
                     }
                     long streamId = Long.parseLong(
                         new String(result.value(), StandardCharsets.UTF_8));
-                    return ensureStreamRegistered(streamId, streamKey);
+                    return completeKeyedAllocation(
+                        streamId, streamKey, keyPath, false);
                 });
         }
-        return generateId().thenCompose(streamId -> registerStream(streamId, null));
+        return generateId().thenCompose(streamId -> registerStream(streamId, null)
+            .thenApply(registeredStreamId ->
+                new StreamIdAllocation(registeredStreamId, false)));
     }
 
-    private CompletableFuture<Long> createKeyedStreamIdMapping(
-            String streamKey, String keyPath, long streamId) {
+    private CompletableFuture<StreamIdAllocation> createKeyedStreamIdMapping(
+            String streamKey, String keyPath, long streamId, int retryAttempt) {
         Set<GetOption> getOptions = Set.of(GetOption.PartitionKey(STREAM_ID_GENERATOR_PATH));
         return oxiaClient.put(keyPath, Long.toString(streamId).getBytes(StandardCharsets.UTF_8),
                 Set.of(PutOption.IfRecordDoesNotExist,
@@ -322,7 +361,8 @@ public class PersistStorageApi implements StorageApi {
                 failure == null ? null : FutureUtils.unwrapCompletionException(failure)))
             .thenCompose(write -> {
                 if (write.failure() == null) {
-                    return ensureStreamRegistered(streamId, streamKey);
+                    return completeKeyedAllocation(
+                        streamId, streamKey, keyPath, true);
                 }
                 return oxiaClient.get(keyPath, getOptions)
                     .handle((current, readFailure) -> new MappingReadResult(
@@ -337,26 +377,41 @@ public class PersistStorageApi implements StorageApi {
                             long mappedStreamId = Long.parseLong(new String(
                                 read.result().value(), StandardCharsets.UTF_8));
                             if (mappedStreamId == streamId) {
-                                return ensureStreamRegistered(streamId, streamKey);
+                                return completeKeyedAllocation(
+                                    streamId, streamKey, keyPath, true);
                             }
                         }
                         if (read.result() == null
                                 && !(write.failure() instanceof KeyAlreadyExistsException)) {
                             return CompletableFuture.failedFuture(write.failure());
                         }
-                        return internalGenerateStreamId(Optional.of(streamKey));
+                        if (retryAttempt >= MAX_KEYED_ALLOCATION_RETRIES) {
+                            return CompletableFuture.failedFuture(new IllegalStateException(
+                                "Keyed stream-ID allocation exhausted retries for " + keyPath,
+                                write.failure()));
+                        }
+                        long delayMillis = KEYED_ALLOCATION_RETRY_DELAY_MS << retryAttempt;
+                        log.warn("Retrying keyed stream-ID allocation for {} after a mapping "
+                                + "conflict (attempt {}/{})", keyPath, retryAttempt + 1,
+                            MAX_KEYED_ALLOCATION_RETRIES);
+                        return CompletableFuture.runAsync(
+                                () -> { }, CompletableFuture.delayedExecutor(
+                                    delayMillis, TimeUnit.MILLISECONDS))
+                            .thenCompose(ignored -> internalAllocateStreamId(
+                                Optional.of(streamKey), retryAttempt + 1));
                     });
             });
     }
 
-    private CompletableFuture<Long> ensureStreamRegistered(long streamId, String key) {
+    private CompletableFuture<Long> ensureStreamRegistered(
+            long streamId, String key) {
         return registerStream(streamId, key)
             .handle((registered, failure) -> new RegistrationWriteResult(
                 registered, failure == null ? null
                     : FutureUtils.unwrapCompletionException(failure)))
             .thenCompose(write -> {
                 if (write.failure() == null) {
-                    return CompletableFuture.completedFuture(write.streamId());
+                    return CompletableFuture.completedFuture(write.registration());
                 }
                 String path = STREAM_REGISTER_PATH + "/" + streamId;
                 return oxiaClient.get(path)
@@ -384,13 +439,60 @@ public class PersistStorageApi implements StorageApi {
             });
     }
 
+    private CompletableFuture<StreamIdAllocation> completeKeyedAllocation(
+            long streamId, String streamKey, String keyPath,
+            boolean createdKeyedMapping) {
+        return ensureStreamRegistered(streamId, streamKey)
+            .thenCompose(registeredStreamId -> validateKeyedAllocation(
+                registeredStreamId, keyPath, createdKeyedMapping));
+    }
+
+    private CompletableFuture<StreamIdAllocation> validateKeyedAllocation(
+            long streamId, String keyPath,
+            boolean createdKeyedMapping) {
+        Set<GetOption> getOptions = Set.of(
+            GetOption.PartitionKey(STREAM_ID_GENERATOR_PATH));
+        return oxiaClient.get(keyPath, getOptions)
+            .handle((current, failure) -> new MappingReadResult(
+                current, failure == null ? null
+                    : FutureUtils.unwrapCompletionException(failure)))
+            .thenCompose(read -> {
+                Throwable invalidation = read.failure();
+                if (invalidation == null && read.result() != null) {
+                    try {
+                        long mappedStreamId = Long.parseLong(new String(
+                            read.result().value(), StandardCharsets.UTF_8));
+                        if (mappedStreamId == streamId) {
+                            return CompletableFuture.completedFuture(
+                                new StreamIdAllocation(
+                                    streamId, createdKeyedMapping));
+                        }
+                    } catch (RuntimeException e) {
+                        invalidation = e;
+                    }
+                }
+                if (invalidation == null) {
+                    invalidation = new IllegalStateException(
+                        "Keyed stream-ID mapping changed while registering " + keyPath);
+                }
+                // Registration is shared by every allocator that observes the same keyed mapping.
+                // Even when this call created it, a concurrent allocator may already have reused
+                // and published the registration. Only the lifecycle-aware catalog can prove that
+                // the stream ID is no longer referenced, so this layer must preserve it.
+                return CompletableFuture.failedFuture(
+                    new KeyedAllocationInvalidatedException(
+                        new StreamIdAllocation(streamId, createdKeyedMapping), invalidation));
+            });
+    }
+
     private record MappingWriteResult(Throwable failure) {
     }
 
     private record MappingReadResult(GetResult result, Throwable failure) {
     }
 
-    private record RegistrationWriteResult(Long streamId, Throwable failure) {
+    private record RegistrationWriteResult(
+            Long registration, Throwable failure) {
     }
 
     private CompletableFuture<Long> generateId() {

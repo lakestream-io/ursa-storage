@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
@@ -26,6 +27,7 @@ import io.lakestream.api.LogId;
 import io.lakestream.api.LogStateManager;
 import io.lakestream.api.LogStorage;
 import io.lakestream.api.Position;
+import io.lakestream.api.StreamIdentifier;
 import io.lakestream.ursa.lakestream.reader.CompactedObjectReader;
 import io.lakestream.ursa.lakestream.reader.CompactedObjectReaderFactory;
 import io.lakestream.ursa.lakestream.reader.NoopCompactedObjectReaderFactory;
@@ -42,6 +44,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
@@ -205,6 +208,29 @@ class StreamCatalogServiceTest {
         closeOrder.verify(storage).close();
         closeOrder.verify(oxiaClient).close();
         closeOrder.verify(telemetry).close();
+    }
+
+    @Test
+    void storageCapabilityDisablesDeletionBeforeCatalogPersistence() throws Exception {
+        Properties properties = localProperties();
+        UrsaStorage storage = mock(UrsaStorage.class);
+        StorageApi storageApi = mock(StorageApi.class);
+        AsyncOxiaClient oxiaClient = mock(AsyncOxiaClient.class);
+        when(storageApi.supportsConditionalStreamIdMappingDeletion()).thenReturn(false);
+        StreamCatalogService service = bootstrapService(storage, storageApi, oxiaClient);
+        IndexedStreamCatalog catalog = service.open("oxia://unused/catalog", properties);
+        StreamIdentifier stream = new StreamIdentifier("public/default", "topic");
+
+        assertInstanceOf(UnsupportedOperationException.class,
+            assertThrows(CompletionException.class,
+                () -> catalog.deleteExternalPartition(stream, 0).join()).getCause());
+        assertInstanceOf(UnsupportedOperationException.class,
+            assertThrows(CompletionException.class,
+                () -> catalog.dropStream(stream, true).join()).getCause());
+
+        verify(oxiaClient, never()).get(anyString());
+        verify(oxiaClient, never()).put(anyString(), any(byte[].class), any());
+        catalog.close();
     }
 
     @Test

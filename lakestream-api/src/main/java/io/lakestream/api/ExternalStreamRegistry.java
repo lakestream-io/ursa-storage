@@ -29,6 +29,10 @@ public interface ExternalStreamRegistry extends AutoCloseable {
      * @param partitionCount the complete logical partition count, which must be positive
      * @param properties stream properties to use when first registering the stream
      * @return a future that completes when the logical stream is registered
+     * @throws io.lakestream.api.exception.AlreadyExistsException if the identifier belongs to a
+     *     native stream or an incompatible registration lifecycle
+     * @throws io.lakestream.api.exception.NoSuchStreamException if the identifier has a durable
+     *     permanent-deletion fence
      */
     CompletableFuture<Void> registerExternalStream(StreamIdentifier id, int partitionCount,
                                                    Map<String, String> properties);
@@ -42,21 +46,32 @@ public interface ExternalStreamRegistry extends AutoCloseable {
      * identity must never be revived by a stale registration.
      *
      * @param id the partition-stripped stream identity
-     * @return a future that completes when the logical stream registration is absent
+     * @return a future that completes when a durable unregistered state is recorded
+     * @throws io.lakestream.api.exception.AlreadyExistsException if the identifier belongs to a
+     *     native stream or has an in-progress external provisioning claim
      */
     CompletableFuture<Void> unregisterExternalStream(StreamIdentifier id);
 
     /**
      * Permanently deletes an externally managed stream identity.
      *
-     * <p>Unlike {@link #unregisterExternalStream(StreamIdentifier)}, this operation records a
-     * durable deletion fence. All subsequent and already in-flight registrations for the same
-     * identifier are suppressed. Use this operation only when the external identity is immutable
-     * and will never become valid again; a replacement resource must use a new identifier.
+     * <p>Unlike {@link #unregisterExternalStream(StreamIdentifier)}, this operation retains a
+     * durable deletion-tombstone record. Registrations that observe the fence are rejected. Any
+     * partition metadata, keyed mappings, or logs written before the fence became visible are
+     * cleaned through the partition lifecycle and are not synchronously rolled back by this
+     * metadata-only operation. The tombstone may retain the prior partition count and properties as
+     * cleanup context. Use this operation only when the external identity is immutable and will
+     * never become valid again; a replacement resource must use a new identifier.
      *
      * @param id the immutable stream identity to delete permanently
-     * @return a future that completes when the deletion fence is durable and the registration is
-     *     absent
+     * @return a future that completes when the retained deletion fence is durable
+     * @throws io.lakestream.api.exception.AlreadyExistsException if the identifier belongs to a
+     *     native stream or has an in-progress external provisioning claim
+     * @throws UnsupportedOperationException if the registry implementation does not support
+     *     permanent deletion
      */
-    CompletableFuture<Void> permanentlyDeleteExternalStream(StreamIdentifier id);
+    default CompletableFuture<Void> permanentlyDeleteExternalStream(StreamIdentifier id) {
+        throw new UnsupportedOperationException(
+            "Permanent external stream deletion is not supported by this registry");
+    }
 }
