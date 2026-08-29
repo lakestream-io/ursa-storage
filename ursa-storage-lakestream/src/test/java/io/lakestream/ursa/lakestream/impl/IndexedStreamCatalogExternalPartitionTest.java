@@ -7,8 +7,10 @@ package io.lakestream.ursa.lakestream.impl;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -20,15 +22,25 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.lakestream.api.Log;
 import io.lakestream.api.LogId;
 import io.lakestream.api.LogStorage;
+import io.lakestream.api.Partitioning;
+import io.lakestream.api.PartitioningStrategy;
+import io.lakestream.api.SchemaConfig;
+import io.lakestream.api.StreamConfig;
 import io.lakestream.api.StreamIdentifier;
-import io.lakestream.api.exception.AlreadyExistsException;
 import io.lakestream.api.exception.NoSuchStreamException;
+import io.lakestream.api.exception.PartitionLifecycleFencedException;
 import io.lakestream.ursa.catalog.metadata.LogMetadata;
 import io.lakestream.ursa.catalog.metadata.LogMetadataSerde;
 import io.lakestream.ursa.lakestream.reader.CompactedObjectReader;
 import io.lakestream.ursa.lakestream.reader.CompactedObjectReaderFactory;
+import io.lakestream.ursa.storage.StorageApi;
+import io.lakestream.ursa.storage.StorageApi.ActiveStreamIdMapping;
 import io.lakestream.ursa.storage.StorageApi.KeyedAllocationInvalidatedException;
 import io.lakestream.ursa.storage.StorageApi.StreamIdAllocation;
+import io.lakestream.ursa.storage.StorageApi.StreamIdMappingConflictException;
+import io.lakestream.ursa.storage.StorageApi.StreamIdMappingFence;
+import io.lakestream.ursa.storage.StorageApi.StreamIdMappingFenceResult;
+import io.lakestream.ursa.storage.StorageApi.StreamIdMappingOwner;
 import io.lakestream.ursa.storage.impl.exception.NoSuchKeyException;
 import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.GetResult;
@@ -41,6 +53,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.Set;
@@ -181,11 +194,11 @@ class IndexedStreamCatalogExternalPartitionTest {
         assertThat(retained.path("_incarnationId").asText()).isEqualTo(incarnation);
         assertThat(retained.path("_creationKind").asText()).isEqualTo("EXTERNAL");
         assertThat(retained.path("_metadataSourceGeneration").asLong()).isEqualTo(1L);
-        assertThat(retained.path("_ownerGeneration").asLong()).isEqualTo(2L);
+        assertThat(retained.path("_ownerGeneration").asLong()).isEqualTo(1L);
         assertThat(catalog.streamExists(stream).join()).isFalse();
         LogMetadata tombstone = metadata(metadata);
         assertThat(tombstone.deleted()).isTrue();
-        assertThat(tombstone.registrationOwnerGeneration()).isEqualTo(2L);
+        assertThat(tombstone.registrationOwnerGeneration()).isEqualTo(1L);
         verify(logStorage).deleteLog(LogId.of(41L));
         assertThat(mappingDeletes).containsExactly(logName + ":41");
     }
@@ -234,23 +247,22 @@ class IndexedStreamCatalogExternalPartitionTest {
         LogMetadata tombstone = metadata(metadata);
         assertThat(tombstone.deleted()).isTrue();
         assertThat(tombstone.streamId()).isEqualTo(90L);
-        assertThat(tombstone.registrationOwnerGeneration()).isEqualTo(2L);
+        assertThat(tombstone.registrationOwnerGeneration()).isEqualTo(1L);
         verify(logStorage).deleteLog(LogId.of(90L));
         verify(logStorage).deleteLog(LogId.of(91L));
-        assertThat(mappingDeletes).containsExactly(
-            logName + ":90", logName + ":91");
+        assertThat(mappingDeletes).containsExactly(logName + ":91");
         verify(readerFactory, never()).open(anyString());
     }
 
     @Test
-    void deletionFenceAfterIdGenerationPreservesPotentiallySharedAllocation() {
+    void deletionFenceAfterIdGenerationPreservesPotentiallySharedAllocation() throws Exception {
         int partition = 2;
         String logName = paths.compactedReaderName(stream, partition);
         String configPath = paths.streamConfigPath(stream);
-        when(oxiaClient.get(configPath))
-            .thenReturn(CompletableFuture.completedFuture(activeLegacyConfig(configPath, VERSION)))
-            .thenReturn(CompletableFuture.completedFuture(
-                permanentDeletion(configPath, VERSION)));
+        String metadataPath = paths.partitionMetadataPath(stream, partition);
+        VersionedRecord config = mockVersionedRecord(
+            configPath, activeLegacyConfigBytes(partition + 1));
+        VersionedRecord metadata = mockVersionedRecord(metadataPath, null);
         CompletableFuture<Long> allocation = new CompletableFuture<>();
         @SuppressWarnings("unchecked")
         BiFunction<String, Long, CompletableFuture<Void>> mappingDeleter =
@@ -262,14 +274,22 @@ class IndexedStreamCatalogExternalPartitionTest {
 
         CompletableFuture<Log> opened =
             catalog.openExternalPartition(stream, partition, Map.of());
+        assertThat(opened).isNotDone();
+        catalog.permanentlyDeleteExternalStream(stream).join();
         allocation.complete(41L);
 
         assertThatThrownBy(opened::join)
             .isInstanceOf(CompletionException.class)
             .hasCauseInstanceOf(NoSuchStreamException.class);
-        verify(logStorage, never()).deleteLog(LogId.of(41L));
-        verify(mappingDeleter, never()).apply(logName, 41L);
-        verify(oxiaClient, never()).get(paths.partitionMetadataPath(stream, partition));
+        verify(logStorage).deleteLog(LogId.of(41L));
+        verify(mappingDeleter).apply(logName, 41L);
+        LogMetadata tombstone = metadata(metadata);
+        assertThat(tombstone.deleted()).isTrue();
+        assertThat(tombstone.streamId()).isEqualTo(41L);
+        assertThat(tombstone.retiredStreamIds()).isEmpty();
+        assertThat(tombstone.purgeableRetiredStreamIds()).isEmpty();
+        assertThat(json(config).path("_provisioningState").asText())
+            .isEqualTo("PERMANENTLY_DELETED");
     }
 
     @Test
@@ -360,28 +380,29 @@ class IndexedStreamCatalogExternalPartitionTest {
         String metadataPath = paths.partitionMetadataPath(stream, partition);
         VersionedRecord config = mockVersionedRecord(configPath, null);
         VersionedRecord metadata = mockVersionedRecord(metadataPath, null);
-        CompletableFuture<Long> allocation = new CompletableFuture<>();
-        List<Long> mappingDeletes = new ArrayList<>();
-        IndexedStreamCatalog catalog = catalog(
-            ignored -> CompletableFuture.completedFuture(allocatedStreamId),
-            ignored -> allocation,
-            ignored -> CompletableFuture.failedFuture(new NoSuchKeyException(logName)),
-            (key, expectedStreamId) -> {
-                assertThat(key).isEqualTo(logName);
-                mappingDeletes.add(expectedStreamId);
-                return CompletableFuture.completedFuture(null);
+        CompletableFuture<StreamIdAllocation> allocation = new CompletableFuture<>();
+        FencedMappingHarness mappings = new FencedMappingHarness(
+            logName, allocatedStreamId + 1);
+        when(mappings.storageApi().allocateStreamId(
+                anyString(), any(StreamIdMappingOwner.class), any()))
+            .thenAnswer(invocation -> {
+                mappings.installActive(allocatedStreamId,
+                    invocation.getArgument(1, StreamIdMappingOwner.class));
+                return allocation;
             });
+        IndexedStreamCatalog catalog = fencedCatalog(mappings.storageApi());
 
         CompletableFuture<Log> opened =
             catalog.openExternalPartition(stream, partition, Map.of());
         assertThat(opened).isNotDone();
+        assertThat(mappings.activeStreamId()).contains(allocatedStreamId);
 
         assertThat(catalog.dropStream(stream, true).join()).isTrue();
         assertThat(json(config).path("_provisioningState").asText())
             .isEqualTo("DROPPED");
-        assertThat(metadata(metadata).streamId()).isEqualTo(-1L);
+        assertThat(metadata(metadata).streamId()).isEqualTo(allocatedStreamId);
 
-        allocation.complete(allocatedStreamId);
+        allocation.complete(new StreamIdAllocation(allocatedStreamId, true));
 
         assertThatThrownBy(opened::join)
             .isInstanceOf(CompletionException.class)
@@ -389,10 +410,11 @@ class IndexedStreamCatalogExternalPartitionTest {
         assertThat(json(config).path("_provisioningState").asText())
             .isEqualTo("DROPPED");
         assertThat(metadata(metadata).deleted()).isTrue();
-        assertThat(metadata(metadata).streamId()).isEqualTo(-1L);
-        assertThat(metadata(metadata).retiredStreamIds()).containsExactly(allocatedStreamId);
-        verify(logStorage).deleteLog(LogId.of(allocatedStreamId));
-        assertThat(mappingDeletes).containsExactly(allocatedStreamId);
+        assertThat(metadata(metadata).streamId()).isEqualTo(allocatedStreamId);
+        assertThat(metadata(metadata).retiredStreamIds()).isEmpty();
+        assertThat(metadata(metadata).purgeableRetiredStreamIds()).isEmpty();
+        assertThat(mappings.activeStreamId()).isEmpty();
+        verify(logStorage, atLeastOnce()).deleteLog(LogId.of(allocatedStreamId));
         verify(readerFactory, never()).open(anyString());
     }
 
@@ -405,25 +427,26 @@ class IndexedStreamCatalogExternalPartitionTest {
         String metadataPath = paths.partitionMetadataPath(stream, partition);
         VersionedRecord config = mockVersionedRecord(configPath, null);
         VersionedRecord metadata = mockVersionedRecord(metadataPath, null);
-        CompletableFuture<Long> allocation = new CompletableFuture<>();
+        CompletableFuture<StreamIdAllocation> allocation = new CompletableFuture<>();
         RuntimeException validationFailure = new RuntimeException("mapping validation failed");
         KeyedAllocationInvalidatedException invalidated =
             new KeyedAllocationInvalidatedException(
                 new StreamIdAllocation(allocatedStreamId, false), validationFailure);
-        List<Long> mappingDeletes = new ArrayList<>();
-        IndexedStreamCatalog catalog = catalog(
-            ignored -> CompletableFuture.completedFuture(allocatedStreamId),
-            ignored -> allocation,
-            ignored -> CompletableFuture.failedFuture(new NoSuchKeyException(logName)),
-            (key, expectedStreamId) -> {
-                assertThat(key).isEqualTo(logName);
-                mappingDeletes.add(expectedStreamId);
-                return CompletableFuture.completedFuture(null);
-            }, false);
+        FencedMappingHarness mappings = new FencedMappingHarness(
+            logName, allocatedStreamId + 1);
+        when(mappings.storageApi().allocateStreamId(
+                anyString(), any(StreamIdMappingOwner.class), any()))
+            .thenAnswer(invocation -> {
+                mappings.installActive(allocatedStreamId,
+                    invocation.getArgument(1, StreamIdMappingOwner.class));
+                return allocation;
+            });
+        IndexedStreamCatalog catalog = fencedCatalog(mappings.storageApi());
 
         CompletableFuture<Log> opened =
             catalog.openExternalPartition(stream, partition, Map.of());
         assertThat(opened).isNotDone();
+        assertThat(mappings.activeStreamId()).contains(allocatedStreamId);
 
         assertThat(catalog.dropStream(stream, true).join()).isTrue();
         allocation.completeExceptionally(invalidated);
@@ -434,10 +457,11 @@ class IndexedStreamCatalogExternalPartitionTest {
         assertThat(invalidated.getCause()).isSameAs(validationFailure);
         assertThat(json(config).path("_provisioningState").asText())
             .isEqualTo("DROPPED");
-        assertThat(metadata(metadata).streamId()).isEqualTo(-1L);
-        assertThat(metadata(metadata).retiredStreamIds()).containsExactly(allocatedStreamId);
-        verify(logStorage).deleteLog(LogId.of(allocatedStreamId));
-        assertThat(mappingDeletes).containsExactly(allocatedStreamId);
+        assertThat(metadata(metadata).streamId()).isEqualTo(allocatedStreamId);
+        assertThat(metadata(metadata).retiredStreamIds()).isEmpty();
+        assertThat(metadata(metadata).purgeableRetiredStreamIds()).isEmpty();
+        assertThat(mappings.activeStreamId()).isEmpty();
+        verify(logStorage, atLeastOnce()).deleteLog(LogId.of(allocatedStreamId));
         verify(readerFactory, never()).open(anyString());
     }
 
@@ -527,7 +551,7 @@ class IndexedStreamCatalogExternalPartitionTest {
         assertThat(catalog.dropStream(stream, false).join()).isTrue();
         LogMetadata initialTombstone = metadata(metadata);
         assertThat(initialTombstone.streamId()).isEqualTo(publishedStreamId);
-        assertThat(initialTombstone.retiredStreamIds()).containsExactly(publishedStreamId);
+        assertThat(initialTombstone.retiredStreamIds()).isEmpty();
         verify(logStorage, never()).deleteLog(LogId.of(publishedStreamId));
 
         mapping.set(staleStreamId);
@@ -538,8 +562,7 @@ class IndexedStreamCatalogExternalPartitionTest {
             .hasCauseInstanceOf(NoSuchStreamException.class);
         LogMetadata completedTombstone = metadata(metadata);
         assertThat(completedTombstone.streamId()).isEqualTo(publishedStreamId);
-        assertThat(completedTombstone.retiredStreamIds())
-            .containsExactly(publishedStreamId, staleStreamId);
+        assertThat(completedTombstone.retiredStreamIds()).isEmpty();
         verify(logStorage, never()).deleteLog(LogId.of(publishedStreamId));
         verify(logStorage).deleteLog(LogId.of(staleStreamId));
         assertThat(mapping).hasValue(null);
@@ -611,7 +634,7 @@ class IndexedStreamCatalogExternalPartitionTest {
             .containsExactly(publishedStreamId, staleStreamId);
         assertThat(interruptedTombstone.purgeableRetiredStreamIds())
             .containsExactly(staleStreamId);
-        assertThat(mapping).hasValue(staleStreamId);
+        assertThat(mapping).hasValue(null);
         verify(logStorage, never()).deleteLog(LogId.of(publishedStreamId));
 
         CompactedObjectReader reader = mock(CompactedObjectReader.class);
@@ -631,13 +654,11 @@ class IndexedStreamCatalogExternalPartitionTest {
 
         LogMetadata replacement = metadata(metadata);
         assertThat(replacement.streamId()).isEqualTo(replacementStreamId);
-        assertThat(replacement.retiredStreamIds())
-            .containsExactly(publishedStreamId, staleStreamId);
-        assertThat(replacement.purgeableRetiredStreamIds()).containsExactly(staleStreamId);
+        assertThat(replacement.retiredStreamIds()).isEmpty();
+        assertThat(replacement.purgeableRetiredStreamIds()).isEmpty();
         verify(logStorage, never()).deleteLog(LogId.of(publishedStreamId));
         verify(logStorage, times(2)).deleteLog(LogId.of(staleStreamId));
-        assertThat(mappingDeletes).containsExactly(
-            publishedStreamId, publishedStreamId, staleStreamId);
+        assertThat(mappingDeletes).containsExactly(publishedStreamId, staleStreamId);
     }
 
     @Test
@@ -677,11 +698,10 @@ class IndexedStreamCatalogExternalPartitionTest {
         assertThat(catalog.dropStream(stream, false).join()).isTrue();
 
         LogMetadata dropped = metadata(metadata);
-        assertThat(dropped.retiredStreamIds())
-            .containsExactly(retainedStreamId, primaryStreamId);
+        assertThat(dropped.retiredStreamIds()).isEmpty();
         assertThat(dropped.purgeableRetiredStreamIds()).isEmpty();
         assertThat(mapping).hasValue(null);
-        assertThat(mappingDeletes).containsExactly(retainedStreamId, primaryStreamId);
+        assertThat(mappingDeletes).containsExactly(retainedStreamId);
         verify(logStorage, never()).deleteLog(LogId.of(primaryStreamId));
         verify(logStorage, never()).deleteLog(LogId.of(retainedStreamId));
     }
@@ -720,10 +740,8 @@ class IndexedStreamCatalogExternalPartitionTest {
         assertThat(catalog.dropStream(stream, true).join()).isTrue();
 
         LogMetadata dropped = metadata(metadata);
-        assertThat(dropped.retiredStreamIds())
-            .containsExactly(retainedStreamId, primaryStreamId);
-        assertThat(dropped.purgeableRetiredStreamIds())
-            .containsExactly(retainedStreamId, primaryStreamId);
+        assertThat(dropped.retiredStreamIds()).isEmpty();
+        assertThat(dropped.purgeableRetiredStreamIds()).isEmpty();
         assertThat(mapping).hasValue(null);
         verify(logStorage).deleteLog(LogId.of(retainedStreamId));
         verify(logStorage).deleteLog(LogId.of(primaryStreamId));
@@ -897,15 +915,18 @@ class IndexedStreamCatalogExternalPartitionTest {
         String logName = paths.compactedReaderName(stream, partition);
         String configPath = paths.streamConfigPath(stream);
         String metadataPath = paths.partitionMetadataPath(stream, partition);
-        Version changedVersion = version(2);
-        when(oxiaClient.get(configPath))
-            .thenReturn(CompletableFuture.completedFuture(activeLegacyConfig(configPath, VERSION)))
-            .thenReturn(CompletableFuture.completedFuture(activeLegacyConfig(configPath, VERSION)))
-            .thenReturn(CompletableFuture.completedFuture(activeLegacyConfig(configPath, VERSION)))
-            .thenReturn(CompletableFuture.completedFuture(activeLegacyConfig(configPath, VERSION)))
-            .thenReturn(CompletableFuture.completedFuture(
-                activeLegacyConfig(configPath, changedVersion)));
+        VersionedRecord config = mockVersionedRecord(
+            configPath, activeLegacyConfigBytes(partition + 1));
         VersionedRecord metadata = mockVersionedRecord(metadataPath, null);
+        AtomicBoolean invalidateRegistration = new AtomicBoolean();
+        metadata.afterSuccessfulPut(ignored -> {
+            if (!invalidateRegistration.compareAndSet(false, true)) {
+                return;
+            }
+            GetResult current = config.currentResult();
+            config.put(config.currentValue(), Set.of(PutOption.IfVersionIdEquals(
+                current.version().versionId()))).join();
+        });
         @SuppressWarnings("unchecked")
         BiFunction<String, Long, CompletableFuture<Void>> mappingDeleter =
             mock(BiFunction.class);
@@ -934,14 +955,14 @@ class IndexedStreamCatalogExternalPartitionTest {
         String configPath = paths.streamConfigPath(stream);
         String metadataPath = paths.partitionMetadataPath(stream, partition);
         CompletableFuture<GetResult> firstOpenPostWriteVerification = new CompletableFuture<>();
-        AtomicInteger configReadCount = new AtomicInteger();
-        when(oxiaClient.get(configPath)).thenAnswer(ignored -> {
-            if (configReadCount.incrementAndGet() == 4) {
-                return firstOpenPostWriteVerification;
-            }
-            return CompletableFuture.completedFuture(activeLegacyConfig(configPath, VERSION));
-        });
+        VersionedRecord config = mockVersionedRecord(
+            configPath, activeLegacyConfigBytes(partition + 1));
         VersionedRecord metadata = mockVersionedRecord(metadataPath, null);
+        AtomicBoolean blockNextConfigRead = new AtomicBoolean();
+        metadata.afterSuccessfulPut(ignored -> blockNextConfigRead.set(true));
+        config.interceptReads(current -> blockNextConfigRead.compareAndSet(true, false)
+            ? firstOpenPostWriteVerification
+            : CompletableFuture.completedFuture(current));
         AtomicInteger allocations = new AtomicInteger();
         @SuppressWarnings("unchecked")
         BiFunction<String, Long, CompletableFuture<Void>> mappingDeleter =
@@ -964,7 +985,8 @@ class IndexedStreamCatalogExternalPartitionTest {
 
         assertThat(catalog.openExternalPartition(stream, partition, Map.of()).get())
             .isSameAs(log);
-        firstOpenPostWriteVerification.complete(permanentDeletion(configPath, VERSION));
+        firstOpenPostWriteVerification.complete(
+            permanentDeletion(configPath, config.currentResult().version()));
 
         assertThatThrownBy(invalidated::join)
             .isInstanceOf(CompletionException.class)
@@ -1000,20 +1022,20 @@ class IndexedStreamCatalogExternalPartitionTest {
 
         assertThatThrownBy(() -> catalog.openExternalPartition(stream, partition, Map.of()).join())
             .isInstanceOf(CompletionException.class)
-            .hasCauseInstanceOf(AlreadyExistsException.class);
+            .hasCauseInstanceOf(PartitionLifecycleFencedException.class);
 
         LogMetadata current = metadata(metadata);
         assertThat(current.streamId()).isEqualTo(42L);
         assertThat(current.deleted()).isFalse();
-        assertThat(current.retiredStreamIds()).contains(41L);
-        assertThat(mapping).hasValue(null);
-        verify(logStorage).deleteLog(LogId.of(41L));
+        assertThat(current.retiredStreamIds()).isEmpty();
+        assertThat(mapping).hasValue(41L);
+        verify(logStorage, never()).deleteLog(LogId.of(41L));
         verify(readerFactory, never()).open(logName);
         verify(logFactory, never()).create(anyString(), any(), any());
     }
 
     @Test
-    void externalProvisioningTakeoverFencesAThenFinalizesBAndLetsCAdopt() throws Exception {
+    void compatibleExternalProvisioningAdoptsDurableClaimAndFinalizesIt() throws Exception {
         int partition = 0;
         String logName = paths.compactedReaderName(stream, partition);
         String configPath = paths.streamConfigPath(stream);
@@ -1034,12 +1056,14 @@ class IndexedStreamCatalogExternalPartitionTest {
         CompactedObjectReader reader = mock(CompactedObjectReader.class);
         Log recovered = mock(Log.class);
         when(readerFactory.open(logName)).thenReturn(reader);
-        when(logFactory.create(logName, LogId.of(202L), reader)).thenReturn(recovered);
+        when(logFactory.create(logName, LogId.of(101L), reader)).thenReturn(recovered);
         IndexedStreamCatalog catalog = catalog(
             ignored -> CompletableFuture.completedFuture(101L),
-            ignored -> CompletableFuture.completedFuture(
-                allocations.getAndIncrement() == 0 ? 101L : 202L),
-            ignored -> CompletableFuture.completedFuture(202L),
+            ignored -> {
+                allocations.incrementAndGet();
+                return CompletableFuture.completedFuture(101L);
+            },
+            ignored -> CompletableFuture.completedFuture(101L),
             (ignored, streamId) -> CompletableFuture.completedFuture(null));
 
         CompletableFuture<Log> ownerA =
@@ -1054,7 +1078,7 @@ class IndexedStreamCatalogExternalPartitionTest {
         assertThat(metadataOwnedByA.registrationOwnerGeneration())
             .isEqualTo(configOwnedByA.path("_ownerGeneration").asLong());
 
-        catalog.registerExternalPartition(stream, partition, 202L, properties).join();
+        catalog.registerExternalPartition(stream, partition, 101L, properties).join();
 
         JsonNode configOwnedByB = json(config);
         LogMetadata metadataOwnedByB = metadata(metadata);
@@ -1062,32 +1086,31 @@ class IndexedStreamCatalogExternalPartitionTest {
         assertThat(configOwnedByB.path("_incarnationId").asText())
             .isEqualTo(configOwnedByA.path("_incarnationId").asText());
         assertThat(configOwnedByB.path("_ownerToken").asText())
-            .isNotEqualTo(configOwnedByA.path("_ownerToken").asText());
-        assertThat(metadataOwnedByB.streamId()).isEqualTo(202L);
+            .isEqualTo(configOwnedByA.path("_ownerToken").asText());
+        assertThat(configOwnedByB.path("_ownerGeneration").asLong())
+            .isEqualTo(configOwnedByA.path("_ownerGeneration").asLong());
+        assertThat(metadataOwnedByB.streamId()).isEqualTo(101L);
         assertThat(metadataOwnedByB.registrationOwnerToken())
             .isEqualTo(configOwnedByB.path("_ownerToken").asText());
         assertThat(metadataOwnedByB.registrationOwnerGeneration())
             .isEqualTo(configOwnedByB.path("_ownerGeneration").asLong());
         assertThat(metadataOwnedByB.registrationOwnerGeneration())
-            .isGreaterThan(metadataOwnedByA.registrationOwnerGeneration());
+            .isEqualTo(metadataOwnedByA.registrationOwnerGeneration());
 
         assertThat(catalog.openExternalPartition(stream, partition, properties).join())
             .isSameAs(recovered);
-        assertThat(metadata.successfulPuts()).isEqualTo(2);
+        assertThat(metadata.successfulPuts()).isEqualTo(1);
 
         stalePostWriteVerification.complete(config.currentResult());
-        assertThatThrownBy(ownerA::join)
-            .isInstanceOf(CompletionException.class)
-            .hasCauseInstanceOf(NoSuchStreamException.class);
+        assertThat(ownerA.join()).isSameAs(recovered);
         assertThat(allocations).hasValue(2);
-        assertThat(metadata(metadata).streamId()).isEqualTo(202L);
-        verify(logStorage).deleteLog(LogId.of(101L));
-        verify(logStorage, never()).deleteLog(LogId.of(202L));
+        assertThat(metadata(metadata).streamId()).isEqualTo(101L);
+        verify(logStorage, never()).deleteLog(any());
         verify(oxiaClient, never()).delete(eq(metadataPath), any());
     }
 
     @Test
-    void staleOwnerCannotPutAfterNewGenerationFinalizes() throws Exception {
+    void adoptedProvisioningRejectsStaleDifferentIdWrite() throws Exception {
         int partition = 0;
         String logName = paths.compactedReaderName(stream, partition);
         String configPath = paths.streamConfigPath(stream);
@@ -1097,43 +1120,49 @@ class IndexedStreamCatalogExternalPartitionTest {
         VersionedRecord metadata = mockVersionedRecord(metadataPath, null);
         CompletableFuture<GetResult> staleMetadataRead = new CompletableFuture<>();
         AtomicInteger metadataReads = new AtomicInteger();
-        metadata.interceptReads(current -> metadataReads.incrementAndGet() == 2
+        metadata.interceptReads(current -> metadataReads.incrementAndGet() == 3
             ? staleMetadataRead : CompletableFuture.completedFuture(current));
-        IndexedStreamCatalog catalog = catalog(
-            ignored -> CompletableFuture.completedFuture(101L),
-            ignored -> CompletableFuture.completedFuture(101L),
-            ignored -> CompletableFuture.completedFuture(202L),
-            (ignored, streamId) -> CompletableFuture.completedFuture(null));
+        FencedMappingHarness mappings = new FencedMappingHarness(logName, 101L);
+        CompactedObjectReader reader = mock(CompactedObjectReader.class);
+        Log recovered = mock(Log.class);
+        when(readerFactory.open(logName)).thenReturn(reader);
+        when(logFactory.create(logName, LogId.of(101L), reader)).thenReturn(recovered);
+        IndexedStreamCatalog catalog = fencedCatalog(mappings.storageApi());
 
         CompletableFuture<Log> ownerA =
             catalog.openExternalPartition(stream, partition, properties);
         assertThat(ownerA).isNotDone();
         JsonNode ownerAConfig = json(config);
         assertThat(ownerAConfig.path("_ownerGeneration").asLong()).isEqualTo(1L);
+        assertThat(mappings.activeStreamId()).contains(101L);
 
-        catalog.registerExternalPartition(stream, partition, 202L, properties).join();
+        assertThatThrownBy(() -> catalog.registerExternalPartition(
+                stream, partition, 202L, properties).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(PartitionLifecycleFencedException.class)
+            .hasMessageContaining("different durable owner or ID");
 
-        JsonNode ownerBConfig = json(config);
-        assertThat(ownerBConfig.path("_provisioning").asBoolean(false)).isFalse();
-        assertThat(ownerBConfig.path("_ownerGeneration").asLong()).isEqualTo(2L);
-        assertThat(metadata(metadata).streamId()).isEqualTo(202L);
-        assertThat(metadata(metadata).registrationOwnerGeneration()).isEqualTo(2L);
+        JsonNode adoptedConfig = json(config);
+        assertThat(adoptedConfig.path("_provisioning").asBoolean()).isTrue();
+        assertThat(adoptedConfig.path("_ownerGeneration").asLong()).isEqualTo(1L);
+        assertThat(adoptedConfig.path("_ownerToken").asText())
+            .isEqualTo(ownerAConfig.path("_ownerToken").asText());
+        assertThat(metadata.currentResult()).isNull();
+        assertThat(mappings.activeStreamId()).contains(101L);
 
         staleMetadataRead.complete(null);
-        assertThatThrownBy(ownerA::join)
-            .isInstanceOf(CompletionException.class)
-            .hasCauseInstanceOf(NoSuchStreamException.class);
-        assertThat(metadata(metadata).streamId()).isEqualTo(202L);
-        assertThat(metadata(metadata).registrationOwnerGeneration()).isEqualTo(2L);
-        assertThat(metadata.successfulPuts()).isEqualTo(2);
-        assertThat(metadata.putAttempts()).isEqualTo(3);
+        assertThat(ownerA.join()).isSameAs(recovered);
+        assertThat(json(config).path("_provisioning").asBoolean(false)).isFalse();
+        assertThat(metadata(metadata).streamId()).isEqualTo(101L);
+        assertThat(metadata(metadata).registrationOwnerGeneration()).isEqualTo(1L);
         LogMetadata current = metadata(metadata);
-        assertThat(current.retiredStreamIds()).containsExactly(101L);
-        assertThat(current.purgeableRetiredStreamIds()).containsExactly(101L);
-        assertThat(current.retiredStreamMappings())
-            .containsExactly(new LogMetadata.RetiredStreamMapping(101L, logName));
-        assertThat(current.retiredMappingKeys()).containsExactly(logName);
-        verify(logStorage).deleteLog(LogId.of(101L));
+        assertThat(current.retiredStreamIds()).isEmpty();
+        assertThat(current.purgeableRetiredStreamIds()).isEmpty();
+        assertThat(current.retiredStreamMappings()).isEmpty();
+        assertThat(current.retiredMappingKeys()).isEmpty();
+        assertThat(mappings.bindCalls()).isEqualTo(1);
+        assertThat(mappings.fenceCalls()).isZero();
+        verify(logStorage, never()).deleteLog(LogId.of(101L));
         verify(logStorage, never()).deleteLog(LogId.of(202L));
     }
 
@@ -1169,7 +1198,9 @@ class IndexedStreamCatalogExternalPartitionTest {
         catalog.deleteExternalPartition(stream, partition).get();
 
         assertThat(deletionOrder)
-            .containsExactly("metadata-tombstone", "data", "mapping:" + logName);
+            .containsSubsequence(
+                "metadata-tombstone", "mapping:" + logName,
+                "data", "metadata-tombstone");
         assertThat(metadata(metadata).deleted()).isTrue();
         assertThat(metadata(metadata).streamId()).isEqualTo(52L);
         verify(oxiaClient, never()).delete(eq(metadataPath), any());
@@ -1204,7 +1235,7 @@ class IndexedStreamCatalogExternalPartitionTest {
         assertThat(tombstone.deleted()).isTrue();
         assertThat(tombstone.streamId()).isEqualTo(concurrentStreamId);
         verify(logStorage).deleteLog(LogId.of(concurrentStreamId));
-        assertThat(mappingDeletes).containsExactly(concurrentStreamId);
+        assertThat(mappingDeletes).isEmpty();
     }
 
     @Test
@@ -1376,7 +1407,7 @@ class IndexedStreamCatalogExternalPartitionTest {
             .isEqualTo("PERMANENTLY_DELETED");
         LogMetadata tombstone = metadata(metadata);
         assertThat(tombstone.deleted()).isTrue();
-        assertThat(tombstone.registrationOwnerGeneration()).isEqualTo(2L);
+        assertThat(tombstone.registrationOwnerGeneration()).isEqualTo(1L);
         verify(logStorage, times(2)).deleteLog(LogId.of(152L));
         assertThat(mappingDeletes).containsExactly(logName);
     }
@@ -1414,7 +1445,7 @@ class IndexedStreamCatalogExternalPartitionTest {
 
         assertThat(metadata(metadata).registrationIncarnationId()).isEqualTo(incarnation);
         verify(logStorage).deleteLog(LogId.of(153L));
-        verify(mappingDeleter, never()).apply(anyString());
+        verify(mappingDeleter).apply(anyString());
     }
 
     @Test
@@ -1491,7 +1522,7 @@ class IndexedStreamCatalogExternalPartitionTest {
         assertThat(replacement.streamId()).isEqualTo(replacementStreamId);
         assertThat(replacement.registrationIncarnationId()).isEqualTo(incarnation);
         assertThat(replacement.registrationOwnerGeneration()).isEqualTo(2L);
-        assertThat(replacement.retiredStreamIds()).containsExactly(retiredStreamId);
+        assertThat(replacement.retiredStreamIds()).isEmpty();
         assertThat(mapping).hasValue(replacementStreamId);
         assertThat(mappingDeletes).containsExactly(retiredStreamId);
 
@@ -1523,33 +1554,22 @@ class IndexedStreamCatalogExternalPartitionTest {
             metadataPath, metadataBytes(
                 metadataPath, retiredStreamId, incarnation,
                 "generation-1-owner", 1L, true));
-        AtomicReference<Long> mapping = new AtomicReference<>(retiredStreamId);
-        AtomicInteger mappingDeleteAttempts = new AtomicInteger();
-        IndexedStreamCatalog catalog = catalog(
-            ignored -> CompletableFuture.completedFuture(retiredStreamId),
-            ignored -> {
-                mapping.set(retiredStreamId);
-                return CompletableFuture.completedFuture(retiredStreamId);
-            },
-            key -> mapping.get() == null
-                ? CompletableFuture.failedFuture(new NoSuchKeyException(key))
-                : CompletableFuture.completedFuture(mapping.get()),
-            (key, expectedStreamId) -> {
-                assertThat(key).isEqualTo(logName);
-                mappingDeleteAttempts.incrementAndGet();
-                mapping.set(null);
-                return CompletableFuture.completedFuture(null);
-            });
+        StreamIdMappingOwner retiredOwner = new StreamIdMappingOwner(
+            incarnation, "generation-1-owner", 1L);
+        FencedMappingHarness mappings = new FencedMappingHarness(
+            logName, retiredStreamId, retiredOwner, retiredStreamId);
+        mappings.fence(logName, retiredStreamId, retiredOwner).join();
+        IndexedStreamCatalog catalog = fencedCatalog(mappings.storageApi());
 
         catalog.unregisterExternalStream(stream).join();
 
         assertThatThrownBy(() ->
                 catalog.openExternalPartition(stream, partition, Map.of()).join())
             .isInstanceOf(CompletionException.class)
-            .hasCauseInstanceOf(AlreadyExistsException.class)
-            .hasMessageContaining("must use a fresh physical stream ID");
+            .hasCauseInstanceOf(PartitionLifecycleFencedException.class)
+            .hasMessageContaining("allocator returned a retired physical stream ID");
 
-        assertThat(mapping.get()).isNull();
+        assertThat(mappings.activeStreamId()).contains(retiredStreamId);
         LogMetadata retired = metadata(metadata);
         assertThat(retired.deleted()).isTrue();
         assertThat(retired.streamId()).isEqualTo(retiredStreamId);
@@ -1561,7 +1581,8 @@ class IndexedStreamCatalogExternalPartitionTest {
         assertThat(metadata.successfulPuts()).isEqualTo(1);
         assertThat(json(config).path("_provisioningState").asText())
             .isEqualTo("PROVISIONING");
-        assertThat(mappingDeleteAttempts).hasValue(1);
+        assertThat(mappings.bindCalls()).isZero();
+        assertThat(mappings.fenceCalls()).isBetween(2, 5);
         verify(logStorage, never()).deleteLog(LogId.of(retiredStreamId));
         verify(readerFactory, never()).open(anyString());
     }
@@ -1631,21 +1652,19 @@ class IndexedStreamCatalogExternalPartitionTest {
 
         catalog.deleteExternalPartition(stream, partition).get();
 
-        assertThat(deletionOrder)
-            .containsExactly(
-                "metadata-tombstone", "metadata-tombstone",
-                "data", "mapping:" + logName);
+        assertThat(deletionOrder).containsExactly(
+            "metadata-tombstone", "mapping:" + logName,
+            "metadata-tombstone", "data", "metadata-tombstone");
         LogMetadata tombstone = metadata(metadata);
-        assertThat(tombstone.streamId()).isEqualTo(-1L);
+        assertThat(tombstone.streamId()).isEqualTo(63L);
         assertThat(tombstone.registrationIncarnationId()).isEqualTo(incarnation);
         assertThat(tombstone.registrationOwnerToken()).isEqualTo(owner);
         assertThat(tombstone.registrationOwnerGeneration()).isEqualTo(1L);
         assertThat(tombstone.deleted()).isTrue();
-        assertThat(tombstone.retiredStreamIds()).containsExactly(63L);
-        assertThat(tombstone.purgeableRetiredStreamIds()).containsExactly(63L);
-        assertThat(tombstone.retiredStreamMappings())
-            .containsExactly(new LogMetadata.RetiredStreamMapping(63L, logName));
-        assertThat(tombstone.retiredMappingKeys()).containsExactly(logName);
+        assertThat(tombstone.retiredStreamIds()).isEmpty();
+        assertThat(tombstone.purgeableRetiredStreamIds()).isEmpty();
+        assertThat(tombstone.retiredStreamMappings()).isEmpty();
+        assertThat(tombstone.retiredMappingKeys()).isEmpty();
     }
 
     @Test
@@ -1673,10 +1692,15 @@ class IndexedStreamCatalogExternalPartitionTest {
 
         assertThat(metadata(metadata).deleted()).isTrue();
         LogMetadata tombstone = metadata(metadata);
-        assertThat(tombstone.streamId()).isEqualTo(-1L);
+        assertThat(tombstone.streamId()).isEqualTo(74L);
         assertThat(tombstone.retiredStreamIds()).containsExactly(74L);
         assertThat(tombstone.purgeableRetiredStreamIds()).containsExactly(74L);
-        verify(mappingDeleter, never()).apply(anyString());
+        assertThat(tombstone.retiredStreamMappings()).containsExactly(
+            new LogMetadata.RetiredStreamMapping(74L,
+                paths.compactedReaderName(stream, partition), true));
+        assertThat(tombstone.retiredMappingKeys()).containsExactly(
+            paths.compactedReaderName(stream, partition));
+        verify(mappingDeleter).apply(paths.compactedReaderName(stream, partition));
         verify(oxiaClient, never()).delete(eq(metadataPath), any());
     }
 
@@ -1747,10 +1771,10 @@ class IndexedStreamCatalogExternalPartitionTest {
             .hasCause(mappingFailure);
         catalog.deleteExternalPartition(stream, partition).get();
 
-        assertThat(metadata.successfulPuts()).isEqualTo(1);
+        assertThat(metadata.successfulPuts()).isEqualTo(2);
         assertThat(metadata(metadata).deleted()).isTrue();
-        verify(logStorage, times(2)).deleteLog(LogId.of(107L));
-        assertThat(lookupCount).hasValue(3);
+        verify(logStorage).deleteLog(LogId.of(107L));
+        assertThat(lookupCount).hasValue(2);
         assertThat(mappingDeleteCount).hasValue(2);
     }
 
@@ -1880,8 +1904,8 @@ class IndexedStreamCatalogExternalPartitionTest {
         assertThat(tombstone.registrationOwnerToken()).isEqualTo(owner);
         assertThat(tombstone.registrationOwnerGeneration()).isEqualTo(1L);
         assertThat(tombstone.deleted()).isTrue();
-        assertThat(metadata.successfulPuts()).isEqualTo(1);
-        assertThat(lookupCount).hasValue(4);
+        assertThat(metadata.successfulPuts()).isEqualTo(4);
+        assertThat(lookupCount).hasValue(2);
         verify(logStorage, never()).deleteLog(any());
         verify(mappingDeleter, never()).apply(anyString());
         verify(oxiaClient, never()).delete(eq(metadataPath), any());
@@ -1926,7 +1950,7 @@ class IndexedStreamCatalogExternalPartitionTest {
         assertThatThrownBy(() -> catalog.registerExternalPartition(
                 stream, partition, 201L, Map.of()).join())
             .isInstanceOf(CompletionException.class)
-            .hasCauseInstanceOf(AlreadyExistsException.class);
+            .hasCauseInstanceOf(PartitionLifecycleFencedException.class);
 
         assertThat(metadata.successfulPuts()).isZero();
     }
@@ -1948,7 +1972,7 @@ class IndexedStreamCatalogExternalPartitionTest {
         assertThatThrownBy(() -> catalog.registerExternalPartition(
                 stream, partition, 211L, Map.of()).join())
             .isInstanceOf(CompletionException.class)
-            .hasCauseInstanceOf(AlreadyExistsException.class);
+            .hasCauseInstanceOf(PartitionLifecycleFencedException.class);
 
         assertThat(metadata.successfulPuts()).isZero();
     }
@@ -2016,6 +2040,7 @@ class IndexedStreamCatalogExternalPartitionTest {
     void activeRegistrationRejectsRetiredPhysicalStreamId() throws Exception {
         int partition = 0;
         long retiredStreamId = 312L;
+        String logName = paths.compactedReaderName(stream, partition);
         String configPath = paths.streamConfigPath(stream);
         String metadataPath = paths.partitionMetadataPath(stream, partition);
         String incarnation = "incarnation-current";
@@ -2024,20 +2049,25 @@ class IndexedStreamCatalogExternalPartitionTest {
         VersionedRecord metadata = mockVersionedRecord(metadataPath,
             metadataBytes(metadataPath, 311L, Map.of(), OptionalLong.empty(),
                 incarnation, "owner-stale", 1L, false, Set.of(retiredStreamId)));
-        IndexedStreamCatalog catalog = catalog(
-            ignored -> CompletableFuture.completedFuture(retiredStreamId),
-            ignored -> CompletableFuture.completedFuture(retiredStreamId),
-            ignored -> CompletableFuture.completedFuture(null));
+        StreamIdMappingOwner currentOwner = new StreamIdMappingOwner(
+            incarnation, "owner-current", 2L);
+        FencedMappingHarness mappings = new FencedMappingHarness(
+            logName, 311L, currentOwner, 313L);
+        IndexedStreamCatalog catalog = fencedCatalog(mappings.storageApi());
 
         assertThatThrownBy(() -> catalog.registerExternalPartition(
                 stream, partition, retiredStreamId, Map.of()).join())
             .isInstanceOf(CompletionException.class)
-            .hasCauseInstanceOf(AlreadyExistsException.class)
-            .hasMessageContaining("retired physical stream ID");
+            .hasCauseInstanceOf(PartitionLifecycleFencedException.class)
+            .hasMessageContaining("physical stream ID was already retired");
 
         assertThat(metadata(metadata).streamId()).isEqualTo(311L);
-        assertThat(metadata(metadata).retiredStreamIds()).containsExactly(retiredStreamId);
-        assertThat(metadata.successfulPuts()).isZero();
+        assertThat(metadata(metadata).retiredStreamIds()).isEmpty();
+        assertThat(metadata.successfulPuts()).isEqualTo(1);
+        assertThat(mappings.activeStreamId()).contains(311L);
+        assertThat(mappings.bindCalls()).isZero();
+        assertThat(mappings.fenceCalls()).isZero();
+        verify(logStorage, never()).deleteLog(any());
     }
 
     @Test
@@ -2058,7 +2088,7 @@ class IndexedStreamCatalogExternalPartitionTest {
         assertThatThrownBy(() -> catalog.registerExternalPartition(
                 stream, partition, 312L, Map.of()).join())
             .isInstanceOf(CompletionException.class)
-            .hasCauseInstanceOf(AlreadyExistsException.class);
+            .hasCauseInstanceOf(PartitionLifecycleFencedException.class);
 
         assertThat(metadata(metadata).streamId()).isEqualTo(311L);
         assertThat(metadata.successfulPuts()).isZero();
@@ -2088,7 +2118,7 @@ class IndexedStreamCatalogExternalPartitionTest {
         assertThatThrownBy(() -> catalog.registerExternalPartition(
                 stream, partition, 72L, Map.of()).join())
             .isInstanceOf(CompletionException.class)
-            .hasCauseInstanceOf(AlreadyExistsException.class);
+            .hasCauseInstanceOf(PartitionLifecycleFencedException.class);
         assertThat(metadata(metadata).streamId()).isEqualTo(71L);
 
         catalog.registerExternalPartition(stream, partition, 71L, Map.of()).join();
@@ -2096,12 +2126,12 @@ class IndexedStreamCatalogExternalPartitionTest {
         JsonNode active = json(config);
         assertThat(active.path("_provisioning").asBoolean(false)).isFalse();
         assertThat(active.path("_incarnationId").asText()).isEqualTo(incarnation);
-        assertThat(active.path("_ownerGeneration").asLong()).isEqualTo(3L);
+        assertThat(active.path("_ownerGeneration").asLong()).isEqualTo(2L);
         assertThat(active.path("_metadataSourceGeneration").asLong()).isEqualTo(1L);
         LogMetadata adopted = metadata(metadata);
         assertThat(adopted.streamId()).isEqualTo(71L);
         assertThat(adopted.registrationIncarnationId()).isEqualTo(incarnation);
-        assertThat(adopted.registrationOwnerGeneration()).isEqualTo(3L);
+        assertThat(adopted.registrationOwnerGeneration()).isEqualTo(2L);
     }
 
     @Test
@@ -2131,12 +2161,12 @@ class IndexedStreamCatalogExternalPartitionTest {
             .isNotEqualTo("incarnation-old");
         assertThat(replacement.registrationOwnerToken())
             .isEqualTo(active.path("_ownerToken").asText());
-        assertThat(replacement.retiredStreamIds()).containsExactly(401L);
+        assertThat(replacement.retiredStreamIds()).isEmpty();
         assertThat(metadata.successfulPuts()).isEqualTo(1);
     }
 
     @Test
-    void newIncarnationReplacesLegacyTombstone() throws Exception {
+    void legacyTombstoneRequiresExplicitUnregisterBeforeReplacement() throws Exception {
         int partition = 0;
         String configPath = paths.streamConfigPath(stream);
         String metadataPath = paths.partitionMetadataPath(stream, partition);
@@ -2148,18 +2178,83 @@ class IndexedStreamCatalogExternalPartitionTest {
             ignored -> CompletableFuture.completedFuture(502L),
             ignored -> CompletableFuture.completedFuture(null));
 
+        assertThatThrownBy(() -> catalog.registerExternalPartition(
+                stream, partition, 502L, Map.of()).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(PartitionLifecycleFencedException.class)
+            .hasMessageContaining("unregistering the external stream");
+
+        JsonNode recoveryAnchor = json(config);
+        assertThat(config.successfulPuts()).isEqualTo(1);
+        assertThat(recoveryAnchor.path("_provisioning").asBoolean(false)).isFalse();
+        assertThat(recoveryAnchor.path("_incarnationId").asText()).isNotBlank();
+        assertThat(recoveryAnchor.path("_ownerGeneration").asLong()).isEqualTo(1L);
+        assertThat(metadata(metadata).streamId()).isEqualTo(501L);
+        assertThat(metadata(metadata).deleted()).isTrue();
+        assertThat(metadata.successfulPuts()).isZero();
+
+        catalog.unregisterExternalStream(stream).join();
+        assertThat(json(config).path("_provisioningState").asText())
+            .isEqualTo("UNREGISTERED");
+
         catalog.registerExternalPartition(stream, partition, 502L, Map.of()).join();
 
-        JsonNode active = json(config);
-        LogMetadata replacement = metadata(metadata);
-        assertThat(replacement.streamId()).isEqualTo(502L);
-        assertThat(replacement.deleted()).isFalse();
-        assertThat(replacement.registrationIncarnationId())
-            .isEqualTo(active.path("_incarnationId").asText());
-        assertThat(replacement.registrationOwnerToken())
-            .isEqualTo(active.path("_ownerToken").asText());
-        assertThat(replacement.retiredStreamIds()).containsExactly(501L);
-        assertThat(metadata.successfulPuts()).isEqualTo(1);
+        assertThat(json(config).path("_provisioning").asBoolean(false)).isFalse();
+        assertThat(json(config).path("_ownerGeneration").asLong()).isEqualTo(2L);
+        assertThat(metadata(metadata).streamId()).isEqualTo(502L);
+        assertThat(metadata(metadata).deleted()).isFalse();
+        assertThat(metadata(metadata).registrationOwnerGeneration()).isEqualTo(2L);
+        verify(logStorage, never()).deleteLog(LogId.of(501L));
+    }
+
+    @Test
+    void legacyTombstoneRequiresExplicitUnregisterBeforeOpenReplacement()
+            throws Exception {
+        int partition = 0;
+        long retiredStreamId = 503L;
+        long replacementStreamId = 504L;
+        String logName = paths.compactedReaderName(stream, partition);
+        String configPath = paths.streamConfigPath(stream);
+        String metadataPath = paths.partitionMetadataPath(stream, partition);
+        VersionedRecord config = mockVersionedRecord(configPath, null);
+        VersionedRecord metadata = mockVersionedRecord(
+            metadataPath, metadataBytes(metadataPath, retiredStreamId, null, null, true));
+        AtomicInteger allocations = new AtomicInteger();
+        CompactedObjectReader reader = mock(CompactedObjectReader.class);
+        Log replacement = mock(Log.class);
+        when(readerFactory.open(logName)).thenReturn(reader);
+        when(logFactory.create(logName, LogId.of(replacementStreamId), reader))
+            .thenReturn(replacement);
+        IndexedStreamCatalog catalog = catalog(
+            ignored -> CompletableFuture.completedFuture(replacementStreamId),
+            ignored -> {
+                allocations.incrementAndGet();
+                return CompletableFuture.completedFuture(replacementStreamId);
+            },
+            ignored -> CompletableFuture.failedFuture(new NoSuchKeyException(logName)),
+            (ignored, streamId) -> CompletableFuture.completedFuture(null));
+
+        assertThatThrownBy(() -> catalog.openExternalPartition(
+                stream, partition, Map.of()).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(PartitionLifecycleFencedException.class)
+            .hasMessageContaining("unregistering the external stream");
+
+        assertThat(allocations).hasValue(0);
+        assertThat(config.successfulPuts()).isEqualTo(1);
+        assertThat(json(config).path("_provisioning").asBoolean(false)).isFalse();
+        assertThat(metadata.successfulPuts()).isZero();
+
+        catalog.unregisterExternalStream(stream).join();
+        assertThat(catalog.openExternalPartition(stream, partition, Map.of()).join())
+            .isSameAs(replacement);
+
+        assertThat(allocations).hasValue(1);
+        assertThat(json(config).path("_ownerGeneration").asLong()).isEqualTo(2L);
+        assertThat(metadata(metadata).streamId()).isEqualTo(replacementStreamId);
+        assertThat(metadata(metadata).deleted()).isFalse();
+        assertThat(metadata(metadata).registrationOwnerGeneration()).isEqualTo(2L);
+        verify(logStorage, never()).deleteLog(LogId.of(retiredStreamId));
     }
 
     @Test
@@ -2180,10 +2275,675 @@ class IndexedStreamCatalogExternalPartitionTest {
         assertThatThrownBy(() -> catalog.registerExternalPartition(
                 stream, partition, 601L, Map.of()).join())
             .isInstanceOf(CompletionException.class)
-            .hasCauseInstanceOf(AlreadyExistsException.class);
+            .hasCauseInstanceOf(PartitionLifecycleFencedException.class)
+            .hasMessageContaining("unregister the stream before recreating it");
 
         assertThat(metadata(metadata).deleted()).isTrue();
         assertThat(metadata.successfulPuts()).isZero();
+    }
+
+    @Test
+    void fencedCleanupJournalRemainsBoundedAcrossOneHundredRecreateCycles()
+            throws Exception {
+        int partition = 0;
+        String logName = paths.compactedReaderName(stream, partition);
+        String configPath = paths.streamConfigPath(stream);
+        String metadataPath = paths.partitionMetadataPath(stream, partition);
+        String incarnation = "bounded-cleanup-incarnation";
+        String owner = "bounded-cleanup-owner";
+        long initialStreamId = 1_000L;
+        VersionedRecord config = mockVersionedRecord(
+            configPath, activeExternalConfigBytes(1, incarnation, owner));
+        VersionedRecord metadata = mockVersionedRecord(
+            metadataPath, metadataBytes(
+                metadataPath, initialStreamId, incarnation, owner, 1L, false));
+        FencedMappingHarness mappings = new FencedMappingHarness(
+            logName, initialStreamId,
+            new StreamIdMappingOwner(incarnation, owner, 1L), 2_000L);
+        when(readerFactory.open(logName))
+            .thenAnswer(ignored -> mock(CompactedObjectReader.class));
+        when(logFactory.create(eq(logName), any(LogId.class),
+                any(CompactedObjectReader.class)))
+            .thenAnswer(ignored -> mock(Log.class));
+        IndexedStreamCatalog catalog = fencedCatalog(mappings.storageApi());
+        int maximumMetadataBytes = 0;
+
+        for (int cycle = 0; cycle < 100; cycle++) {
+            catalog.deleteExternalPartition(stream, partition).join();
+            LogMetadata deleted = metadata(metadata);
+            assertThat(deleted.purgeableRetiredStreamIds()).isEmpty();
+            assertThat(deleted.retiredStreamMappings()).isEmpty();
+            assertThat(deleted.retiredMappingKeys()).isEmpty();
+            assertThat(deleted.retiredStreamIds()).isEmpty();
+            maximumMetadataBytes = Math.max(
+                maximumMetadataBytes, metadata.currentValue().length);
+
+            catalog.unregisterExternalStream(stream).join();
+            catalog.openExternalPartition(stream, partition, Map.of()).join();
+
+            LogMetadata active = metadata(metadata);
+            assertThat(active.deleted()).isFalse();
+            assertThat(active.purgeableRetiredStreamIds()).isEmpty();
+            assertThat(active.retiredStreamMappings()).isEmpty();
+            assertThat(active.retiredMappingKeys()).isEmpty();
+            assertThat(active.retiredStreamIds()).isEmpty();
+            maximumMetadataBytes = Math.max(
+                maximumMetadataBytes, metadata.currentValue().length);
+        }
+
+        assertThat(maximumMetadataBytes).isLessThan(512);
+        assertThat(mappings.fenceCalls()).isLessThanOrEqualTo(100);
+        assertThat(config.successfulPuts()).isGreaterThanOrEqualTo(200);
+    }
+
+    @Test
+    void ownerAwareNonPurgingNativeDropAndRecreateKeepsJournalBounded()
+            throws Exception {
+        int partition = 0;
+        String mappingKey = "lakestream-native/" + stream.fullName() + "/partition-0";
+        String configPath = paths.streamConfigPath(stream);
+        String metadataPath = paths.partitionMetadataPath(stream, partition);
+        String incarnation = "native-bounded-incarnation";
+        String ownerToken = "native-owner";
+        long initialStreamId = 1_500L;
+        StreamIdMappingOwner initialOwner = new StreamIdMappingOwner(
+            incarnation, ownerToken, 1L);
+        VersionedRecord config = mockVersionedRecord(configPath,
+            ("{\"partitions\":1,\"properties\":{},"
+                + "\"_incarnationId\":\"" + incarnation + "\","
+                + "\"_ownerToken\":\"" + ownerToken + "\","
+                + "\"_ownerGeneration\":1,"
+                + "\"_creationKind\":\"NATIVE_CREATE\"}")
+                .getBytes(StandardCharsets.UTF_8));
+        VersionedRecord metadata = mockVersionedRecord(
+            metadataPath, metadataBytes(
+                metadataPath, initialStreamId, incarnation, ownerToken, 1L, false));
+        FencedMappingHarness mappings = new FencedMappingHarness(
+            mappingKey, initialStreamId, initialOwner, 2_000L);
+        IndexedStreamCatalog catalog = fencedCatalog(mappings.storageApi());
+        Partitioning partitioning = new Partitioning(
+            PartitioningStrategy.INDEXED, Map.of("numPartitions", "1"));
+        int maximumMetadataBytes = 0;
+
+        for (int cycle = 0; cycle < 25; cycle++) {
+            long droppedStreamId = mappings.activeStreamId().orElseThrow();
+            assertThat(catalog.dropStream(stream, false).join()).isTrue();
+
+            LogMetadata dropped = metadata(metadata);
+            assertThat(dropped.deleted()).isTrue();
+            assertThat(dropped.streamId()).isEqualTo(droppedStreamId);
+            assertThat(dropped.retiredStreamIds()).isEmpty();
+            assertThat(dropped.purgeableRetiredStreamIds()).isEmpty();
+            assertThat(dropped.retiredStreamMappings()).isEmpty();
+            assertThat(dropped.retiredMappingKeys()).isEmpty();
+            maximumMetadataBytes = Math.max(
+                maximumMetadataBytes, metadata.currentValue().length);
+            verify(logStorage, never()).deleteLog(LogId.of(droppedStreamId));
+
+            catalog.createStream(
+                stream, new StreamConfig(), partitioning,
+                new SchemaConfig(), Map.of()).join();
+
+            LogMetadata active = metadata(metadata);
+            assertThat(active.deleted()).isFalse();
+            assertThat(active.retiredStreamIds()).isEmpty();
+            assertThat(active.purgeableRetiredStreamIds()).isEmpty();
+            assertThat(active.retiredStreamMappings()).isEmpty();
+            assertThat(active.retiredMappingKeys()).isEmpty();
+            maximumMetadataBytes = Math.max(
+                maximumMetadataBytes, metadata.currentValue().length);
+        }
+
+        assertThat(maximumMetadataBytes).isLessThan(512);
+        assertThat(mappings.fenceCalls()).isEqualTo(25);
+        assertThat(config.successfulPuts()).isGreaterThanOrEqualTo(75);
+    }
+
+    @Test
+    void registerThatOwnsMappingIsNotDeletedByRetiredCleanup() throws Exception {
+        int partition = 0;
+        String logName = paths.compactedReaderName(stream, partition);
+        String configPath = paths.streamConfigPath(stream);
+        String metadataPath = paths.partitionMetadataPath(stream, partition);
+        String incarnation = "register-open-race";
+        StreamIdMappingOwner retiredOwner = new StreamIdMappingOwner(
+            incarnation, "retired-owner", 1L);
+        StreamIdMappingOwner currentOwner = new StreamIdMappingOwner(
+            incarnation, "broker-owner", 2L);
+        long retiredStreamId = 910L;
+        long brokerStreamId = 920L;
+        mockVersionedRecord(configPath, ("{\"partitions\":1,\"properties\":{},"
+            + "\"_incarnationId\":\"" + incarnation + "\","
+            + "\"_ownerToken\":\"broker-owner\","
+            + "\"_ownerGeneration\":2,"
+            + "\"_metadataSourceOwnerToken\":\"retired-owner\","
+            + "\"_metadataSourceGeneration\":1,"
+            + "\"_creationKind\":\"EXTERNAL\"}")
+            .getBytes(StandardCharsets.UTF_8));
+        VersionedRecord metadata = mockVersionedRecord(
+            metadataPath, LOG_METADATA_SERDE.serialize(metadataPath, new LogMetadata(
+                retiredStreamId, Map.of(), OptionalLong.empty(),
+                retiredOwner.incarnationId(), retiredOwner.ownerToken(),
+                retiredOwner.ownerGeneration(), true, Set.of(retiredStreamId),
+                Set.of(retiredStreamId),
+                Set.of(new LogMetadata.RetiredStreamMapping(
+                    retiredStreamId, logName)), Set.of(logName))));
+        FencedMappingHarness mappings = new FencedMappingHarness(
+            logName, brokerStreamId, currentOwner, 1_000L);
+        IndexedStreamCatalog catalog = fencedCatalog(mappings.storageApi());
+
+        catalog.registerExternalPartition(
+            stream, partition, brokerStreamId, Map.of()).join();
+
+        LogMetadata registered = metadata(metadata);
+        assertThat(registered.streamId()).isEqualTo(brokerStreamId);
+        assertThat(registered.registrationOwnerToken())
+            .isEqualTo(currentOwner.ownerToken());
+        assertThat(registered.retiredStreamMappings()).isEmpty();
+        assertThat(registered.retiredMappingKeys()).isEmpty();
+        verify(logStorage, never()).deleteLog(LogId.of(brokerStreamId));
+        assertThat(mappings.activeStreamId()).contains(brokerStreamId);
+    }
+
+    @Test
+    void activeKeysOnlyJournalCapturesLateAllocatorAndRestoresCanonicalMapping()
+            throws Exception {
+        int partition = 0;
+        String logName = paths.compactedReaderName(stream, partition);
+        String configPath = paths.streamConfigPath(stream);
+        String metadataPath = paths.partitionMetadataPath(stream, partition);
+        String incarnation = "active-keys-only";
+        String ownerToken = "active-owner";
+        long currentStreamId = 930L;
+        long previouslyRetiredStreamId = 929L;
+        long lateAllocatedStreamId = 931L;
+        StreamIdMappingOwner owner = new StreamIdMappingOwner(
+            incarnation, ownerToken, 1L);
+        mockVersionedRecord(
+            configPath, activeExternalConfigBytes(1, incarnation, ownerToken));
+        VersionedRecord metadata = mockVersionedRecord(
+            metadataPath, metadataBytes(
+                metadataPath, currentStreamId, incarnation, ownerToken, 1L, false,
+                Set.of(previouslyRetiredStreamId), Set.of(), Set.of(), Set.of(logName)));
+        FencedMappingHarness mappings = new FencedMappingHarness(
+            logName, lateAllocatedStreamId, owner, 1_000L);
+        RuntimeException crashAfterCapture =
+            new RuntimeException("crash after captured mapping was journaled");
+        mappings.failNextCanonicalize(crashAfterCapture);
+        IndexedStreamCatalog catalog = fencedCatalog(mappings.storageApi());
+
+        assertThatThrownBy(() -> catalog.registerExternalPartition(
+                stream, partition, currentStreamId, Map.of()).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCause(crashAfterCapture);
+
+        LogMetadata captured = metadata(metadata);
+        assertThat(captured.retiredStreamMappings())
+            .containsExactly(new LogMetadata.RetiredStreamMapping(
+                lateAllocatedStreamId, logName));
+        assertThat(captured.retiredStreamIds())
+            .containsExactly(previouslyRetiredStreamId, lateAllocatedStreamId);
+        assertThat(mappings.activeStreamId()).isEmpty();
+
+        catalog.registerExternalPartition(
+            stream, partition, currentStreamId, Map.of()).join();
+
+        LogMetadata registered = metadata(metadata);
+        assertThat(registered.streamId()).isEqualTo(currentStreamId);
+        assertThat(registered.retiredStreamIds()).isEmpty();
+        assertThat(registered.purgeableRetiredStreamIds()).isEmpty();
+        assertThat(registered.retiredStreamMappings()).isEmpty();
+        assertThat(registered.retiredMappingKeys()).isEmpty();
+        assertThat(mappings.activeStreamId()).contains(currentStreamId);
+        assertThat(mappings.fenceCalls()).isEqualTo(2);
+        assertThat(mappings.canonicalizeCalls()).isEqualTo(2);
+        assertThat(mappings.bindCalls()).isGreaterThanOrEqualTo(2);
+        verify(logStorage, never()).deleteLog(LogId.of(currentStreamId));
+        verify(logStorage, never()).deleteLog(LogId.of(lateAllocatedStreamId));
+    }
+
+    @Test
+    void knownRetiredIdWithAbsentMappingCanonicalizesAndReplaysCleanup()
+            throws Exception {
+        int partition = 0;
+        String logName = paths.compactedReaderName(stream, partition);
+        String configPath = paths.streamConfigPath(stream);
+        String metadataPath = paths.partitionMetadataPath(stream, partition);
+        String incarnation = "known-id-absent-mapping";
+        String ownerToken = "known-id-owner";
+        long streamId = 935L;
+        StreamIdMappingOwner owner = new StreamIdMappingOwner(
+            incarnation, ownerToken, 1L);
+        mockVersionedRecord(
+            configPath, activeExternalConfigBytes(1, incarnation, ownerToken));
+        VersionedRecord metadata = mockVersionedRecord(
+            metadataPath, metadataBytes(
+                metadataPath, streamId, incarnation, ownerToken, 1L, false));
+        FencedMappingHarness mappings = new FencedMappingHarness(
+            logName, streamId, owner, 1_000L);
+        mappings.clearMapping();
+        RuntimeException firstDeleteFailure =
+            new RuntimeException("delete response failed after canonical fence");
+        AtomicInteger deleteAttempts = new AtomicInteger();
+        when(logStorage.deleteLog(LogId.of(streamId))).thenAnswer(ignored ->
+            deleteAttempts.getAndIncrement() == 0
+                ? CompletableFuture.failedFuture(firstDeleteFailure)
+                : CompletableFuture.completedFuture(null));
+        IndexedStreamCatalog catalog = fencedCatalog(mappings.storageApi());
+
+        assertThatThrownBy(() ->
+                catalog.deleteExternalPartition(stream, partition).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCause(firstDeleteFailure);
+
+        LogMetadata interrupted = metadata(metadata);
+        assertThat(interrupted.deleted()).isTrue();
+        assertThat(interrupted.streamId()).isEqualTo(streamId);
+        assertThat(interrupted.retiredStreamIds()).containsExactly(streamId);
+        assertThat(interrupted.purgeableRetiredStreamIds()).containsExactly(streamId);
+        assertThat(interrupted.retiredStreamMappings())
+            .containsExactly(new LogMetadata.RetiredStreamMapping(-1L, logName, true));
+        assertThat(interrupted.retiredMappingKeys()).containsExactly(logName);
+        assertThat(mappings.activeStreamId()).isEmpty();
+
+        catalog.deleteExternalPartition(stream, partition).join();
+
+        LogMetadata cleaned = metadata(metadata);
+        assertThat(cleaned.deleted()).isTrue();
+        assertThat(cleaned.streamId()).isEqualTo(streamId);
+        assertThat(cleaned.retiredStreamIds()).isEmpty();
+        assertThat(cleaned.purgeableRetiredStreamIds()).isEmpty();
+        assertThat(cleaned.retiredStreamMappings()).isEmpty();
+        assertThat(cleaned.retiredMappingKeys()).isEmpty();
+        assertThat(deleteAttempts).hasValue(2);
+        assertThat(mappings.fenceCalls()).isEqualTo(2);
+        assertThat(mappings.canonicalizeCalls()).isEqualTo(1);
+    }
+
+    @Test
+    void permanentDeletionRecoversProvisioningMappingWithoutPartitionMetadata()
+            throws Exception {
+        int partition = 0;
+        String logName = paths.compactedReaderName(stream, partition);
+        String configPath = paths.streamConfigPath(stream);
+        String metadataPath = paths.partitionMetadataPath(stream, partition);
+        String incarnation = "crashed-provisioner";
+        String ownerToken = "provisioning-owner";
+        long streamId = 938L;
+        StreamIdMappingOwner owner = new StreamIdMappingOwner(
+            incarnation, ownerToken, 1L);
+        VersionedRecord config = mockVersionedRecord(configPath,
+            ("{\"partitions\":1,\"properties\":{},"
+                + "\"_incarnationId\":\"" + incarnation + "\","
+                + "\"_ownerToken\":\"" + ownerToken + "\","
+                + "\"_ownerGeneration\":1,"
+                + "\"_creationKind\":\"EXTERNAL\","
+                + "\"_provisioning\":true,"
+                + "\"_provisioningState\":\"PROVISIONING\"}")
+                .getBytes(StandardCharsets.UTF_8));
+        VersionedRecord metadata = mockVersionedRecord(metadataPath, null);
+        FencedMappingHarness mappings = new FencedMappingHarness(
+            logName, streamId, owner, 1_000L);
+        IndexedStreamCatalog catalog = fencedCatalog(mappings.storageApi());
+
+        catalog.permanentlyDeleteExternalStream(stream).join();
+
+        JsonNode permanent = json(config);
+        assertThat(permanent.path("_provisioningState").asText())
+            .isEqualTo("PERMANENTLY_DELETED");
+        assertThat(permanent.path("_ownerToken").asText()).isEqualTo(ownerToken);
+        assertThat(permanent.path("_ownerGeneration").asLong()).isEqualTo(1L);
+        assertThat(permanent.path("_metadataSourceOwnerToken").asText())
+            .isEqualTo(ownerToken);
+        assertThat(permanent.path("_metadataSourceGeneration").asLong()).isEqualTo(1L);
+
+        catalog.deleteExternalPartition(stream, partition).join();
+
+        LogMetadata tombstone = metadata(metadata);
+        assertThat(tombstone.deleted()).isTrue();
+        assertThat(tombstone.streamId()).isEqualTo(streamId);
+        assertThat(tombstone.registrationIncarnationId()).isEqualTo(incarnation);
+        assertThat(tombstone.registrationOwnerToken()).isEqualTo(ownerToken);
+        assertThat(tombstone.registrationOwnerGeneration()).isEqualTo(1L);
+        assertThat(tombstone.retiredStreamIds()).isEmpty();
+        assertThat(tombstone.purgeableRetiredStreamIds()).isEmpty();
+        assertThat(tombstone.retiredStreamMappings()).isEmpty();
+        assertThat(tombstone.retiredMappingKeys()).isEmpty();
+        assertThat(mappings.activeStreamId()).isEmpty();
+        assertThat(mappings.fenceCalls()).isEqualTo(1);
+        verify(logStorage).deleteLog(LogId.of(streamId));
+    }
+
+    @Test
+    void missingDurableFenceCapabilityFailsBeforeLifecycleSideEffects()
+            throws Exception {
+        int partition = 0;
+        String configPath = paths.streamConfigPath(stream);
+        String metadataPath = paths.partitionMetadataPath(stream, partition);
+        String incarnation = "unsupported-fence";
+        String ownerToken = "unsupported-owner";
+        long streamId = 939L;
+        VersionedRecord config = mockVersionedRecord(
+            configPath, activeExternalConfigBytes(1, incarnation, ownerToken));
+        VersionedRecord metadata = mockVersionedRecord(
+            metadataPath, metadataBytes(
+                metadataPath, streamId, incarnation, ownerToken, 1L, true,
+                Set.of(streamId), Set.of(streamId), Set.of(), Set.of("mapping-key")));
+        StorageApi unsupported = mock(StorageApi.class);
+        when(unsupported.supportsConditionalStreamIdMappingDeletion()).thenReturn(true);
+        when(unsupported.supportsFencedStreamIdMappings()).thenReturn(false);
+        IndexedStreamCatalog catalog = fencedCatalog(unsupported);
+
+        assertThatThrownBy(() ->
+                catalog.permanentlyDeleteExternalStream(stream).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> catalog.registerExternalPartition(
+                stream, partition, streamId + 1, Map.of()).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(UnsupportedOperationException.class);
+
+        assertThat(config.successfulPuts()).isZero();
+        assertThat(metadata.successfulPuts()).isZero();
+        verify(logStorage, never()).deleteLog(any());
+        verify(unsupported, never()).fenceStreamIdMappingState(
+            anyString(), anyLong(), any(StreamIdMappingOwner.class));
+        verify(unsupported, never()).bindStreamIdMapping(
+            anyString(), anyLong(), any(StreamIdMappingOwner.class), any());
+    }
+
+    @Test
+    void nativeOwnedStreamIsTerminallyFencedAtExternalRegistrationBoundary()
+            throws Exception {
+        int partition = 0;
+        String logName = paths.compactedReaderName(stream, partition);
+        String configPath = paths.streamConfigPath(stream);
+        String metadataPath = paths.partitionMetadataPath(stream, partition);
+        String incarnation = "native-owner-conflict";
+        String ownerToken = "native-owner";
+        long streamId = 941L;
+        VersionedRecord config = mockVersionedRecord(configPath,
+            ("{\"partitions\":1,\"properties\":{},"
+                + "\"_incarnationId\":\"" + incarnation + "\","
+                + "\"_ownerToken\":\"" + ownerToken + "\","
+                + "\"_ownerGeneration\":1,"
+                + "\"_creationKind\":\"NATIVE_CREATE\"}")
+                .getBytes(StandardCharsets.UTF_8));
+        VersionedRecord metadata = mockVersionedRecord(metadataPath, null);
+        FencedMappingHarness mappings = new FencedMappingHarness(
+            logName, streamId,
+            new StreamIdMappingOwner(incarnation, ownerToken, 1L), 1_000L);
+        IndexedStreamCatalog catalog = fencedCatalog(mappings.storageApi());
+
+        assertThatThrownBy(() -> catalog.registerExternalPartition(
+                stream, partition, streamId, Map.of()).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(PartitionLifecycleFencedException.class)
+            .hasMessageContaining("different catalog lifecycle");
+
+        assertThat(config.successfulPuts()).isZero();
+        assertThat(metadata.currentResult()).isNull();
+        assertThat(mappings.bindCalls()).isZero();
+        assertThat(mappings.fenceCalls()).isZero();
+    }
+
+    @Test
+    void nativeOwnedStreamIsTerminallyFencedAtExternalOpenBoundary()
+            throws Exception {
+        int partition = 0;
+        String logName = paths.compactedReaderName(stream, partition);
+        String configPath = paths.streamConfigPath(stream);
+        String metadataPath = paths.partitionMetadataPath(stream, partition);
+        String incarnation = "native-open-owner-conflict";
+        String ownerToken = "native-open-owner";
+        long streamId = 944L;
+        VersionedRecord config = mockVersionedRecord(configPath,
+            ("{\"partitions\":1,\"properties\":{},"
+                + "\"_incarnationId\":\"" + incarnation + "\","
+                + "\"_ownerToken\":\"" + ownerToken + "\","
+                + "\"_ownerGeneration\":1,"
+                + "\"_creationKind\":\"NATIVE_CREATE\"}")
+                .getBytes(StandardCharsets.UTF_8));
+        VersionedRecord metadata = mockVersionedRecord(metadataPath, null);
+        FencedMappingHarness mappings = new FencedMappingHarness(
+            logName, streamId,
+            new StreamIdMappingOwner(incarnation, ownerToken, 1L), 1_000L);
+        IndexedStreamCatalog catalog = fencedCatalog(mappings.storageApi());
+
+        assertThatThrownBy(() -> catalog.openExternalPartition(
+                stream, partition, Map.of()).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(PartitionLifecycleFencedException.class)
+            .hasMessageContaining("different catalog lifecycle");
+
+        assertThat(config.successfulPuts()).isZero();
+        assertThat(metadata.currentResult()).isNull();
+        assertThat(mappings.bindCalls()).isZero();
+        assertThat(mappings.fenceCalls()).isZero();
+        verify(readerFactory, never()).open(anyString());
+    }
+
+    @Test
+    void legacyActivePartitionDeletionFencesExactMetadataStreamId()
+            throws Exception {
+        int partition = 0;
+        String logName = paths.compactedReaderName(stream, partition);
+        String configPath = paths.streamConfigPath(stream);
+        String metadataPath = paths.partitionMetadataPath(stream, partition);
+        long streamId = 945L;
+        mockVersionedRecord(configPath, activeLegacyConfigBytes(1));
+        VersionedRecord metadata = mockVersionedRecord(
+            metadataPath, metadataBytes(metadataPath, streamId, null, null, false));
+        FencedMappingHarness mappings = new FencedMappingHarness(
+            logName, streamId, StreamIdMappingOwner.legacy(), 1_000L);
+        IndexedStreamCatalog catalog = fencedCatalog(mappings.storageApi());
+
+        catalog.deleteExternalPartition(stream, partition).join();
+
+        LogMetadata deleted = metadata(metadata);
+        assertThat(deleted.deleted()).isTrue();
+        assertThat(deleted.streamId()).isEqualTo(streamId);
+        assertThat(deleted.retiredStreamIds()).isEmpty();
+        assertThat(deleted.retiredStreamMappings()).isEmpty();
+        assertThat(deleted.retiredMappingKeys()).isEmpty();
+        assertThat(mappings.activeStreamId()).isEmpty();
+        assertThat(mappings.fenceCalls()).isEqualTo(1);
+        verify(logStorage).deleteLog(LogId.of(streamId));
+    }
+
+    @Test
+    void legacyKeysOnlyJournalUsesExactMetadataStreamId()
+            throws Exception {
+        int partition = 0;
+        String logName = paths.compactedReaderName(stream, partition);
+        String configPath = paths.streamConfigPath(stream);
+        String metadataPath = paths.partitionMetadataPath(stream, partition);
+        long streamId = 946L;
+        mockVersionedRecord(configPath, activeLegacyConfigBytes(1));
+        VersionedRecord metadata = mockVersionedRecord(
+            metadataPath, metadataBytes(
+                metadataPath, streamId, null, null, null, true,
+                Set.of(streamId), Set.of(streamId), Set.of(), Set.of(logName)));
+        FencedMappingHarness mappings = new FencedMappingHarness(
+            logName, streamId, StreamIdMappingOwner.legacy(), 1_000L);
+        IndexedStreamCatalog catalog = fencedCatalog(mappings.storageApi());
+
+        catalog.deleteExternalPartition(stream, partition).join();
+
+        LogMetadata deleted = metadata(metadata);
+        assertThat(deleted.deleted()).isTrue();
+        assertThat(deleted.streamId()).isEqualTo(streamId);
+        assertThat(deleted.retiredStreamIds()).isEmpty();
+        assertThat(deleted.purgeableRetiredStreamIds()).isEmpty();
+        assertThat(deleted.retiredStreamMappings()).isEmpty();
+        assertThat(deleted.retiredMappingKeys()).isEmpty();
+        assertThat(mappings.fenceCalls()).isEqualTo(1);
+        verify(logStorage).deleteLog(LogId.of(streamId));
+    }
+
+    @Test
+    void unknownLegacyMappingFailsClosedBeforeCleanupSideEffects()
+            throws Exception {
+        int partition = 0;
+        String logName = paths.compactedReaderName(stream, partition);
+        String configPath = paths.streamConfigPath(stream);
+        String metadataPath = paths.partitionMetadataPath(stream, partition);
+        mockVersionedRecord(configPath, activeLegacyConfigBytes(1));
+        VersionedRecord metadata = mockVersionedRecord(
+            metadataPath, metadataBytes(
+                metadataPath, -1L, null, null, null, true,
+                Set.of(), Set.of(), Set.of(), Set.of(logName)));
+        FencedMappingHarness mappings = new FencedMappingHarness(logName, 1_000L);
+        IndexedStreamCatalog catalog = fencedCatalog(mappings.storageApi());
+
+        assertThatThrownBy(() ->
+                catalog.deleteExternalPartition(stream, partition).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(PartitionLifecycleFencedException.class)
+            .hasMessageContaining("without an exact physical stream ID");
+
+        assertThat(metadata(metadata).retiredMappingKeys()).containsExactly(logName);
+        assertThat(mappings.fenceCalls()).isZero();
+        verify(logStorage, never()).deleteLog(any());
+    }
+
+    @Test
+    void durableMappingConflictIsTerminallyFencedAtExternalRegistrationBoundary()
+            throws Exception {
+        int partition = 0;
+        String logName = paths.compactedReaderName(stream, partition);
+        String configPath = paths.streamConfigPath(stream);
+        String metadataPath = paths.partitionMetadataPath(stream, partition);
+        String incarnation = "mapping-owner-conflict";
+        String ownerToken = "registration-owner";
+        long requestedStreamId = 943L;
+        long existingStreamId = 942L;
+        mockVersionedRecord(
+            configPath, activeExternalConfigBytes(1, incarnation, ownerToken));
+        VersionedRecord metadata = mockVersionedRecord(metadataPath, null);
+        FencedMappingHarness mappings = new FencedMappingHarness(
+            logName, existingStreamId,
+            new StreamIdMappingOwner(incarnation, "different-owner", 1L), 1_000L);
+        IndexedStreamCatalog catalog = fencedCatalog(mappings.storageApi());
+
+        assertThatThrownBy(() -> catalog.registerExternalPartition(
+                stream, partition, requestedStreamId, Map.of()).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(PartitionLifecycleFencedException.class)
+            .hasMessageContaining("different durable owner or ID");
+
+        assertThat(metadata.currentResult()).isNull();
+        assertThat(mappings.activeStreamId()).contains(existingStreamId);
+        assertThat(mappings.bindCalls()).isEqualTo(1);
+        assertThat(mappings.fenceCalls()).isZero();
+        verify(logStorage, never()).deleteLog(any());
+    }
+
+    @Test
+    void preservedActiveRetiredIdFencesRegistrationWithoutDeletingReplacement()
+            throws Exception {
+        int partition = 0;
+        String logName = paths.compactedReaderName(stream, partition);
+        String configPath = paths.streamConfigPath(stream);
+        String metadataPath = paths.partitionMetadataPath(stream, partition);
+        String incarnation = "preserved-active-retired";
+        StreamIdMappingOwner retiredOwner = new StreamIdMappingOwner(
+            incarnation, "retired-owner", 1L);
+        StreamIdMappingOwner replacementOwner = new StreamIdMappingOwner(
+            incarnation, "replacement-owner", 2L);
+        long replacementStreamId = 940L;
+        mockVersionedRecord(configPath, ("{\"partitions\":1,\"properties\":{},"
+            + "\"_incarnationId\":\"" + incarnation + "\","
+            + "\"_ownerToken\":\"replacement-owner\","
+            + "\"_ownerGeneration\":2,"
+            + "\"_metadataSourceOwnerToken\":\"retired-owner\","
+            + "\"_metadataSourceGeneration\":1,"
+            + "\"_creationKind\":\"EXTERNAL\"}")
+            .getBytes(StandardCharsets.UTF_8));
+        VersionedRecord metadata = mockVersionedRecord(
+            metadataPath, LOG_METADATA_SERDE.serialize(metadataPath, new LogMetadata(
+                replacementStreamId, Map.of(), OptionalLong.empty(),
+                retiredOwner.incarnationId(), retiredOwner.ownerToken(),
+                retiredOwner.ownerGeneration(), true, Set.of(replacementStreamId),
+                Set.of(replacementStreamId),
+                Set.of(new LogMetadata.RetiredStreamMapping(
+                    replacementStreamId, logName, true)), Set.of(logName))));
+        FencedMappingHarness mappings = new FencedMappingHarness(
+            logName, replacementStreamId, replacementOwner, 1_000L);
+        IndexedStreamCatalog catalog = fencedCatalog(mappings.storageApi());
+
+        assertThatThrownBy(() -> catalog.registerExternalPartition(
+                stream, partition, replacementStreamId, Map.of()).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(PartitionLifecycleFencedException.class)
+            .hasMessageContaining("retired cleanup journal contains durable active stream ID");
+
+        LogMetadata retained = metadata(metadata);
+        assertThat(retained.deleted()).isTrue();
+        assertThat(retained.retiredStreamIds()).containsExactly(replacementStreamId);
+        assertThat(retained.purgeableRetiredStreamIds()).containsExactly(replacementStreamId);
+        assertThat(retained.retiredStreamMappings()).hasSize(1);
+        assertThat(mappings.activeStreamId()).contains(replacementStreamId);
+        verify(logStorage, never()).deleteLog(LogId.of(replacementStreamId));
+    }
+
+    @Test
+    void legacyDeletedPartitionRequiresUnregisterBeforeModernRegistration()
+            throws Exception {
+        int partition = 0;
+        String logName = paths.compactedReaderName(stream, partition);
+        String configPath = paths.streamConfigPath(stream);
+        String metadataPath = paths.partitionMetadataPath(stream, partition);
+        long retiredStreamId = 950L;
+        long replacementStreamId = 951L;
+        VersionedRecord config = mockVersionedRecord(
+            configPath, activeLegacyConfigBytes(1));
+        VersionedRecord metadata = mockVersionedRecord(
+            metadataPath, LOG_METADATA_SERDE.serialize(metadataPath, new LogMetadata(
+                retiredStreamId, Map.of(), OptionalLong.empty(),
+                null, null, null, true, Set.of(retiredStreamId),
+                Set.of(), Set.of(new LogMetadata.RetiredStreamMapping(
+                    retiredStreamId, logName)), Set.of(logName))));
+        FencedMappingHarness mappings = new FencedMappingHarness(
+            logName, retiredStreamId, StreamIdMappingOwner.legacy(), 1_000L);
+        IndexedStreamCatalog catalog = fencedCatalog(mappings.storageApi());
+
+        assertThatThrownBy(() -> catalog.registerExternalPartition(
+                stream, partition, replacementStreamId, Map.of()).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(PartitionLifecycleFencedException.class)
+            .hasMessageContaining("requires unregistering the external stream");
+
+        JsonNode stillLegacy = json(config);
+        assertThat(stillLegacy.has("_incarnationId")).isFalse();
+        assertThat(stillLegacy.path("_provisioning").asBoolean(false)).isFalse();
+        assertThat(config.successfulPuts()).isZero();
+        assertThat(mappings.fenceCalls()).isZero();
+
+        catalog.unregisterExternalStream(stream).join();
+        assertThat(json(config).path("_provisioningState").asText())
+            .isEqualTo("UNREGISTERED");
+
+        catalog.registerExternalPartition(
+            stream, partition, replacementStreamId, Map.of()).join();
+
+        JsonNode active = json(config);
+        LogMetadata registered = metadata(metadata);
+        assertThat(active.path("_provisioning").asBoolean(false)).isFalse();
+        assertThat(active.path("_ownerGeneration").asLong()).isEqualTo(1L);
+        assertThat(active.path("_metadataSourceGeneration").asLong()).isEqualTo(-1L);
+        assertThat(registered.deleted()).isFalse();
+        assertThat(registered.streamId()).isEqualTo(replacementStreamId);
+        assertThat(registered.registrationOwnerGeneration()).isEqualTo(1L);
+        assertThat(registered.retiredStreamIds()).isEmpty();
+        assertThat(mappings.activeStreamId()).contains(replacementStreamId);
+        verify(logStorage, never()).deleteLog(LogId.of(retiredStreamId));
+    }
+
+    private IndexedStreamCatalog fencedCatalog(StorageApi storageApi) {
+        return new IndexedStreamCatalog(
+            oxiaClient, paths, logStorage, logFactory, null, storageApi,
+            readerFactory, null, List.of());
     }
 
     private IndexedStreamCatalog catalog(
@@ -2211,12 +2971,130 @@ class IndexedStreamCatalogExternalPartitionTest {
             boolean createdKeyedMapping) {
         Function<Optional<String>, CompletableFuture<Long>> combinedGenerator = key ->
             key.isPresent() ? keyedGenerator.apply(key.orElseThrow()) : generator.apply(key);
+        StorageApi storageApi = lifecycleAwareStorage(
+            combinedGenerator, keyedGenerator, lookup, mappingDeleter,
+            createdKeyedMapping);
         return new IndexedStreamCatalog(
-            oxiaClient, paths, logStorage, logFactory, null, combinedGenerator,
-            key -> keyedGenerator.apply(key).thenApply(streamId ->
-                new StreamIdAllocation(streamId, createdKeyedMapping)),
-            lookup, mappingDeleter,
+            oxiaClient, paths, logStorage, logFactory, null, storageApi,
             readerFactory, null, List.of());
+    }
+
+    private StorageApi lifecycleAwareStorage(
+            Function<Optional<String>, CompletableFuture<Long>> generator,
+            Function<String, CompletableFuture<Long>> keyedGenerator,
+            Function<String, CompletableFuture<Long>> lookup,
+            BiFunction<String, Long, CompletableFuture<Void>> mappingDeleter,
+            boolean createdKeyedMapping) {
+        StorageApi storageApi = mock(StorageApi.class);
+        when(storageApi.supportsConditionalStreamIdMappingDeletion()).thenReturn(true);
+        when(storageApi.supportsFencedStreamIdMappings()).thenReturn(true);
+        when(storageApi.generateStreamId(any()))
+            .thenAnswer(invocation -> generator.apply(invocation.getArgument(0)));
+        when(storageApi.allocateStreamId(any()))
+            .thenAnswer(invocation -> generator
+                .apply(invocation.getArgument(0))
+                .thenApply(streamId ->
+                    new StreamIdAllocation(streamId, createdKeyedMapping)));
+        when(storageApi.allocateStreamId(
+                anyString(), any(StreamIdMappingOwner.class), any()))
+            .thenAnswer(invocation -> keyedGenerator
+                .apply(invocation.getArgument(0, String.class))
+                .thenApply(streamId ->
+                    new StreamIdAllocation(streamId, createdKeyedMapping)));
+        when(storageApi.getStreamIdByKey(anyString()))
+            .thenAnswer(invocation -> lookup.apply(
+                invocation.getArgument(0, String.class)));
+        when(storageApi.bindStreamIdMapping(
+                anyString(), anyLong(), any(StreamIdMappingOwner.class), any()))
+            .thenAnswer(invocation -> bindLegacyTestMapping(
+                lookup,
+                invocation.getArgument(0, String.class),
+                invocation.getArgument(1, Long.class)));
+        when(storageApi.fenceStreamIdMappingState(
+                anyString(), anyLong(), any(StreamIdMappingOwner.class)))
+            .thenAnswer(invocation -> fenceLegacyTestMapping(
+                lookup, mappingDeleter,
+                invocation.getArgument(0, String.class),
+                invocation.getArgument(1, Long.class),
+                invocation.getArgument(2, StreamIdMappingOwner.class)));
+        when(storageApi.canonicalizeStreamIdMappingFence(
+                anyString(), any(StreamIdMappingFence.class),
+                any(StreamIdMappingFence.class)))
+            .thenReturn(CompletableFuture.completedFuture(null));
+        when(storageApi.deleteStreamIdMapping(anyString()))
+            .thenAnswer(invocation -> mappingDeleter.apply(
+                invocation.getArgument(0, String.class), -1L));
+        when(storageApi.deleteStreamIdMapping(anyString(), anyLong()))
+            .thenAnswer(invocation -> mappingDeleter.apply(
+                invocation.getArgument(0, String.class),
+                invocation.getArgument(1, Long.class)));
+        return storageApi;
+    }
+
+    private CompletableFuture<Void> bindLegacyTestMapping(
+            Function<String, CompletableFuture<Long>> lookup,
+            String key, long streamId) {
+        return lookup.apply(key).handle((mappedStreamId, failure) -> {
+            if (failure == null) {
+                if (mappedStreamId == null) {
+                    return CompletableFuture.<Void>completedFuture(null);
+                }
+                if (mappedStreamId.longValue() == streamId) {
+                    return CompletableFuture.<Void>completedFuture(null);
+                }
+                return CompletableFuture.<Void>failedFuture(
+                    new StreamIdMappingConflictException(
+                        key, new ActiveStreamIdMapping(
+                            mappedStreamId, StreamIdMappingOwner.legacy())));
+            }
+            Throwable cause = unwrapCompletionFailure(failure);
+            if (cause instanceof NoSuchKeyException) {
+                return CompletableFuture.<Void>completedFuture(null);
+            }
+            return CompletableFuture.<Void>failedFuture(cause);
+        }).thenCompose(Function.identity());
+    }
+
+    private CompletableFuture<StreamIdMappingFenceResult> fenceLegacyTestMapping(
+            Function<String, CompletableFuture<Long>> lookup,
+            BiFunction<String, Long, CompletableFuture<Void>> mappingDeleter,
+            String key, long expectedStreamId, StreamIdMappingOwner expectedOwner) {
+        return lookup.apply(key).handle((mappedStreamId, failure) -> {
+            if (failure != null) {
+                Throwable cause = unwrapCompletionFailure(failure);
+                if (cause instanceof NoSuchKeyException) {
+                    return CompletableFuture.<StreamIdMappingFenceResult>completedFuture(
+                        new StreamIdMappingFenceResult.Fenced(
+                            new StreamIdMappingFence(-1L, expectedOwner)));
+                }
+                return CompletableFuture.<StreamIdMappingFenceResult>failedFuture(cause);
+            }
+            if (mappedStreamId == null) {
+                return CompletableFuture.<StreamIdMappingFenceResult>completedFuture(
+                    new StreamIdMappingFenceResult.Fenced(
+                        new StreamIdMappingFence(-1L, expectedOwner)));
+            }
+            if (expectedStreamId != -1L
+                    && mappedStreamId.longValue() != expectedStreamId) {
+                return CompletableFuture.<StreamIdMappingFenceResult>completedFuture(
+                    new StreamIdMappingFenceResult.PreservedActive(
+                        new ActiveStreamIdMapping(
+                            mappedStreamId, StreamIdMappingOwner.legacy())));
+            }
+            CompletableFuture<Void> deletion = mappingDeleter.apply(key, mappedStreamId);
+            return (deletion == null ? CompletableFuture.<Void>completedFuture(null) : deletion)
+                .thenApply(ignored -> (StreamIdMappingFenceResult)
+                    new StreamIdMappingFenceResult.Fenced(
+                        new StreamIdMappingFence(mappedStreamId, expectedOwner)));
+        }).thenCompose(Function.identity());
+    }
+
+    private static Throwable unwrapCompletionFailure(Throwable failure) {
+        Throwable current = failure;
+        while (current instanceof CompletionException && current.getCause() != null) {
+            current = current.getCause();
+        }
+        return current;
     }
 
     private VersionedRecord mockVersionedRecord(String path, byte[] initialValue) {
@@ -2366,6 +3244,209 @@ class IndexedStreamCatalogExternalPartitionTest {
 
     private static Version version(long id) {
         return new Version(id, 0, 0, 0, Optional.empty(), Optional.empty());
+    }
+
+    private static final class FencedMappingHarness {
+
+        private final StorageApi storageApi = mock(StorageApi.class);
+        private final String mappingKey;
+        private final AtomicLong nextStreamId;
+        private final AtomicInteger fenceCalls = new AtomicInteger();
+        private final AtomicInteger bindCalls = new AtomicInteger();
+        private final AtomicInteger canonicalizeCalls = new AtomicInteger();
+        private final AtomicReference<Throwable> nextCanonicalizeFailure =
+            new AtomicReference<>();
+        private Object mapping;
+
+        private FencedMappingHarness(
+                String mappingKey, long initialStreamId,
+                StreamIdMappingOwner initialOwner, long nextStreamId) {
+            this(mappingKey, nextStreamId);
+            this.mapping = new ActiveMapping(initialStreamId, initialOwner);
+        }
+
+        private FencedMappingHarness(String mappingKey, long nextStreamId) {
+            this.mappingKey = mappingKey;
+            this.nextStreamId = new AtomicLong(nextStreamId);
+            when(storageApi.supportsConditionalStreamIdMappingDeletion()).thenReturn(true);
+            when(storageApi.supportsFencedStreamIdMappings()).thenReturn(true);
+            when(storageApi.getStreamIdByKey(anyString()))
+                .thenAnswer(ignored -> getStreamId());
+            when(storageApi.allocateStreamId(
+                    anyString(), any(StreamIdMappingOwner.class), any()))
+                .thenAnswer(invocation -> allocate(
+                    invocation.getArgument(0, String.class),
+                    invocation.getArgument(1, StreamIdMappingOwner.class),
+                    invocation.getArgument(2)));
+            when(storageApi.bindStreamIdMapping(
+                    anyString(), anyLong(), any(StreamIdMappingOwner.class), any()))
+                .thenAnswer(invocation -> bind(
+                    invocation.getArgument(0, String.class),
+                    invocation.getArgument(1, Long.class),
+                    invocation.getArgument(2, StreamIdMappingOwner.class),
+                    invocation.getArgument(3)));
+            when(storageApi.fenceStreamIdMappingState(
+                    anyString(), anyLong(), any(StreamIdMappingOwner.class)))
+                .thenAnswer(invocation -> fence(
+                    invocation.getArgument(0, String.class),
+                    invocation.getArgument(1, Long.class),
+                    invocation.getArgument(2, StreamIdMappingOwner.class)));
+            when(storageApi.canonicalizeStreamIdMappingFence(
+                    anyString(), any(StreamIdMappingFence.class),
+                    any(StreamIdMappingFence.class)))
+                .thenAnswer(invocation -> canonicalize(
+                    invocation.getArgument(0, String.class),
+                    invocation.getArgument(1, StreamIdMappingFence.class),
+                    invocation.getArgument(2, StreamIdMappingFence.class)));
+            when(storageApi.deleteStreamIdMapping(anyString(), anyLong()))
+                .thenReturn(CompletableFuture.completedFuture(null));
+        }
+
+        private StorageApi storageApi() {
+            return storageApi;
+        }
+
+        private int fenceCalls() {
+            return fenceCalls.get();
+        }
+
+        private int bindCalls() {
+            return bindCalls.get();
+        }
+
+        private int canonicalizeCalls() {
+            return canonicalizeCalls.get();
+        }
+
+        private synchronized void clearMapping() {
+            mapping = null;
+        }
+
+        private synchronized void installActive(
+                long streamId, StreamIdMappingOwner owner) {
+            mapping = new ActiveMapping(streamId, owner);
+        }
+
+        private void failNextCanonicalize(Throwable failure) {
+            nextCanonicalizeFailure.set(failure);
+        }
+
+        private synchronized Optional<Long> activeStreamId() {
+            return mapping instanceof ActiveMapping active
+                ? Optional.of(active.streamId()) : Optional.empty();
+        }
+
+        private synchronized CompletableFuture<Long> getStreamId() {
+            if (mapping instanceof ActiveMapping active) {
+                return CompletableFuture.completedFuture(active.streamId());
+            }
+            return CompletableFuture.failedFuture(
+                new NoSuchKeyException(mappingKey));
+        }
+
+        private synchronized CompletableFuture<StreamIdAllocation> allocate(
+                String key, StreamIdMappingOwner owner,
+                Optional<StreamIdMappingFence> acknowledgedFence) {
+            assertThat(key).isEqualTo(mappingKey);
+            if (mapping instanceof ActiveMapping active) {
+                if (active.owner().equals(owner)) {
+                    return CompletableFuture.completedFuture(
+                        new StreamIdAllocation(active.streamId(), false));
+                }
+                return CompletableFuture.failedFuture(
+                    new StreamIdMappingConflictException(
+                        key, new ActiveStreamIdMapping(active.streamId(), active.owner())));
+            }
+            if (mapping == null && acknowledgedFence.isEmpty()) {
+                long allocated = nextStreamId.getAndIncrement();
+                mapping = new ActiveMapping(allocated, owner);
+                return CompletableFuture.completedFuture(
+                    new StreamIdAllocation(allocated, true));
+            }
+            if (mapping instanceof StreamIdMappingFence fence
+                    && acknowledgedFence.equals(Optional.of(fence))) {
+                long allocated = nextStreamId.getAndIncrement();
+                mapping = new ActiveMapping(allocated, owner);
+                return CompletableFuture.completedFuture(
+                    new StreamIdAllocation(allocated, true));
+            }
+            return CompletableFuture.failedFuture(
+                new IllegalStateException("mapping fence was not acknowledged"));
+        }
+
+        private synchronized CompletableFuture<Void> bind(
+                String key, long streamId, StreamIdMappingOwner owner,
+                Optional<StreamIdMappingFence> acknowledgedFence) {
+            assertThat(key).isEqualTo(mappingKey);
+            bindCalls.incrementAndGet();
+            if (mapping instanceof ActiveMapping active) {
+                if (active.streamId() == streamId && active.owner().equals(owner)) {
+                    return CompletableFuture.completedFuture(null);
+                }
+                return CompletableFuture.failedFuture(
+                    new StreamIdMappingConflictException(
+                        key, new ActiveStreamIdMapping(active.streamId(), active.owner())));
+            }
+            if (mapping instanceof StreamIdMappingFence fence
+                    && acknowledgedFence.equals(Optional.of(fence))) {
+                mapping = new ActiveMapping(streamId, owner);
+                return CompletableFuture.completedFuture(null);
+            }
+            return CompletableFuture.failedFuture(
+                new IllegalStateException("mapping fence was not acknowledged"));
+        }
+
+        private synchronized CompletableFuture<StreamIdMappingFenceResult> fence(
+                String key, long expectedStreamId, StreamIdMappingOwner expectedOwner) {
+            assertThat(key).isEqualTo(mappingKey);
+            if (expectedOwner.isLegacy() && expectedStreamId == -1L) {
+                return CompletableFuture.failedFuture(new IllegalArgumentException(
+                    "Legacy mapping owner requires an exact stream ID"));
+            }
+            fenceCalls.incrementAndGet();
+            if (mapping == null) {
+                StreamIdMappingFence fence = new StreamIdMappingFence(-1L, expectedOwner);
+                mapping = fence;
+                return CompletableFuture.completedFuture(
+                    new StreamIdMappingFenceResult.Fenced(fence));
+            }
+            if (mapping instanceof StreamIdMappingFence fence) {
+                return CompletableFuture.completedFuture(
+                    new StreamIdMappingFenceResult.Fenced(fence));
+            }
+            ActiveMapping active = (ActiveMapping) mapping;
+            if (!active.owner().equals(expectedOwner)
+                    || expectedStreamId >= 0 && active.streamId() != expectedStreamId) {
+                return CompletableFuture.completedFuture(
+                    new StreamIdMappingFenceResult.PreservedActive(
+                        new ActiveStreamIdMapping(active.streamId(), active.owner())));
+            }
+            StreamIdMappingFence fence = new StreamIdMappingFence(
+                active.streamId(), active.owner());
+            mapping = fence;
+            return CompletableFuture.completedFuture(
+                new StreamIdMappingFenceResult.Fenced(fence));
+        }
+
+        private synchronized CompletableFuture<Void> canonicalize(
+                String key, StreamIdMappingFence expected,
+                StreamIdMappingFence canonical) {
+            assertThat(key).isEqualTo(mappingKey);
+            canonicalizeCalls.incrementAndGet();
+            Throwable failure = nextCanonicalizeFailure.getAndSet(null);
+            if (failure != null) {
+                return CompletableFuture.failedFuture(failure);
+            }
+            if (!Objects.equals(mapping, expected)) {
+                return CompletableFuture.failedFuture(
+                    new IllegalStateException("mapping fence changed"));
+            }
+            mapping = canonical;
+            return CompletableFuture.completedFuture(null);
+        }
+
+        private record ActiveMapping(long streamId, StreamIdMappingOwner owner) {
+        }
     }
 
     private final class VersionedRecord {

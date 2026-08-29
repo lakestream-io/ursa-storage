@@ -31,8 +31,8 @@ public interface ExternalStreamRegistry extends AutoCloseable {
      * @return a future that completes when the logical stream is registered
      * @throws io.lakestream.api.exception.AlreadyExistsException if the identifier belongs to a
      *     native stream or an incompatible registration lifecycle
-     * @throws io.lakestream.api.exception.NoSuchStreamException if the identifier has a durable
-     *     permanent-deletion fence
+     * @throws io.lakestream.api.exception.StreamPermanentlyDeletedException if the identifier has
+     *     a durable permanent-deletion fence
      */
     CompletableFuture<Void> registerExternalStream(StreamIdentifier id, int partitionCount,
                                                    Map<String, String> properties);
@@ -61,12 +61,15 @@ public interface ExternalStreamRegistry extends AutoCloseable {
      * cleaned through the partition lifecycle and are not synchronously rolled back by this
      * metadata-only operation. The tombstone may retain the prior partition count and properties as
      * cleanup context. Use this operation only when the external identity is immutable and will
-     * never become valid again; a replacement resource must use a new identifier.
+     * never become valid again; a replacement resource must use a new identifier. Permanent
+     * deletion also fences an in-progress external provisioning claim, providing a recovery path
+     * when its provisioner has crashed. A stale claimant cannot finalize after this method
+     * completes.
      *
      * @param id the immutable stream identity to delete permanently
      * @return a future that completes when the retained deletion fence is durable
      * @throws io.lakestream.api.exception.AlreadyExistsException if the identifier belongs to a
-     *     native stream or has an in-progress external provisioning claim
+     *     native stream
      * @throws UnsupportedOperationException if the registry implementation does not support
      *     permanent deletion
      */

@@ -186,10 +186,10 @@ public class LogMetadata {
     }
 
     /**
-     * Physical stream IDs that must never be published again for this logical partition.
+     * Physical stream IDs whose durable retirement cleanup is still pending.
      *
-     * <p>The set is retained after a replacement becomes active so a delayed allocation from an
-     * older lifecycle cannot be mistaken for the replacement's physical stream.
+     * <p>Storage mapping fences, rather than an ever-growing ID history, prevent reuse after this
+     * cleanup journal is acknowledged and cleared.
      */
     public Set<Long> retiredStreamIds() {
         return retiredStreamIds;
@@ -210,7 +210,7 @@ public class LogMetadata {
         return retiredStreamMappings;
     }
 
-    /** Mapping keys that remain eligible for fixed-point late-allocation discovery. */
+    /** Mapping keys retained while their durable fence cleanup remains replayable. */
     public Set<String> retiredMappingKeys() {
         return retiredMappingKeys;
     }
@@ -226,7 +226,8 @@ public class LogMetadata {
                 "Purgeable retired stream IDs must also be retired");
         }
         for (RetiredStreamMapping mapping : retiredStreamMappings) {
-            if (!retiredStreamIds.contains(mapping.streamId())) {
+            if (mapping.streamId() >= 0
+                    && !retiredStreamIds.contains(mapping.streamId())) {
                 throw new IllegalArgumentException(
                     "Retired stream mappings must reference retired stream IDs");
             }
@@ -296,21 +297,32 @@ public class LogMetadata {
         if (retiredStreamMappings == null || retiredStreamMappings.isEmpty()) {
             return Set.of();
         }
-        TreeSet<RetiredStreamMapping> normalized = new TreeSet<>();
+        TreeMap<Long, TreeMap<String, Boolean>> merged = new TreeMap<>();
         for (RetiredStreamMapping mapping : retiredStreamMappings) {
-            normalized.add(Objects.requireNonNull(mapping, "retiredStreamMapping"));
+            RetiredStreamMapping checked = Objects.requireNonNull(
+                mapping, "retiredStreamMapping");
+            merged.computeIfAbsent(checked.streamId(), ignored -> new TreeMap<>())
+                .merge(checked.mappingKey(), checked.purge(), Boolean::logicalOr);
         }
+        TreeSet<RetiredStreamMapping> normalized = new TreeSet<>();
+        merged.forEach((streamId, mappings) -> mappings.forEach((mappingKey, purge) ->
+            normalized.add(new RetiredStreamMapping(streamId, mappingKey, purge))));
         return Collections.unmodifiableSet(normalized);
     }
 
-    /** A conditional mapping deletion that remains replayable after lifecycle reincarnation. */
-    public record RetiredStreamMapping(long streamId, String mappingKey)
+    /** A fenced mapping cleanup that remains replayable after lifecycle reincarnation. */
+    public record RetiredStreamMapping(long streamId, String mappingKey, boolean purge)
             implements Comparable<RetiredStreamMapping> {
 
+        /** Reads the historical exact-ID journal representation, whose purge intent is separate. */
+        public RetiredStreamMapping(long streamId, String mappingKey) {
+            this(streamId, mappingKey, false);
+        }
+
         public RetiredStreamMapping {
-            if (streamId < 0) {
+            if (streamId < -1) {
                 throw new IllegalArgumentException(
-                    "Retired stream mapping ID must be non-negative");
+                    "Retired stream mapping ID must be -1 or non-negative");
             }
             if (mappingKey == null || mappingKey.isBlank()) {
                 throw new IllegalArgumentException(
@@ -321,7 +333,14 @@ public class LogMetadata {
         @Override
         public int compareTo(RetiredStreamMapping other) {
             int idComparison = Long.compare(streamId, other.streamId);
-            return idComparison != 0 ? idComparison : mappingKey.compareTo(other.mappingKey);
+            if (idComparison != 0) {
+                return idComparison;
+            }
+            int keyComparison = mappingKey.compareTo(other.mappingKey);
+            if (keyComparison != 0) {
+                return keyComparison;
+            }
+            return Boolean.compare(purge, other.purge);
         }
     }
 }

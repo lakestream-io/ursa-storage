@@ -19,7 +19,6 @@ import io.lakestream.ursa.storage.StorageApi;
 import io.netty.buffer.ByteBuf;
 import java.io.IOException;
 import java.util.List;
-import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -119,7 +118,7 @@ public class StorageApiLogStorage implements LogStorage {
 
     @Override
     public CompletableFuture<Void> deleteLog(LogId logId) {
-        return storageApi.deleteStream(logId.id(), Optional.empty());
+        return storageApi.deleteStream(logId.id());
     }
 
     @Override

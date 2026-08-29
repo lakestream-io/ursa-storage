@@ -11,6 +11,16 @@ import io.lakestream.api.StreamIdentifier;
  */
 public class NoSuchStreamException extends RuntimeException {
 
+    /** Constructor for more specific missing-stream exception types. */
+    protected NoSuchStreamException(String message) {
+        super(message);
+    }
+
+    /** Constructor for more specific missing-stream exception types with a cause. */
+    protected NoSuchStreamException(String message, Throwable cause) {
+        super(message, cause);
+    }
+
     public NoSuchStreamException(StreamIdentifier identifier) {
         super("Stream not found: " + identifier.fullName());
     }

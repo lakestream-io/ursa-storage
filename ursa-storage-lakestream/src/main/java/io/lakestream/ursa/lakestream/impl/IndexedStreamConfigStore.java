@@ -12,6 +12,7 @@ import io.lakestream.api.CatalogPaths;
 import io.lakestream.api.StreamIdentifier;
 import io.lakestream.api.exception.AlreadyExistsException;
 import io.lakestream.api.exception.NoSuchStreamException;
+import io.lakestream.api.exception.StreamPermanentlyDeletedException;
 import io.lakestream.api.materialization.TableMaterializationPolicy;
 import io.lakestream.ursa.lakestream.impl.materialization.MaterializationJson;
 import io.oxia.client.api.AsyncOxiaClient;
@@ -49,6 +50,8 @@ final class IndexedStreamConfigStore {
     private static final String INCARNATION_ID_FIELD = "_incarnationId";
     private static final String OWNER_TOKEN_FIELD = "_ownerToken";
     private static final String OWNER_GENERATION_FIELD = "_ownerGeneration";
+    private static final String METADATA_SOURCE_OWNER_TOKEN_FIELD =
+        "_metadataSourceOwnerToken";
     private static final String METADATA_SOURCE_GENERATION_FIELD = "_metadataSourceGeneration";
     private static final String CREATION_KIND_FIELD = "_creationKind";
     private static final String PROVISIONING_FIELD = "_provisioning";
@@ -83,9 +86,80 @@ final class IndexedStreamConfigStore {
         return registerExternalStreamAttempt(id, partitionCount, properties);
     }
 
+    CompletableFuture<Void> establishExternalRecoveryAnchor(
+            StreamIdentifier id, int partitionCount, Map<String, String> properties) {
+        Objects.requireNonNull(id, "id");
+        Objects.requireNonNull(properties, "properties");
+        if (partitionCount <= 0) {
+            throw new IllegalArgumentException("partitionCount must be positive");
+        }
+        return establishExternalRecoveryAnchorAttempt(
+            id, partitionCount, properties, 0);
+    }
+
+    private CompletableFuture<Void> establishExternalRecoveryAnchorAttempt(
+            StreamIdentifier id, int partitionCount, Map<String, String> properties,
+            int retryCount) {
+        String path = catalogPaths.streamConfigPath(id);
+        return oxiaClient.get(path).thenCompose(current -> {
+            if (current != null) {
+                if (isPermanentDeletionTombstone(current.value())) {
+                    return CompletableFuture.failedFuture(
+                        new StreamPermanentlyDeletedException(id));
+                }
+                StreamConfigData config = parse(id, current.value());
+                if (config.isActiveExternalOrLegacy()) {
+                    return CompletableFuture.completedFuture(null);
+                }
+                return CompletableFuture.failedFuture(
+                    new ExternalRegistrationLifecycleConflictException(
+                        "Stream lifecycle changed while establishing a legacy recovery anchor: "
+                            + id.fullName()));
+            }
+            StreamConfigData anchor = StreamConfigData.provisioning(
+                partitionCount, properties, Optional.empty(), CreationKind.EXTERNAL,
+                UUID.randomUUID().toString(), UUID.randomUUID().toString()).activate();
+            return putWithResult(path, anchor, Set.of(PutOption.IfRecordDoesNotExist))
+                .handle((write, failure) ->
+                    new CreateWrite(write, unwrapNullable(failure)))
+                .thenCompose(write -> {
+                    if (write.failure() == null) {
+                        return CompletableFuture.completedFuture(null);
+                    }
+                    if (write.failure() instanceof KeyAlreadyExistsException) {
+                        return retryAfterConflict(
+                            id, "legacy external recovery anchor", retryCount,
+                            write.failure(),
+                            () -> establishExternalRecoveryAnchorAttempt(
+                                id, partitionCount, properties, retryCount + 1));
+                    }
+                    return oxiaClient.get(path).thenCompose(observed -> {
+                        if (observed != null
+                                && !isPermanentDeletionTombstone(observed.value())) {
+                            StreamConfigData observedConfig = parse(id, observed.value());
+                            if (observedConfig.isActiveExternalOrLegacy()) {
+                                logResolvedWrite(
+                                    id, "legacy external recovery anchor",
+                                    observed.version().versionId(), write.failure());
+                                return CompletableFuture.completedFuture(null);
+                            }
+                        }
+                        return CompletableFuture.failedFuture(write.failure());
+                    });
+                });
+        });
+    }
+
     CompletableFuture<ExternalRegistration> beginExternalPartitionRegistration(
             StreamIdentifier id, int partitionCount, Map<String, String> properties,
             String attemptToken) {
+        return beginExternalPartitionRegistration(
+            id, partitionCount, properties, attemptToken, false);
+    }
+
+    CompletableFuture<ExternalRegistration> beginExternalPartitionRegistration(
+            StreamIdentifier id, int partitionCount, Map<String, String> properties,
+            String attemptToken, boolean requireModernOwner) {
         Objects.requireNonNull(id, "id");
         Objects.requireNonNull(properties, "properties");
         Objects.requireNonNull(attemptToken, "attemptToken");
@@ -93,32 +167,60 @@ final class IndexedStreamConfigStore {
             throw new IllegalArgumentException("partitionCount must be positive");
         }
         return beginExternalPartitionRegistrationAttempt(
-            id, partitionCount, properties, attemptToken, 0);
+            id, partitionCount, properties, attemptToken, requireModernOwner, 0);
     }
 
     private CompletableFuture<ExternalRegistration> beginExternalPartitionRegistrationAttempt(
             StreamIdentifier id, int partitionCount, Map<String, String> properties,
-            String ownerToken, int retryCount) {
+            String ownerToken, boolean requireModernOwner, int retryCount) {
         String path = catalogPaths.streamConfigPath(id);
         return oxiaClient.get(path).thenCompose(result -> {
-            if (result == null || isProvisioning(result.value())) {
+            if (result == null) {
+                return claimCreation(
+                        id, partitionCount, properties, Optional.empty(),
+                        CreationKind.EXTERNAL, ownerToken)
+                    .thenApply(ExternalRegistration::provisioning);
+            }
+            if (isProvisioning(result.value())) {
+                StreamConfigData provisioning = parse(id, result.value());
+                if (provisioning.creationKind().orElse(null)
+                        == CreationKind.NATIVE_CREATE) {
+                    return CompletableFuture.failedFuture(
+                        new ExternalRegistrationLifecycleConflictException(
+                            "Stream is owned by a native catalog creation: "
+                                + id.fullName()));
+                }
                 return claimCreation(
                         id, partitionCount, properties, Optional.empty(),
                         CreationKind.EXTERNAL, ownerToken)
                     .thenApply(ExternalRegistration::provisioning);
             }
             if (isPermanentDeletionTombstone(result.value())) {
-                return CompletableFuture.failedFuture(new NoSuchStreamException(id));
+                return CompletableFuture.failedFuture(
+                    new StreamPermanentlyDeletedException(id));
             }
             StreamConfigData existing = parse(id, result.value());
             if (!existing.isActiveExternalOrLegacy()) {
-                return CompletableFuture.failedFuture(new AlreadyExistsException(
-                    "Stream is owned by a native catalog creation: " + id.fullName()));
+                return CompletableFuture.failedFuture(
+                    new ExternalRegistrationLifecycleConflictException(
+                        "Stream is owned by a native catalog creation: " + id.fullName()));
+            }
+            if (requireModernOwner && existing.incarnationId().isEmpty()) {
+                StreamConfigData migrated = existing.modernizeLegacyExternal(
+                    ownerToken, partitionCount);
+                return putWithResult(path, migrated,
+                        Set.of(PutOption.IfVersionIdEquals(result.version().versionId())))
+                    .handle((write, failure) ->
+                        new CreateWrite(write, unwrapNullable(failure)))
+                    .thenCompose(write -> resolveLegacyExternalMigration(
+                        id, partitionCount, properties, ownerToken,
+                        requireModernOwner, migrated, write, retryCount));
             }
             if (existing.partitions() >= partitionCount) {
                 return CompletableFuture.completedFuture(ExternalRegistration.active(
                     existing.incarnationId(), existing.ownerToken(), existing.creationKind(),
-                    existing.ownerGeneration(), existing.metadataSourceGeneration(),
+                    existing.ownerGeneration(), existing.metadataSourceOwnerToken(),
+                    existing.metadataSourceGeneration(),
                     result.version().versionId()));
             }
             StreamConfigData grown = existing.withPartitions(partitionCount);
@@ -127,18 +229,41 @@ final class IndexedStreamConfigStore {
                 .handle((write, failure) ->
                     new CreateWrite(write, unwrapNullable(failure)))
                 .thenCompose(write -> resolveExternalPartitionGrowth(
-                    id, partitionCount, properties, ownerToken, grown, write, retryCount));
+                    id, partitionCount, properties, ownerToken, requireModernOwner,
+                    grown, write, retryCount));
         });
+    }
+
+    private CompletableFuture<ExternalRegistration> resolveLegacyExternalMigration(
+            StreamIdentifier id, int partitionCount, Map<String, String> properties,
+            String attemptToken, boolean requireModernOwner,
+            StreamConfigData migrated, CreateWrite write, int retryCount) {
+        if (write.failure() == null) {
+            return CompletableFuture.completedFuture(
+                ExternalRegistration.provisioning(
+                    claim(migrated, write.result().version().versionId())));
+        }
+        if (write.failure() instanceof KeyAlreadyExistsException
+                || write.failure() instanceof UnexpectedVersionIdException) {
+            return retryAfterConflict(
+                id, "legacy external owner migration", retryCount, write.failure(),
+                () -> beginExternalPartitionRegistrationAttempt(
+                    id, partitionCount, properties, attemptToken,
+                    requireModernOwner, retryCount + 1));
+        }
+        return CompletableFuture.failedFuture(write.failure());
     }
 
     private CompletableFuture<ExternalRegistration> resolveExternalPartitionGrowth(
             StreamIdentifier id, int partitionCount, Map<String, String> properties,
-            String attemptToken, StreamConfigData grown, CreateWrite write,
+            String attemptToken, boolean requireModernOwner,
+            StreamConfigData grown, CreateWrite write,
             int retryCount) {
         if (write.failure() == null) {
             return CompletableFuture.completedFuture(ExternalRegistration.active(
                 grown.incarnationId(), grown.ownerToken(), grown.creationKind(),
-                grown.ownerGeneration(), grown.metadataSourceGeneration(),
+                grown.ownerGeneration(), grown.metadataSourceOwnerToken(),
+                grown.metadataSourceGeneration(),
                 write.result().version().versionId()));
         }
         if (write.failure() instanceof KeyAlreadyExistsException
@@ -146,7 +271,8 @@ final class IndexedStreamConfigStore {
             return retryAfterConflict(
                 id, "external partition registration", retryCount, write.failure(),
                 () -> beginExternalPartitionRegistrationAttempt(
-                    id, partitionCount, properties, attemptToken, retryCount + 1));
+                    id, partitionCount, properties, attemptToken,
+                    requireModernOwner, retryCount + 1));
         }
         String path = catalogPaths.streamConfigPath(id);
         return oxiaClient.get(path)
@@ -162,13 +288,14 @@ final class IndexedStreamConfigStore {
                 }
                 if (isPermanentDeletionTombstone(check.config().value())) {
                     return CompletableFuture.failedFuture(
-                        new NoSuchStreamException(id, write.failure()));
+                        new StreamPermanentlyDeletedException(id, write.failure()));
                 }
                 if (isProvisioning(check.config().value())) {
                     return retryAfterConflict(
                         id, "external partition registration", retryCount, write.failure(),
                         () -> beginExternalPartitionRegistrationAttempt(
-                            id, partitionCount, properties, attemptToken, retryCount + 1));
+                            id, partitionCount, properties, attemptToken,
+                            requireModernOwner, retryCount + 1));
                 }
                 StreamConfigData current = parse(id, check.config().value());
                 if (current.isActiveExternalOrLegacy()
@@ -177,7 +304,8 @@ final class IndexedStreamConfigStore {
                         check.config().version().versionId(), write.failure());
                     return CompletableFuture.completedFuture(ExternalRegistration.active(
                         current.incarnationId(), current.ownerToken(), current.creationKind(),
-                        current.ownerGeneration(), current.metadataSourceGeneration(),
+                        current.ownerGeneration(), current.metadataSourceOwnerToken(),
+                        current.metadataSourceGeneration(),
                         check.config().version().versionId()));
                 }
                 return CompletableFuture.failedFuture(write.failure());
@@ -207,9 +335,13 @@ final class IndexedStreamConfigStore {
             StreamConfigData config = parse(id, current.value());
             if (registration.claim().isPresent()) {
                 ProvisioningClaim claim = registration.claim().orElseThrow();
-                if (config.provisioningState() == ProvisioningState.PROVISIONING
-                        && config.isOwnedBy(claim)
-                        && current.version().versionId() == claim.versionId()) {
+                boolean claimStillProvisioning =
+                    config.provisioningState() == ProvisioningState.PROVISIONING
+                        && current.version().versionId() == claim.versionId();
+                boolean compatibleCallerFinalizedClaim =
+                    config.provisioningState() == ProvisioningState.ACTIVE;
+                if (config.isOwnedBy(claim)
+                        && (claimStillProvisioning || compatibleCallerFinalizedClaim)) {
                     return CompletableFuture.completedFuture(null);
                 }
             } else if (!config.provisioning()
@@ -351,6 +483,32 @@ final class IndexedStreamConfigStore {
         return permanentlyDeleteExternalStreamAttempt(id, 0);
     }
 
+    CompletableFuture<Void> permanentlyDeleteAbsentExternalStream(StreamIdentifier id) {
+        Objects.requireNonNull(id, "id");
+        String path = catalogPaths.streamConfigPath(id);
+        StreamConfigData deleted = StreamConfigData.emptyPermanentDeletion();
+        return putWithResult(path, deleted, Set.of(PutOption.IfRecordDoesNotExist))
+            .handle((write, failure) ->
+                new CreateWrite(write, unwrapNullable(failure)))
+            .thenCompose(write -> {
+                if (write.failure() == null) {
+                    return CompletableFuture.completedFuture(null);
+                }
+                if (!(write.failure() instanceof KeyAlreadyExistsException)) {
+                    return CompletableFuture.failedFuture(write.failure());
+                }
+                return oxiaClient.get(path).thenCompose(current -> {
+                    if (current != null
+                            && isPermanentDeletionTombstone(current.value())) {
+                        return CompletableFuture.completedFuture(null);
+                    }
+                    return CompletableFuture.failedFuture(new AlreadyExistsException(
+                        "Stream lifecycle appeared during permanent deletion: "
+                            + id.fullName()));
+                });
+            });
+    }
+
     private CompletableFuture<Void> permanentlyDeleteExternalStreamAttempt(
             StreamIdentifier id, int retryCount) {
         String path = catalogPaths.streamConfigPath(id);
@@ -362,15 +520,15 @@ final class IndexedStreamConfigStore {
                     return CompletableFuture.failedFuture(new AlreadyExistsException(
                         "Stream is owned by a native catalog creation: " + id.fullName()));
                 }
-                if (config.provisioningState() == ProvisioningState.PROVISIONING) {
-                    return CompletableFuture.failedFuture(new AlreadyExistsException(
-                        "External stream registration is still provisioning: " + id.fullName()));
-                }
+                // Permanent deletion is the recovery escape hatch for a crashed external
+                // provisioner. The version-guarded tombstone fences an in-flight registration
+                // before it can finalize while retaining its durable owner identity so catalog
+                // cleanup can fence an allocation it may already have published.
                 if (config.provisioningState()
                         == ProvisioningState.PERMANENTLY_DELETED) {
                     return CompletableFuture.completedFuture(null);
                 }
-                deleted = config.permanentlyDelete(UUID.randomUUID().toString());
+                deleted = config.permanentlyDelete();
             } else {
                 deleted = StreamConfigData.emptyPermanentDeletion();
             }
@@ -472,6 +630,8 @@ final class IndexedStreamConfigStore {
                     || !current.ownerToken().equals(expected.config().ownerToken())
                     || !current.creationKind().equals(expected.config().creationKind())
                     || current.ownerGeneration() != expected.config().ownerGeneration()
+                    || !current.metadataSourceOwnerToken().equals(
+                        expected.config().metadataSourceOwnerToken())
                     || current.metadataSourceGeneration()
                         != expected.config().metadataSourceGeneration()) {
                 return CompletableFuture.failedFuture(
@@ -546,11 +706,12 @@ final class IndexedStreamConfigStore {
             if (result == null) {
                 return CompletableFuture.completedFuture(null);
             }
-            String reason = isPermanentDeletionTombstone(result.value())
-                ? "Stream identity was permanently deleted: "
-                : "Stream already exists: ";
+            if (isPermanentDeletionTombstone(result.value())) {
+                return CompletableFuture.failedFuture(
+                    new StreamPermanentlyDeletedException(id));
+            }
             return CompletableFuture.failedFuture(
-                new AlreadyExistsException(reason + id.fullName()));
+                new AlreadyExistsException("Stream already exists: " + id.fullName()));
         });
     }
 
@@ -597,10 +758,8 @@ final class IndexedStreamConfigStore {
                 return writeInitialClaim(id, desired, retryCount);
             }
             if (isPermanentDeletionTombstone(result.value())) {
-                return kind == CreationKind.EXTERNAL
-                    ? CompletableFuture.failedFuture(new NoSuchStreamException(id))
-                    : CompletableFuture.failedFuture(new AlreadyExistsException(
-                        "Stream identity was permanently deleted: " + id.fullName()));
+                return CompletableFuture.failedFuture(
+                    new StreamPermanentlyDeletedException(id));
             }
             StreamConfigData current = parse(id, result.value());
             if (requiredIncarnation.isPresent()
@@ -645,15 +804,10 @@ final class IndexedStreamConfigStore {
                 return CompletableFuture.failedFuture(new AlreadyExistsException(
                     "A different stream creation is already provisioning: " + id.fullName()));
             }
-            if (current.ownerToken().equals(Optional.of(ownerToken))) {
-                return CompletableFuture.completedFuture(new ProvisioningClaim(
-                    current, current.incarnationId().orElseThrow(), ownerToken, kind,
-                    current.ownerGeneration(),
-                    result.version().versionId()));
-            }
-            StreamConfigData takeover = current.takeover(ownerToken, partitions);
-            return writeTakeoverClaim(
-                id, takeover, result.version().versionId(), retryCount);
+            String durableOwnerToken = current.ownerToken().orElseThrow();
+            return CompletableFuture.completedFuture(new ProvisioningClaim(
+                current, current.incarnationId().orElseThrow(), durableOwnerToken, kind,
+                current.ownerGeneration(), result.version().versionId()));
         });
     }
 
@@ -707,24 +861,18 @@ final class IndexedStreamConfigStore {
                 }
                 if (check.config() != null
                         && isPermanentDeletionTombstone(check.config().value())) {
-                    return desired.creationKind().orElseThrow() == CreationKind.EXTERNAL
-                        ? CompletableFuture.failedFuture(
-                            new NoSuchStreamException(id, write.failure()))
-                        : CompletableFuture.failedFuture(new AlreadyExistsException(
-                            "Stream identity was permanently deleted: " + id.fullName()));
+                    return CompletableFuture.failedFuture(
+                        new StreamPermanentlyDeletedException(id, write.failure()));
                 }
                 if (write.failure() instanceof KeyAlreadyExistsException
                         || write.failure() instanceof UnexpectedVersionIdException) {
-                    if (initialWrite) {
-                        return CompletableFuture.failedFuture(new AlreadyExistsException(
-                            "Stream creation raced another lifecycle: " + id.fullName()));
-                    }
                     return retryAfterConflict(
                         id, "stream creation claim", retryCount, write.failure(),
                         () -> claimCreationAttempt(
                             id, desired.partitions(), desired.properties(),
                             desired.materialization(), desired.creationKind().orElseThrow(),
-                            desired.ownerToken().orElseThrow(), desired.incarnationId(),
+                            desired.ownerToken().orElseThrow(),
+                            initialWrite ? Optional.empty() : desired.incarnationId(),
                             retryCount + 1));
                 }
                 if (!initialWrite && check.config() != null
@@ -796,6 +944,10 @@ final class IndexedStreamConfigStore {
             if (observed.incarnationId().equals(expectedConfig.incarnationId())
                     && observed.ownerToken().equals(expectedConfig.ownerToken())
                     && observed.ownerGeneration() == expectedConfig.ownerGeneration()
+                    && observed.metadataSourceOwnerToken().equals(
+                        expectedConfig.metadataSourceOwnerToken())
+                    && observed.metadataSourceGeneration()
+                        == expectedConfig.metadataSourceGeneration()
                     && observed.creationKind().equals(expectedConfig.creationKind())
                     && observed.provisioningState()
                         == expectedConfig.provisioningState()
@@ -1105,6 +1257,8 @@ final class IndexedStreamConfigStore {
         if (config.ownerGeneration() >= 0) {
             node.put(OWNER_GENERATION_FIELD, config.ownerGeneration());
         }
+        config.metadataSourceOwnerToken().ifPresent(value ->
+            node.put(METADATA_SOURCE_OWNER_TOKEN_FIELD, value));
         if (config.metadataSourceGeneration() != NO_METADATA_GENERATION) {
             node.put(METADATA_SOURCE_GENERATION_FIELD, config.metadataSourceGeneration());
         }
@@ -1181,6 +1335,10 @@ final class IndexedStreamConfigStore {
                 : Optional.empty();
             long ownerGeneration = node.hasNonNull(OWNER_GENERATION_FIELD)
                 ? node.get(OWNER_GENERATION_FIELD).asLong() : -1L;
+            Optional<String> metadataSourceOwnerToken =
+                node.hasNonNull(METADATA_SOURCE_OWNER_TOKEN_FIELD)
+                    ? Optional.of(node.get(METADATA_SOURCE_OWNER_TOKEN_FIELD).asText())
+                    : Optional.empty();
             long metadataSourceGeneration = node.hasNonNull(METADATA_SOURCE_GENERATION_FIELD)
                 ? node.get(METADATA_SOURCE_GENERATION_FIELD).asLong()
                 : NO_METADATA_GENERATION;
@@ -1202,7 +1360,8 @@ final class IndexedStreamConfigStore {
             return new StreamConfigData(
                 partitions, properties, materialization, incarnationId,
                 ownerToken, creationKind, ownerGeneration,
-                metadataSourceGeneration, provisioningState, purgeRequested);
+                metadataSourceOwnerToken, metadataSourceGeneration,
+                provisioningState, purgeRequested);
         } catch (Exception e) {
             throw new RuntimeException("Failed to parse stream config for: " + id.fullName(), e);
         }
@@ -1279,7 +1438,8 @@ final class IndexedStreamConfigStore {
             Optional<TableMaterializationPolicy> materialization,
             Optional<String> incarnationId, Optional<String> ownerToken,
             Optional<CreationKind> creationKind,
-            long ownerGeneration, long metadataSourceGeneration,
+            long ownerGeneration, Optional<String> metadataSourceOwnerToken,
+            long metadataSourceGeneration,
             ProvisioningState provisioningState, boolean purgeRequested) {
 
         StreamConfigData {
@@ -1288,6 +1448,7 @@ final class IndexedStreamConfigStore {
             Objects.requireNonNull(incarnationId, "incarnationId");
             Objects.requireNonNull(ownerToken, "ownerToken");
             Objects.requireNonNull(creationKind, "creationKind");
+            Objects.requireNonNull(metadataSourceOwnerToken, "metadataSourceOwnerToken");
             Objects.requireNonNull(provisioningState, "provisioningState");
             if (ownerGeneration < LEGACY_METADATA_GENERATION
                     || metadataSourceGeneration < NO_METADATA_GENERATION) {
@@ -1300,6 +1461,11 @@ final class IndexedStreamConfigStore {
                 throw new IllegalArgumentException(
                     "Modern stream config requires incarnation, owner, and generation");
             }
+            if (metadataSourceOwnerToken.isPresent()
+                    && metadataSourceGeneration < 0) {
+                throw new IllegalArgumentException(
+                    "Modern metadata source requires owner token and generation");
+            }
         }
 
         StreamConfigData(
@@ -1307,7 +1473,7 @@ final class IndexedStreamConfigStore {
                 Optional<TableMaterializationPolicy> materialization) {
             this(partitions, properties, materialization, Optional.empty(),
                 Optional.empty(), Optional.empty(), LEGACY_METADATA_GENERATION,
-                NO_METADATA_GENERATION,
+                Optional.empty(), NO_METADATA_GENERATION,
                 ProvisioningState.ACTIVE, false);
         }
 
@@ -1318,7 +1484,7 @@ final class IndexedStreamConfigStore {
             return new StreamConfigData(
                 partitions, properties, materialization, Optional.of(incarnationId),
                 Optional.of(ownerToken), Optional.of(creationKind), 1L,
-                NO_METADATA_GENERATION,
+                Optional.empty(), NO_METADATA_GENERATION,
                 ProvisioningState.PROVISIONING, false);
         }
 
@@ -1334,7 +1500,23 @@ final class IndexedStreamConfigStore {
                 requestedPartitions, requestedProperties, requestedMaterialization,
                 Optional.of(newIncarnationId), Optional.of(newOwnerToken),
                 Optional.of(requestedKind), ownerGeneration + 1,
-                NO_METADATA_GENERATION, ProvisioningState.PROVISIONING, false);
+                Optional.empty(), NO_METADATA_GENERATION,
+                ProvisioningState.PROVISIONING, false);
+        }
+
+        StreamConfigData modernizeLegacyExternal(
+                String newOwnerToken, int requestedPartitions) {
+            if (provisioningState != ProvisioningState.ACTIVE
+                    || incarnationId.isPresent() || ownerToken.isPresent()
+                    || ownerGeneration != LEGACY_METADATA_GENERATION) {
+                throw new IllegalStateException(
+                    "Only an active legacy external stream can migrate its owner");
+            }
+            return new StreamConfigData(
+                Math.max(partitions, requestedPartitions), properties, materialization,
+                Optional.of(UUID.randomUUID().toString()), Optional.of(newOwnerToken),
+                Optional.of(CreationKind.EXTERNAL), 0L, Optional.empty(),
+                LEGACY_METADATA_GENERATION, ProvisioningState.PROVISIONING, false);
         }
 
         boolean provisioning() {
@@ -1356,6 +1538,9 @@ final class IndexedStreamConfigStore {
                 return incarnationId.equals(expected.incarnationId)
                     && ownerToken.equals(expected.ownerToken)
                     && ownerGeneration == expected.ownerGeneration
+                    && metadataSourceOwnerToken.equals(
+                        expected.metadataSourceOwnerToken)
+                    && metadataSourceGeneration == expected.metadataSourceGeneration
                     && creationKind.equals(expected.creationKind);
             }
             return incarnationId.isEmpty()
@@ -1381,15 +1566,6 @@ final class IndexedStreamConfigStore {
                 || partitions == requestedPartitions;
         }
 
-        StreamConfigData takeover(String newOwnerToken, int requestedPartitions) {
-            int updatedPartitions = creationKind.orElseThrow() == CreationKind.EXTERNAL
-                ? Math.max(partitions, requestedPartitions) : partitions;
-            return new StreamConfigData(
-                updatedPartitions, properties, materialization, incarnationId,
-                Optional.of(newOwnerToken), creationKind, ownerGeneration + 1,
-                metadataSourceGeneration, ProvisioningState.PROVISIONING, false);
-        }
-
         StreamConfigData resumeExternalRegistration(
                 String newOwnerToken, int requestedPartitions) {
             if (incarnationId.isEmpty()) {
@@ -1397,20 +1573,21 @@ final class IndexedStreamConfigStore {
                     Math.max(partitions, requestedPartitions), properties, materialization,
                     Optional.of(UUID.randomUUID().toString()), Optional.of(newOwnerToken),
                     Optional.of(CreationKind.EXTERNAL), 1L,
-                    LEGACY_METADATA_GENERATION,
+                    Optional.empty(), LEGACY_METADATA_GENERATION,
                     ProvisioningState.PROVISIONING, false);
             }
             return new StreamConfigData(
                 Math.max(partitions, requestedPartitions), properties, materialization,
                 incarnationId, Optional.of(newOwnerToken), creationKind,
-                ownerGeneration + 1, ownerGeneration,
+                ownerGeneration + 1, ownerToken, ownerGeneration,
                 ProvisioningState.PROVISIONING, false);
         }
 
         StreamConfigData activate() {
             return new StreamConfigData(
                 partitions, properties, materialization, incarnationId, ownerToken,
-                creationKind, ownerGeneration, metadataSourceGeneration,
+                creationKind, ownerGeneration, metadataSourceOwnerToken,
+                metadataSourceGeneration,
                 ProvisioningState.ACTIVE, purgeRequested);
         }
 
@@ -1423,41 +1600,38 @@ final class IndexedStreamConfigStore {
                 return new StreamConfigData(
                     partitions, properties, materialization,
                     Optional.of(UUID.randomUUID().toString()), Optional.of(newOwnerToken),
-                    creationKind, 1L, LEGACY_METADATA_GENERATION,
+                    creationKind, 1L, Optional.empty(), LEGACY_METADATA_GENERATION,
                     ProvisioningState.ABORTING, purgeRequested || purge);
             }
+            Optional<String> cleanupOwnerToken =
+                provisioningState == ProvisioningState.ABORTING
+                    ? metadataSourceOwnerToken : ownerToken;
             long cleanupGeneration = provisioningState == ProvisioningState.ABORTING
                 ? metadataSourceGeneration : ownerGeneration;
             return new StreamConfigData(
                 partitions, properties, materialization, incarnationId,
                 Optional.of(newOwnerToken), creationKind, ownerGeneration + 1,
-                cleanupGeneration, ProvisioningState.ABORTING,
+                cleanupOwnerToken, cleanupGeneration, ProvisioningState.ABORTING,
                 purgeRequested || purge);
         }
 
         StreamConfigData unregister() {
             return new StreamConfigData(
                 partitions, properties, materialization, incarnationId, ownerToken,
-                creationKind, ownerGeneration, ownerGeneration,
+                creationKind, ownerGeneration, ownerToken, ownerGeneration,
                 ProvisioningState.UNREGISTERED, purgeRequested);
         }
 
-        StreamConfigData permanentlyDelete(String newOwnerToken) {
-            long cleanupGeneration = provisioningState == ProvisioningState.ABORTING
-                    || provisioningState == ProvisioningState.PERMANENTLY_DELETED
+        StreamConfigData permanentlyDelete() {
+            boolean preserveMetadataSource = provisioningState.retainsExternalDeletionSpec();
+            Optional<String> cleanupOwnerToken = preserveMetadataSource
+                ? metadataSourceOwnerToken : ownerToken;
+            long cleanupGeneration = preserveMetadataSource
                 ? metadataSourceGeneration : ownerGeneration;
-            if (incarnationId.isEmpty()) {
-                return new StreamConfigData(
-                    partitions, properties, materialization,
-                    Optional.of(UUID.randomUUID().toString()), Optional.of(newOwnerToken),
-                    Optional.of(CreationKind.EXTERNAL), 1L,
-                    LEGACY_METADATA_GENERATION,
-                    ProvisioningState.PERMANENTLY_DELETED, true);
-            }
             return new StreamConfigData(
                 partitions, properties, materialization, incarnationId,
-                Optional.of(newOwnerToken), Optional.of(CreationKind.EXTERNAL),
-                ownerGeneration + 1, cleanupGeneration,
+                ownerToken, Optional.of(CreationKind.EXTERNAL),
+                ownerGeneration, cleanupOwnerToken, cleanupGeneration,
                 ProvisioningState.PERMANENTLY_DELETED, true);
         }
 
@@ -1467,7 +1641,8 @@ final class IndexedStreamConfigStore {
             }
             return new StreamConfigData(
                 partitions, properties, materialization, incarnationId, ownerToken,
-                creationKind, ownerGeneration, metadataSourceGeneration,
+                creationKind, ownerGeneration, metadataSourceOwnerToken,
+                metadataSourceGeneration,
                 ProvisioningState.DROPPED, purgeRequested);
         }
 
@@ -1475,21 +1650,23 @@ final class IndexedStreamConfigStore {
             return new StreamConfigData(
                 0, Map.of(), Optional.empty(), Optional.empty(), Optional.empty(),
                 Optional.of(CreationKind.EXTERNAL), LEGACY_METADATA_GENERATION,
-                NO_METADATA_GENERATION,
+                Optional.empty(), NO_METADATA_GENERATION,
                 ProvisioningState.PERMANENTLY_DELETED, true);
         }
 
         StreamConfigData withPartitions(int newPartitions) {
             return new StreamConfigData(
                 newPartitions, properties, materialization, incarnationId, ownerToken,
-                creationKind, ownerGeneration, metadataSourceGeneration, provisioningState,
+                creationKind, ownerGeneration, metadataSourceOwnerToken,
+                metadataSourceGeneration, provisioningState,
                 purgeRequested);
         }
 
         StreamConfigData withProperties(Map<String, String> newProperties) {
             return new StreamConfigData(
                 partitions, newProperties, materialization, incarnationId, ownerToken,
-                creationKind, ownerGeneration, metadataSourceGeneration, provisioningState,
+                creationKind, ownerGeneration, metadataSourceOwnerToken,
+                metadataSourceGeneration, provisioningState,
                 purgeRequested);
         }
 
@@ -1497,7 +1674,8 @@ final class IndexedStreamConfigStore {
                 Optional<TableMaterializationPolicy> newMaterialization) {
             return new StreamConfigData(
                 partitions, properties, newMaterialization, incarnationId, ownerToken,
-                creationKind, ownerGeneration, metadataSourceGeneration, provisioningState,
+                creationKind, ownerGeneration, metadataSourceOwnerToken,
+                metadataSourceGeneration, provisioningState,
                 purgeRequested);
         }
 
@@ -1506,6 +1684,8 @@ final class IndexedStreamConfigStore {
                 && incarnationId.equals(other.incarnationId)
                 && ownerToken.equals(other.ownerToken)
                 && ownerGeneration == other.ownerGeneration
+                && metadataSourceOwnerToken.equals(other.metadataSourceOwnerToken)
+                && metadataSourceGeneration == other.metadataSourceGeneration
                 && creationKind.equals(other.creationKind)
                 && purgeRequested == other.purgeRequested;
         }
@@ -1535,6 +1715,10 @@ final class IndexedStreamConfigStore {
                 && ownerToken.equals(Optional.of(claim.ownerToken()))
                 && incarnationId.equals(claim.config().incarnationId())
                 && ownerGeneration == claim.config().ownerGeneration()
+                && metadataSourceOwnerToken.equals(
+                    claim.config().metadataSourceOwnerToken())
+                && metadataSourceGeneration
+                    == claim.config().metadataSourceGeneration()
                 && creationKind.equals(claim.config().creationKind());
         }
 
@@ -1544,6 +1728,7 @@ final class IndexedStreamConfigStore {
                 && incarnationId.equals(expected.incarnationId)
                 && ownerToken.equals(expected.ownerToken)
                 && ownerGeneration == expected.ownerGeneration
+                && metadataSourceOwnerToken.equals(expected.metadataSourceOwnerToken)
                 && metadataSourceGeneration == expected.metadataSourceGeneration
                 && creationKind.equals(expected.creationKind)
                 && purgeRequested == expected.purgeRequested;
@@ -1583,6 +1768,11 @@ final class IndexedStreamConfigStore {
                 ? config.ownerGeneration() : config.metadataSourceGeneration();
         }
 
+        Optional<String> metadataOwnerToken() {
+            return config.provisioningState() == ProvisioningState.ACTIVE
+                ? config.ownerToken() : config.metadataSourceOwnerToken();
+        }
+
         boolean canRetryWith(ExternalDeletionContext successor) {
             StreamConfigData previous = config;
             StreamConfigData next = successor.config();
@@ -1594,6 +1784,7 @@ final class IndexedStreamConfigStore {
             }
             if (previous.incarnationId().isEmpty()) {
                 return next.provisioningState().retainsExternalDeletionSpec()
+                    && next.metadataSourceOwnerToken().isEmpty()
                     && next.metadataSourceGeneration() == LEGACY_METADATA_GENERATION;
             }
             if (!next.incarnationId().equals(previous.incarnationId())) {
@@ -1603,10 +1794,15 @@ final class IndexedStreamConfigStore {
                 return previous.provisioningState() == ProvisioningState.ACTIVE
                     && next.ownerGeneration() == previous.ownerGeneration()
                     && next.ownerToken().equals(previous.ownerToken())
+                    && next.metadataSourceOwnerToken().equals(
+                        previous.metadataSourceOwnerToken())
+                    && next.metadataSourceGeneration()
+                        == previous.metadataSourceGeneration()
                     && next.creationKind().equals(previous.creationKind());
             }
             return next.provisioningState().retainsExternalDeletionSpec()
                 && next.ownerGeneration() >= previous.ownerGeneration()
+                && next.metadataSourceOwnerToken().equals(metadataOwnerToken())
                 && next.metadataSourceGeneration() == metadataGeneration();
         }
     }
@@ -1624,21 +1820,25 @@ final class IndexedStreamConfigStore {
             Optional<String> activeIncarnation,
             Optional<String> activeOwnerToken,
             Optional<CreationKind> activeKind, long activeOwnerGeneration,
+            Optional<String> activeMetadataSourceOwnerToken,
             long activeMetadataSourceGeneration, long activeVersionId) {
 
         static ExternalRegistration provisioning(ProvisioningClaim claim) {
             return new ExternalRegistration(
                 Optional.of(claim), Optional.empty(), Optional.empty(), Optional.empty(),
-                LEGACY_METADATA_GENERATION, NO_METADATA_GENERATION, -1L);
+                LEGACY_METADATA_GENERATION, Optional.empty(),
+                NO_METADATA_GENERATION, -1L);
         }
 
         static ExternalRegistration active(
                 Optional<String> activeIncarnation, Optional<String> activeOwnerToken,
                 Optional<CreationKind> activeKind, long activeOwnerGeneration,
+                Optional<String> activeMetadataSourceOwnerToken,
                 long activeMetadataSourceGeneration, long activeVersionId) {
             return new ExternalRegistration(
                 Optional.empty(), activeIncarnation, activeOwnerToken,
                 activeKind, activeOwnerGeneration,
+                activeMetadataSourceOwnerToken,
                 activeMetadataSourceGeneration, activeVersionId);
         }
 
@@ -1671,6 +1871,11 @@ final class IndexedStreamConfigStore {
                 .orElse(activeMetadataSourceGeneration);
         }
 
+        Optional<String> metadataSourceOwnerToken() {
+            return claim.map(value -> value.config().metadataSourceOwnerToken())
+                .orElse(activeMetadataSourceOwnerToken);
+        }
+
         boolean provisioning() {
             return claim.isPresent();
         }
@@ -1691,6 +1896,14 @@ final class IndexedStreamConfigStore {
 
         private VerificationUnknownException(Throwable cause) {
             super("Stream registration verification outcome is unknown", cause);
+        }
+    }
+
+    static final class ExternalRegistrationLifecycleConflictException
+            extends AlreadyExistsException {
+
+        private ExternalRegistrationLifecycleConflictException(String message) {
+            super(message);
         }
     }
 

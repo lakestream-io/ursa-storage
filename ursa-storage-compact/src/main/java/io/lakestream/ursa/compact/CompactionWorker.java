@@ -7,6 +7,8 @@ package io.lakestream.ursa.compact;
 import io.lakestream.api.Stream;
 import io.lakestream.api.StreamCatalog;
 import io.lakestream.api.StreamIdentifier;
+import io.lakestream.api.exception.PartitionLifecycleFencedException;
+import io.lakestream.api.exception.StreamPermanentlyDeletedException;
 import io.lakestream.api.materialization.ResolvedMaterialization;
 import io.lakestream.api.materialization.TableCatalog;
 import io.lakestream.ursa.compaction.CompactTaskManager;
@@ -309,16 +311,16 @@ public class CompactionWorker implements Runnable {
             // This bridge makes externally-created stream metadata visible to Lakestream.
             streamCatalog.registerExternalPartition(id, partitionIndex, task.getStreamId(), props).join();
         } catch (RuntimeException re) {
-            throw new MaterializationException(ExceptionCode.INTERNAL_ERROR,
-                    "Failed to register stream " + id.fullName() + " for materialization", re);
+            throw catalogFailure(
+                "Failed to register stream " + id.fullName() + " for materialization", re);
         }
         Stream stream;
         try {
             stream = streamCatalog.loadStream(id).join();
         } catch (RuntimeException re) {
             // Do not silently skip: a transient load failure would drop the range. Retry.
-            throw new MaterializationException(ExceptionCode.INTERNAL_ERROR,
-                    "Failed to load stream " + id.fullName() + " for materialization", re);
+            throw catalogFailure(
+                "Failed to load stream " + id.fullName() + " for materialization", re);
         }
         boolean ownershipTransferred = false;
         Throwable materializationFailure = null;
@@ -418,6 +420,30 @@ public class CompactionWorker implements Runnable {
     private static boolean isRetryableQuarantineCode(ExceptionCode code) {
         return code == ExceptionCode.NO_MORE_RECORDS
             || code == ExceptionCode.SOURCE_CLIENT_ERROR;
+    }
+
+    private static MaterializationException catalogFailure(
+            String message, RuntimeException failure) {
+        ExceptionCode code = hasCause(failure, StreamPermanentlyDeletedException.class)
+                || hasCause(failure, PartitionLifecycleFencedException.class)
+            ? ExceptionCode.NO_SUCH_STREAM
+            : ExceptionCode.INTERNAL_ERROR;
+        return new MaterializationException(code, message, failure);
+    }
+
+    private static boolean hasCause(Throwable failure, Class<? extends Throwable> type) {
+        Throwable current = failure;
+        while (current != null) {
+            if (type.isInstance(current)) {
+                return true;
+            }
+            Throwable cause = current.getCause();
+            if (cause == current) {
+                break;
+            }
+            current = cause;
+        }
+        return false;
     }
 
     private static ExceptionCode exceptionCode(Throwable error) {

@@ -144,12 +144,12 @@ class StorageApiLogStorageTest {
     @Test
     void testDeleteLogDelegatesToStorageApi() throws Exception {
         LogId logId = LogId.of(400);
-        when(storageApi.deleteStream(eq(400L), eq(Optional.empty())))
+        when(storageApi.deleteStream(400L))
             .thenReturn(CompletableFuture.completedFuture(null));
 
         logStorage.deleteLog(logId).get();
 
-        verify(storageApi).deleteStream(eq(400L), eq(Optional.empty()));
+        verify(storageApi).deleteStream(400L);
     }
 
     @Test
