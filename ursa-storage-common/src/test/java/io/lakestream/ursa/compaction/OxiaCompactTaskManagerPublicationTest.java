@@ -4,6 +4,7 @@
  */
 package io.lakestream.ursa.compaction;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -113,6 +114,49 @@ class OxiaCompactTaskManagerPublicationTest {
         verify(client, times(1)).get(eq(cursorKey), eq(Set.of(GetOption.PartitionKey(TOPIC))));
         verify(client, times(1)).put(eq(cursorKey), any(), eq(Set.of(
                 PutOption.PartitionKey(TOPIC), PutOption.IfVersionIdEquals(11L))));
+    }
+
+    @Test
+    void cursorAdvancePersistsCumulativeSize() throws Exception {
+        AsyncOxiaClient client = mock(AsyncOxiaClient.class);
+        CompactTaskManager.PublicationLease lease =
+                new CompactTaskManager.PublicationLease(TOPIC, STREAM_ID, "owner", 7L);
+        byte[] leaseValue = (STREAM_ID + "\n" + lease.ownerId()).getBytes(StandardCharsets.UTF_8);
+        when(client.get(anyString(), anySet())).thenReturn(CompletableFuture.completedFuture(
+                new GetResult("lease", leaseValue, version(lease.revision()))));
+        String cursorKey = "compact-offset-" + TOPIC;
+        when(client.put(eq(cursorKey), any(), anySet())).thenReturn(CompletableFuture.completedFuture(
+                new PutResult(cursorKey, version(12L))));
+        OxiaCompactTaskManager manager = new OxiaCompactTaskManager(client);
+        CompactTaskManager.PublishedOffsetClaim current = new CompactTaskManager.PublishedOffsetClaim(
+                new CompactedOffset(STREAM_ID, 9L, 100L), 11L);
+        CompactedOffset updated = new CompactedOffset(STREAM_ID, 19L, 250L);
+
+        CompactTaskManager.PublishedOffsetClaim result =
+                manager.compareAndSetPublishedOffset(lease, current, updated);
+
+        ArgumentCaptor<byte[]> serialized = ArgumentCaptor.forClass(byte[].class);
+        verify(client).put(eq(cursorKey), serialized.capture(), eq(Set.of(
+                PutOption.PartitionKey(TOPIC), PutOption.IfVersionIdEquals(11L))));
+        assertEquals(updated, CompactOffsetSerde.INSTANCE.deserialize(serialized.getValue()));
+        assertEquals(250L, result.offset().getCumulativeSize());
+    }
+
+    @Test
+    void namedOffsetUpdatePersistsCumulativeSize() throws Exception {
+        AsyncOxiaClient client = mock(AsyncOxiaClient.class);
+        String cursorKey = "compact-offset-" + TOPIC;
+        when(client.put(eq(cursorKey), any(), anySet())).thenReturn(CompletableFuture.completedFuture(
+                new PutResult(cursorKey, version(12L))));
+        OxiaCompactTaskManager manager = new OxiaCompactTaskManager(client);
+
+        manager.updatePublishedOffset(TOPIC, STREAM_ID, 19L, 250L);
+
+        ArgumentCaptor<byte[]> serialized = ArgumentCaptor.forClass(byte[].class);
+        verify(client).put(eq(cursorKey), serialized.capture(), eq(Set.of(PutOption.PartitionKey(TOPIC))));
+        assertEquals(
+                new CompactedOffset(STREAM_ID, 19L, 250L),
+                CompactOffsetSerde.INSTANCE.deserialize(serialized.getValue()));
     }
 
     @Test

@@ -24,6 +24,14 @@ import java.util.concurrent.CompletableFuture;
  * </ul>
  *
  * <p>Thread safety: implementations must be safe for concurrent use.
+ *
+ * <p>Stream creation and external-partition registration ensure that the referenced namespace
+ * exists. If it is absent, they first create an empty namespace with create-only semantics; an
+ * existing namespace's properties and materialization policy are never overwritten. The implicit
+ * namespace remains even if the subsequent stream operation fails. Because it is then an existing
+ * namespace, callers should use {@link #setNamespaceProperties} and
+ * {@link #setNamespaceMaterialization} to configure it rather than calling
+ * {@link #createNamespace}.
  */
 public interface StreamCatalog extends AutoCloseable {
 
@@ -195,6 +203,10 @@ public interface StreamCatalog extends AutoCloseable {
     /**
      * Creates a new stream.
      *
+     * <p>If necessary, this operation first creates the empty namespace described by the
+     * interface-level namespace lifecycle contract. That namespace is not rolled back when stream
+     * provisioning fails.
+     *
      * @param id the stream identifier
      * @param config stream configuration
      * @param partitioning partitioning configuration
@@ -213,6 +225,10 @@ public interface StreamCatalog extends AutoCloseable {
 
     /**
      * Creates a new stream with an optional stream-level materialization policy.
+     *
+     * <p>If necessary, this operation first creates the empty namespace described by the
+     * interface-level namespace lifecycle contract. That namespace is not rolled back when stream
+     * provisioning fails.
      *
      * @param id the stream identifier
      * @param config stream configuration
@@ -261,6 +277,10 @@ public interface StreamCatalog extends AutoCloseable {
      * open the partition again. That stream-level transition advances the ownership generation and
      * preserves the fence against delayed writers from the deleted generation.
      *
+     * <p>If necessary, this operation first creates an empty namespace with create-only semantics.
+     * The namespace is retained if registration later fails and can be configured through the
+     * namespace mutation methods on this catalog.
+     *
      * @param id             the partition-stripped stream identity
      * @param partitionIndex the partition being registered (0 for a non-partitioned stream)
      * @param streamId       the underlying log id for this partition; it must be globally unique
@@ -281,6 +301,9 @@ public interface StreamCatalog extends AutoCloseable {
      *
      * <p>The implementation derives the persistent log name, creates or reuses its keyed log ID,
      * registers the partition in the catalog, and returns a reader-aware log handle.
+     * If necessary, it first creates an empty namespace with create-only semantics. The namespace
+     * is retained if opening or registration later fails and can be configured through the
+     * namespace mutation methods on this catalog.
      *
      * @param id the partition-stripped stream identity
      * @param partitionIndex the zero-based partition index

@@ -518,13 +518,29 @@ public class OxiaCompactTaskManager implements CompactTaskManager {
     }
 
     @Override
-    public void updatePublishedOffset(String name, long streamId, long offset)
+    public void updatePublishedOffset(
+            String name, long streamId, long offset, long cumulativeSize)
         throws IOException, ExecutionException, InterruptedException {
-        CompactedOffset compactedOffset = new CompactedOffset(streamId, offset, 0);
+        validateNamedPublishedOffset(offset, cumulativeSize);
+        CompactedOffset compactedOffset = new CompactedOffset(streamId, offset, cumulativeSize);
         byte[] data = CompactOffsetSerde.INSTANCE.serialize(compactedOffset);
         String key = publishedOffsetKey(name);
         oxiaClient.put(key, data, Set.of(PutOption.PartitionKey(name))).get();
-        log.debug("Update compacted {} offset with offset: {}:{}", key, streamId, offset);
+        log.debug("Update compacted {} offset with offset: {}:{} and cumulative size {}",
+                key, streamId, offset, cumulativeSize);
+    }
+
+    private static void validateNamedPublishedOffset(long offset, long cumulativeSize) {
+        if (offset < -1) {
+            throw new IllegalArgumentException("Published offset must be at least -1");
+        }
+        if (cumulativeSize < 0) {
+            throw new IllegalArgumentException("Published cumulative size must be non-negative");
+        }
+        if (offset == -1 && cumulativeSize != 0) {
+            throw new IllegalArgumentException(
+                    "Published cumulative size must be 0 when the published offset is -1");
+        }
     }
 
     @Override

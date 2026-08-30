@@ -117,6 +117,45 @@ class CompactionTaskProviderV2Test {
     }
 
     @Test
+    @Timeout(10)
+    void testGetTask_PendingOrphanCleanupDoesNotBlockHealthyTasksOrTightLoop() throws Exception {
+        provider = new CompactionTaskProviderV2(taskManager, compactionMetrics, 60_000, 10.0);
+        PackagedCompactStreamTask orphan = createMockPackagedTask("orphan", List.of());
+        PackagedCompactStreamTask healthy = createMockPackagedTask("task1", List.of("sub1"));
+        CompactStreamTask healthySubTask = createMockCompactStreamTask("task1", "sub1", 1);
+        CompletableFuture<Boolean> pendingCleanup = new CompletableFuture<>();
+        when(taskManager.getAllTasks())
+            .thenReturn(CompletableFuture.completedFuture(List.of(orphan, healthy)));
+        when(taskManager.deletePackagedTaskNameIfEmpty("orphan"))
+            .thenReturn(pendingCleanup);
+        when(taskManager.getCompactStreamTask("sub1"))
+            .thenReturn(CompletableFuture.completedFuture(healthySubTask));
+
+        PackagedCompactStreamTask result = provider.getTask();
+
+        assertNotNull(result);
+        assertEquals("task1", result.getTaskName());
+        assertTrue(provider.getLastFetchTimestamp() > 0);
+        assertNull(provider.getTask());
+        verify(taskManager, times(1)).getAllTasks();
+        verify(taskManager).deletePackagedTaskNameIfEmpty("orphan");
+        pendingCleanup.completeExceptionally(new RuntimeException("transient Oxia failure"));
+    }
+
+    @Test
+    void testGetTask_FetchFailureRespectsMinFetchInterval() throws Exception {
+        provider = new CompactionTaskProviderV2(taskManager, compactionMetrics, 60_000, 10.0);
+        when(taskManager.getAllTasks())
+            .thenReturn(CompletableFuture.failedFuture(new RuntimeException("transient Oxia failure")));
+
+        assertNull(provider.getTask());
+        assertTrue(provider.getLastFetchTimestamp() > 0);
+        assertNull(provider.getTask());
+
+        verify(taskManager, times(1)).getAllTasks();
+    }
+
+    @Test
     void testGetTask_RespectMinFetchInterval() throws Exception {
         // Given
         provider = new CompactionTaskProviderV2(taskManager, compactionMetrics, 5000, 10.0);
@@ -200,7 +239,7 @@ class CompactionTaskProviderV2Test {
     @Test
     void testQuarantineTask_ShouldReleaseAfterTimeout() throws Exception {
         // Given
-        provider = new CompactionTaskProviderV2(taskManager, compactionMetrics, 100, 10.0);
+        provider = new CompactionTaskProviderV2(taskManager, compactionMetrics, 0, 10.0);
 
         PackagedCompactStreamTask task1 = createMockPackagedTask("task1", List.of("sub1"));
         CompactStreamTask subTask1 = createMockCompactStreamTask("task1", "sub1", 1);
@@ -213,21 +252,16 @@ class CompactionTaskProviderV2Test {
         assertNotNull(firstTask);
         assertEquals("task1", firstTask.getTaskName());
 
-        // Now the queue is empty, quarantine task1 for 200ms
-        provider.quarantineTask(System.currentTimeMillis() + 200, "task1");
-
-        // Wait for min fetch interval to pass
-        Thread.sleep(150);
+        // Now the queue is empty, quarantine task1 in the future.
+        provider.quarantineTask(System.currentTimeMillis() + 5_000, "task1");
 
         // Try to get task - should fetch but task is quarantined
         PackagedCompactStreamTask result1 = provider.getTask();
         assertNull(result1);
 
-        // Wait for quarantine to expire
-        Thread.sleep(100);
-
-        // When - try to get task again after min interval
-        Thread.sleep(100); // Ensure min fetch interval has passed
+        // Replace the quarantine deadline with an expired one instead of relying on a narrow
+        // wall-clock sleep window, which makes this test deterministic under a loaded CI worker.
+        provider.quarantineTask(System.currentTimeMillis() - 1, "task1");
         PackagedCompactStreamTask result2 = provider.getTask();
 
         // Then - should now get the task

@@ -52,13 +52,16 @@ import lombok.extern.slf4j.Slf4j;
  * <p>The catalog is the source of truth for both native streams and externally registered streams.
  * A long-lived fenced {@link CompactionManager.PublicationSession} is held for every physical log
  * incarnation. Stream deletion, partition removal, or replacement by a different physical log ID
- * fences the old session before it can be removed or replaced.
+ * removes and synchronously fences the old local session before a replacement lease is acquired.
+ * Publication identifies readable log ranges and does not resolve Kafka schemas; schema resolution
+ * and its terminal-failure policy belong to the downstream materialization worker.
  */
 @Slf4j
 public final class PublishCompactTaskRunner implements Runnable, StartStopRunner {
 
     static final String ENTRY_FORMAT_PROPERTY = "entryFormat";
     private static final int MAX_FAIR_PUBLICATION_QUANTUM = 100;
+    private static final AttributeKey<String> TOPIC_ATTRIBUTE = AttributeKey.stringKey("topic");
 
     private final StreamCatalog streamCatalog;
     private final CompactionManager compactionManager;
@@ -75,6 +78,7 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
     private final CompactionMetrics compactionMetrics;
     private final Map<String, PartitionPublisher> publishers = new ConcurrentHashMap<>();
     private final Map<String, Long> tailWaitStartedAtMillis = new ConcurrentHashMap<>();
+    private final Map<String, Long> unavailablePublicationLeases = new ConcurrentHashMap<>();
     private final AtomicBoolean pendingLeaseReleaseRetryScheduled = new AtomicBoolean();
 
     private volatile boolean stopped;
@@ -119,8 +123,18 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
                 Math.max(0L, storageConfig.getTailCompactDataVisibilityIntervalInSeconds()));
         this.excludedNamespaces = Set.copyOf(storageConfig.getBlackNamespaceOfCompact());
         this.excludedStreams = storageConfig.getBlackTopicOfCompact().stream()
-                .map(TopicNames::partitionedTopicName)
+                .map(PublishCompactTaskRunner::parseExcludedStream)
+                .flatMap(Optional::stream)
                 .collect(Collectors.toUnmodifiableSet());
+    }
+
+    private static Optional<String> parseExcludedStream(String configuredName) {
+        try {
+            return Optional.of(TopicNames.partitionedTopicName(configuredName));
+        } catch (RuntimeException invalidName) {
+            log.warn("Ignoring invalid blackTopicOfCompact entry '{}'", configuredName, invalidName);
+            return Optional.empty();
+        }
     }
 
     @Override
@@ -135,18 +149,24 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
 
     @Override
     public void run() {
+        boolean scheduleNextScan = true;
         try {
-            do {
-                scanCatalogOnce();
-            } while (!stopped && backlogRemaining);
-        } catch (Throwable error) {
+            scanCatalogOnce();
+            while (!stopped && backlogRemaining) {
+                drainPublisherBacklogOnce();
+            }
+        } catch (Exception error) {
+            recordActivePublisherCount();
             if (!stopped) {
                 log.warn("Failed to discover streams and publish compaction tasks", error);
                 compactionMetrics.getPublishTaskFailedCount().increment();
             }
+        } catch (Error fatal) {
+            scheduleNextScan = false;
+            throw fatal;
         } finally {
             synchronized (this) {
-                if (!stopped) {
+                if (!stopped && scheduleNextScan) {
                     long nextDelayMillis = publicationLeaseUnavailable
                             ? Math.min(1000L, scanIntervalMillis) : scanIntervalMillis;
                     nextScanFuture = publishExecutor.schedule(
@@ -162,6 +182,7 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
         publicationLeaseUnavailable = false;
         retryPendingLeaseReleases();
         Map<String, PartitionIdentity> discovered = discoverPartitions();
+        unavailablePublicationLeases.keySet().retainAll(discovered.keySet());
         if (stopped) {
             return;
         }
@@ -177,33 +198,80 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
             }
         }
 
+        publishDiscovered(discovered.values());
+        recordActivePublisherCount();
+    }
+
+    private void recordActivePublisherCount() {
+        long logicalStreamCount = publishers.values().stream()
+                .map(PartitionPublisher::identity)
+                .map(PartitionIdentity::stream)
+                .distinct()
+                .count();
+        compactionMetrics.getOngoingCompactionTopicCount().set(logicalStreamCount);
+    }
+
+    /** Drains another fair quantum without repeating namespace and stream discovery. */
+    private void drainPublisherBacklogOnce() throws Exception {
+        backlogRemaining = false;
+        retryPendingLeaseReleases();
+        publishExisting(List.copyOf(publishers.values()));
+        recordActivePublisherCount();
+    }
+
+    private void publishDiscovered(Iterable<PartitionIdentity> discovered) throws Exception {
         List<Future<?>> publicationFutures = new ArrayList<>();
-        for (PartitionIdentity identity : discovered.values()) {
+        for (PartitionIdentity identity : discovered) {
             if (stopped) {
-                return;
+                break;
             }
             try {
-                PartitionPublisher publisher = publishers.get(identity.taskTopic());
-                if (publisher == null) {
-                    publisher = openPublisher(identity);
-                    if (publisher == null) {
-                        continue;
-                    }
-                }
-                publisher.identity(identity);
-                PartitionPublisher selected = publisher;
-                publicationFutures.add(publishExecutor.submit(() -> publishAvailable(selected)));
+                publicationFutures.add(publishExecutor.submit(() -> publishIdentity(identity)));
             } catch (RejectedExecutionException rejected) {
                 if (!stopped) {
                     recordPartitionFailure(identity.taskTopic(), "schedule task publication", rejected);
                 }
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-                throw interrupted;
-            } catch (Exception error) {
-                recordPartitionFailure(identity.taskTopic(), "open task publisher", error);
             }
         }
+        awaitPublication(publicationFutures, "catalog scan");
+    }
+
+    private void publishExisting(List<PartitionPublisher> existing) throws Exception {
+        List<Future<?>> publicationFutures = new ArrayList<>();
+        for (PartitionPublisher publisher : existing) {
+            if (stopped) {
+                break;
+            }
+            try {
+                publicationFutures.add(publishExecutor.submit(() -> publishAvailable(publisher)));
+            } catch (RejectedExecutionException rejected) {
+                if (!stopped) {
+                    recordPartitionFailure(
+                            publisher.identity().taskTopic(), "schedule backlog publication", rejected);
+                }
+            }
+        }
+        awaitPublication(publicationFutures, "publisher backlog");
+    }
+
+    private void publishIdentity(PartitionIdentity identity) {
+        try {
+            PartitionPublisher publisher = publishers.get(identity.taskTopic());
+            if (publisher == null) {
+                publisher = openPublisher(identity);
+                if (publisher == null) {
+                    return;
+                }
+            }
+            publishAvailable(publisher);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        } catch (Exception error) {
+            recordPartitionFailure(identity.taskTopic(), "open task publisher", error);
+        }
+    }
+
+    private void awaitPublication(List<Future<?>> publicationFutures, String scope) throws Exception {
         for (Future<?> publicationFuture : publicationFutures) {
             try {
                 publicationFuture.get();
@@ -211,10 +279,12 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
                 Thread.currentThread().interrupt();
                 throw interrupted;
             } catch (ExecutionException error) {
-                recordPartitionFailure("catalog scan", "complete task publication", error.getCause());
+                if (error.getCause() instanceof Error fatal) {
+                    throw fatal;
+                }
+                recordPartitionFailure(scope, "complete task publication", error.getCause());
             }
         }
-        compactionMetrics.getOngoingCompactionTopicCount().set(discovered.size());
     }
 
     private Map<String, PartitionIdentity> discoverPartitions() throws Exception {
@@ -248,7 +318,7 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
                             }
                             String taskTopic = taskTopic(identifier, partition);
                             PartitionIdentity previous = discovered.putIfAbsent(taskTopic,
-                                    new PartitionIdentity(identifier, partition, logId, taskTopic));
+                                    new PartitionIdentity(identifier, partition, logId));
                             if (previous != null) {
                                 recordPartitionFailure(taskTopic, "discover physical log",
                                         new IllegalStateException(
@@ -279,8 +349,19 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
         }
         if (session.isEmpty()) {
             publicationLeaseUnavailable = true;
+            Long previousUnavailableStream = unavailablePublicationLeases.put(
+                    identity.taskTopic(), identity.logId().id());
+            if (previousUnavailableStream == null
+                    || previousUnavailableStream != identity.logId().id()) {
+                log.warn("Compaction publication lease for {} (physical log {}) is held by another owner; "
+                                + "publication will be retried",
+                        identity.taskTopic(), identity.logId().id());
+                compactionMetrics.getPublicationLeaseUnavailableCount().increment(
+                        Attributes.of(TOPIC_ATTRIBUTE, identity.taskTopic()));
+            }
             return null;
         }
+        unavailablePublicationLeases.remove(identity.taskTopic(), identity.logId().id());
 
         PartitionPublisher candidate = new PartitionPublisher(identity, session.orElseThrow());
         PartitionPublisher selected = null;
@@ -318,15 +399,14 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
     private CompactionManager.PublicationResult publishNext(PartitionPublisher publisher) throws Exception {
         try {
             TaskSnapshot[] task = new TaskSnapshot[1];
-            CompactionManager.PublicationResult result = publisher.session().publishNext(lastPublishedOffset -> {
-                TaskSnapshot snapshot = createTask(publisher.identity(), lastPublishedOffset);
+            CompactionManager.PublicationResult result = publisher.session().publishNext(cursor -> {
+                TaskSnapshot snapshot = createTask(publisher.identity(), cursor);
                 task[0] = snapshot;
                 return snapshot == null ? Optional.empty() : Optional.of(snapshot.task());
             });
             if (result == CompactionManager.PublicationResult.PUBLISHED && task[0] != null) {
                 long latestOffset = task[0].latestOffset();
-                Attributes attributes = Attributes.of(
-                        AttributeKey.stringKey("topic"), publisher.identity().taskTopic());
+                Attributes attributes = Attributes.of(TOPIC_ATTRIBUTE, publisher.identity().taskTopic());
                 compactionMetrics.getLatestMessageOffset().set(latestOffset, attributes);
                 compactionMetrics.getCompactionLag().set(
                         latestOffset - task[0].publishedOffset(), attributes);
@@ -343,7 +423,13 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
         }
     }
 
-    private TaskSnapshot createTask(PartitionIdentity expected, long lastPublishedOffset) throws Exception {
+    private TaskSnapshot createTask(
+            PartitionIdentity expected,
+            CompactionManager.PublicationCursor publishedCursor) throws Exception {
+        if (publishedCursor.streamId() != expected.logId().id()) {
+            throw new PublicationFencedException(
+                    "Published cursor for " + expected.taskTopic() + " belongs to a different physical log");
+        }
         try (Stream stream = streamCatalog.loadStream(expected.stream()).get()) {
             List<LogId> logIds = stream.layout().logIds().get();
             if (expected.partition() >= logIds.size()
@@ -356,12 +442,12 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
                     return null;
                 }
                 long endOffset = Math.addExact(last.offset(), last.numberOfRecords());
-                long startOffset = Math.addExact(lastPublishedOffset, 1L);
+                long startOffset = Math.addExact(publishedCursor.offset(), 1L);
                 if (startOffset >= endOffset) {
                     return null;
                 }
 
-                long startCumulativeSize = cumulativeSizeAt(logHandle, lastPublishedOffset);
+                long startCumulativeSize = publishedCursor.cumulativeSize();
                 LogOffset selectedEnd = selectTaskEnd(
                         logHandle, expected.taskTopic(), startOffset, startCumulativeSize, last);
                 if (selectedEnd == null) {
@@ -369,7 +455,7 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
                 }
                 long selectedEndOffset = Math.addExact(
                         selectedEnd.offset(), selectedEnd.numberOfRecords());
-                long totalSize = Math.max(0L, selectedEnd.cumulativeSize() - startCumulativeSize);
+                long totalSize = Math.subtractExact(selectedEnd.cumulativeSize(), startCumulativeSize);
                 Map<String, String> taskProperties = resolveTaskProperties(stream.properties());
                 PreparedCompactStreamTask task = new PreparedCompactStreamTask(
                         expected.logId().id(),
@@ -418,8 +504,12 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
             }
         }
 
-        long selectedSize = selected.cumulativeSize() - startCumulativeSize;
-        if (selectedSize <= 0) {
+        long selectedSize = Math.subtractExact(selected.cumulativeSize(), startCumulativeSize);
+        if (selectedSize < 0) {
+            throw new IllegalStateException(
+                    "Selected compaction range ends before the persisted cumulative-size cursor");
+        }
+        if (selectedSize == 0) {
             tailWaitStartedAtMillis.remove(taskTopic);
             return null;
         }
@@ -447,14 +537,6 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
         return selected;
     }
 
-    private static long cumulativeSizeAt(Log logHandle, long offset) throws Exception {
-        if (offset < 0) {
-            return 0L;
-        }
-        LogEntryHeader header = logHandle.getEntryMetadata(offset).get();
-        return header == null || header.offset() < 0 ? 0L : header.cumulativeSize();
-    }
-
     private Map<String, String> resolveTaskProperties(Map<String, String> streamProperties) {
         Map<String, String> taskProperties = new HashMap<>();
         if (streamProperties != null) {
@@ -476,6 +558,11 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
         return identifier.fullName() + "-partition-" + partition;
     }
 
+    /**
+     * Fences every local publisher before returning, then schedules remote publication-lease release.
+     * If scheduling is unavailable, release is attempted inline. Callers that need to transfer
+     * ownership immediately must wait for the lease store to confirm the release.
+     */
     @Override
     public void stop() {
         Map<String, PartitionPublisher> sessions;
@@ -491,13 +578,15 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
                 scanFuture.cancel(false);
             }
             sessions = Map.copyOf(publishers);
-            // Fence every local owner synchronously before waiting for any remote lease release.
+            // Fence every local owner synchronously before scheduling remote lease release.
             sessions.values().forEach(PartitionPublisher::fence);
             publishers.clear();
             tailWaitStartedAtMillis.clear();
+            unavailablePublicationLeases.clear();
         }
         sessions.values().forEach(this::closePublisherAfterStop);
         schedulePendingLeaseReleaseRetry();
+        recordActivePublisherCount();
     }
 
     private void closePublisherAfterStop(PartitionPublisher publisher) {
@@ -519,13 +608,17 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
         try {
             publisher.session().close();
             publisher.closeRetryScheduled().set(false);
-        } catch (Exception error) {
+        } catch (Exception | Error error) {
             if (error instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
             log.warn("Failed to close compaction publication session for {}",
                     publisher.identity().taskTopic(), error);
+            schedulePendingLeaseReleaseRetry();
             scheduleCloseRetry(publisher);
+            if (error instanceof Error fatal) {
+                throw fatal;
+            }
         }
     }
 
@@ -555,7 +648,7 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
             if (error instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
-            log.warn("Failed to release an incompletely opened compaction publication lease", error);
+            log.warn("Failed to release an unsettled compaction publication lease", error);
             schedulePendingLeaseReleaseRetry();
         }
     }
@@ -604,14 +697,26 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
         return publishers.size();
     }
 
-    private record PartitionIdentity(StreamIdentifier stream, int partition, LogId logId, String taskTopic) {
+    private record PartitionIdentity(StreamIdentifier stream, int partition, LogId logId) {
+
+        private PartitionIdentity {
+            Objects.requireNonNull(stream, "stream");
+            Objects.requireNonNull(logId, "logId");
+            if (partition < 0) {
+                throw new IllegalArgumentException("partition must be non-negative");
+            }
+        }
+
+        private String taskTopic() {
+            return PublishCompactTaskRunner.taskTopic(stream, partition);
+        }
     }
 
     private record TaskSnapshot(PreparedCompactStreamTask task, long latestOffset, long publishedOffset) {
     }
 
     private static final class PartitionPublisher {
-        private volatile PartitionIdentity identity;
+        private final PartitionIdentity identity;
         private final CompactionManager.PublicationSession session;
         private final AtomicBoolean closeRetryScheduled = new AtomicBoolean();
 
@@ -623,10 +728,6 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
 
         private PartitionIdentity identity() {
             return identity;
-        }
-
-        private void identity(PartitionIdentity identity) {
-            this.identity = identity;
         }
 
         private long streamId() {

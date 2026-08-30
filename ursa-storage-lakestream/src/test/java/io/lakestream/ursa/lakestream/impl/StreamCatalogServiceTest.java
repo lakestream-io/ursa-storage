@@ -225,11 +225,16 @@ class StreamCatalogServiceTest {
         UrsaStorage storage = mock(UrsaStorage.class);
         StorageApi storageApi = mock(StorageApi.class);
         AsyncOxiaClient oxiaClient = mock(AsyncOxiaClient.class);
+        String namespacePath = "/admin/streams/_namespaces/public/default";
         String configPath = "/admin/streams/public/default/topic";
         String partitionPath = "/streams/public/default/topic-partition-0";
         Version version = new Version(1, 0, 0, 0, Optional.empty(), Optional.empty());
         AtomicReference<byte[]> storedConfig = new AtomicReference<>();
         when(storageApi.supportsFencedStreamIdMappings()).thenReturn(false);
+        when(oxiaClient.put(eq(namespacePath), any(byte[].class),
+                eq(Set.of(PutOption.IfRecordDoesNotExist))))
+            .thenReturn(CompletableFuture.completedFuture(
+                new PutResult(namespacePath, version)));
         when(oxiaClient.get(partitionPath))
             .thenReturn(CompletableFuture.completedFuture(null));
         when(oxiaClient.get(configPath)).thenAnswer(ignored ->
@@ -264,6 +269,8 @@ class StreamCatalogServiceTest {
             eq(Set.of(PutOption.IfRecordDoesNotExist)));
         verify(oxiaClient).put(eq(configPath), any(byte[].class),
             eq(Set.of(PutOption.IfVersionIdEquals(version.versionId()))));
+        verify(oxiaClient).put(eq(namespacePath), any(byte[].class),
+            eq(Set.of(PutOption.IfRecordDoesNotExist)));
         verify(storageApi, never()).deleteStreamIdMapping(anyString(), anyLong());
         catalog.close();
     }

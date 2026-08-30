@@ -25,6 +25,14 @@ public interface ExternalStreamRegistry extends AutoCloseable {
      * map) and any materialization policy are preserved. The returned future fails if the identity
      * was previously deleted with {@link #permanentlyDeleteExternalStream(StreamIdentifier)}.
      *
+     * <p>If the namespace is absent, this operation first creates an empty namespace with
+     * create-only semantics. It never overwrites existing namespace metadata, and the empty
+     * namespace remains if stream registration later fails. A caller that also uses a full
+     * {@link StreamCatalog} can subsequently configure the namespace through
+     * {@link StreamCatalog#setNamespaceProperties} or
+     * {@link StreamCatalog#setNamespaceMaterialization}; {@link StreamCatalog#createNamespace}
+     * reports that the implicit namespace already exists.
+     *
      * @param id the partition-stripped stream identity
      * @param partitionCount the complete logical partition count, which must be positive
      * @param properties stream properties to use when first registering the stream

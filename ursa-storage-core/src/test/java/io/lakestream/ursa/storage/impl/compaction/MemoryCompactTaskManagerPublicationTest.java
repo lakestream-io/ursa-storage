@@ -23,6 +23,15 @@ class MemoryCompactTaskManagerPublicationTest {
     private static final String TOPIC = "org/analytics/orders";
 
     @Test
+    void namedOffsetUpdatePreservesCumulativeSize() throws Exception {
+        MemoryCompactTaskManager manager = new MemoryCompactTaskManager();
+
+        manager.updatePublishedOffset(TOPIC, 1L, 9L, 100L);
+
+        assertEquals(new CompactedOffset(1L, 9L, 100L), manager.getPublishedOffset(TOPIC));
+    }
+
+    @Test
     void publicationLeaseIsExclusiveAndReleaseIsConditional() throws Exception {
         MemoryCompactTaskManager manager = new MemoryCompactTaskManager();
         CompactTaskManager.PublicationLease first =
@@ -83,14 +92,16 @@ class MemoryCompactTaskManagerPublicationTest {
                 manager.tryOpenPublicationSession(TOPIC, 1L).orElseThrow();
 
         assertEquals(CompactionManager.PublicationResult.PUBLISHED,
-                first.publishNext(last -> Optional.of(task(1L, last + 1, 100L, "first"))));
+                first.publishNext(cursor -> Optional.of(
+                        task(1L, cursor.offset() + 1, 100L, "first"))));
         first.close();
 
         CompactionManager.PublicationSession second =
                 manager.tryOpenPublicationSession(TOPIC, 1L).orElseThrow();
         assertEquals(CompactionManager.PublicationResult.NO_TASK,
-                second.publishNext(last -> {
-                    assertEquals(99L, last);
+                second.publishNext(cursor -> {
+                    assertEquals(99L, cursor.offset());
+                    assertEquals(100L, cursor.cumulativeSize());
                     return Optional.empty();
                 }));
         second.close();
@@ -104,6 +115,8 @@ class MemoryCompactTaskManagerPublicationTest {
                 .streamId(streamId)
                 .startOffset(startOffset)
                 .endOffset(endOffset)
+                .totalSize(endOffset - startOffset)
+                .cumulativeSize(endOffset)
                 .taskName(taskName)
                 .topic(TOPIC)
                 .status(PreparedCompactStreamTask.INIT)

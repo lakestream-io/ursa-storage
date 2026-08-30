@@ -103,6 +103,7 @@ class IndexedStreamCatalogTest {
     private IndexedStreamCatalog catalog;
     private FencedStorageHarness defaultStorage;
     private StreamIdentifier streamId;
+    private AtomicReference<VersionedValue> implicitNamespace;
 
     private long nextStreamId = 100L;
 
@@ -112,11 +113,14 @@ class IndexedStreamCatalogTest {
             .thenReturn(CompletableFuture.completedFuture(null));
         catalogPaths = new DefaultCatalogPaths();
         String namespacePath = catalogPaths.namespacePath("public/default");
-        lenient().when(oxiaClient.put(
-                eq(namespacePath), any(byte[].class),
-                eq(Set.of(PutOption.IfRecordDoesNotExist))))
-            .thenReturn(CompletableFuture.completedFuture(
-                new PutResult(namespacePath, DUMMY_VERSION)));
+        implicitNamespace = mockCreateOnlyRecord(namespacePath);
+        lenient().when(oxiaClient.put(eq(namespacePath), any(byte[].class)))
+            .thenAnswer(invocation -> {
+                byte[] value = invocation.getArgument(1, byte[].class);
+                implicitNamespace.set(new VersionedValue(value.clone(), DUMMY_VERSION));
+                return CompletableFuture.completedFuture(
+                    new PutResult(namespacePath, DUMMY_VERSION));
+            });
         defaultStorage = new FencedStorageHarness(
             key -> CompletableFuture.completedFuture(nextStreamId++));
         catalog = fencedCatalog(defaultStorage);
@@ -143,6 +147,7 @@ class IndexedStreamCatalogTest {
         assertEquals(streamId, result.identifier());
         assertEquals(LifecycleState.ACTIVE, result.state());
         assertEquals(Map.of("key1", "val1"), result.properties());
+        assertImplicitEmptyNamespace();
 
         verify(oxiaClient).put(eq(firstPartitionPath), any(byte[].class),
             eq(Set.of(PutOption.IfRecordDoesNotExist)));
@@ -175,7 +180,7 @@ class IndexedStreamCatalogTest {
     }
 
     @Test
-    void createStream_permanentlyDeletedIdentityDoesNotCreatePartitions() {
+    void createStream_permanentlyDeletedIdentityDoesNotCreatePartitions() throws Exception {
         String configPath = "/admin/streams/public/default/my-topic";
         when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(
             new GetResult(configPath,
@@ -190,6 +195,7 @@ class IndexedStreamCatalogTest {
                 new SchemaConfig(), Map.of()).get());
 
         assertInstanceOf(StreamPermanentlyDeletedException.class, ex.getCause());
+        assertImplicitEmptyNamespace();
         verify(oxiaClient, never()).put(any(), any(byte[].class));
         verify(oxiaClient, never()).put(eq(configPath), any(byte[].class), any());
     }
@@ -1840,6 +1846,13 @@ class IndexedStreamCatalogTest {
         return state;
     }
 
+    private void assertImplicitEmptyNamespace() throws Exception {
+        assertNotNull(implicitNamespace.get());
+        JsonNode namespace = MAPPER.readTree(implicitNamespace.get().value());
+        assertTrue(namespace.path("properties").isObject());
+        assertTrue(namespace.path("properties").isEmpty());
+    }
+
     private IndexedStreamCatalog fencedCatalog(FencedStorageHarness storage) {
         return new IndexedStreamCatalog(
             oxiaClient, catalogPaths, logStorage,
@@ -2125,6 +2138,27 @@ class IndexedStreamCatalogTest {
     void registerExternalStream_rejectsNonPositivePartitionCount() {
         assertThrows(IllegalArgumentException.class,
             () -> catalog.registerExternalStream(streamId, 0, Map.of()));
+    }
+
+    @Test
+    void failedExternalRegistrationLeavesConfigurableImplicitNamespace() throws Exception {
+        String configPath = catalogPaths.streamConfigPath(streamId);
+        when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(
+            new GetResult(configPath,
+                "{\"_externalStreamPermanentlyDeleted\":true}"
+                    .getBytes(StandardCharsets.UTF_8),
+                DUMMY_VERSION)));
+
+        ExecutionException failure = assertThrows(ExecutionException.class, () ->
+            catalog.registerExternalStream(streamId, 1, Map.of()).get());
+
+        assertInstanceOf(StreamPermanentlyDeletedException.class, failure.getCause());
+        assertImplicitEmptyNamespace();
+        catalog.setNamespaceProperties(streamId.namespace(), Map.of("owner", "platform")).get();
+        assertEquals(
+            Map.of("owner", "platform"),
+            catalog.loadNamespaceMetadata(streamId.namespace()).get().properties());
+        verify(oxiaClient, never()).put(eq(configPath), any(byte[].class), any());
     }
 
     @Test

@@ -52,6 +52,7 @@ public class CompactionManagerTest {
     private static final long LAST_INCLUDED_OFFSET = END_OFFSET - 1;
     private static final long TOTAL_SIZE = 4096L;
     private static final long CUMULATIVE_SIZE = 5000L;
+    private static final long PREVIOUS_CUMULATIVE_SIZE = CUMULATIVE_SIZE - TOTAL_SIZE;
 
     private CompactTaskManager taskManager;
     private CompactionManager compactionManager;
@@ -85,7 +86,8 @@ public class CompactionManagerTest {
         verify(taskManager).updatePreparedCompactTask(eq(task), eq(Optional.of(TOPIC)));
 
         // The task end is exclusive; the published offset is the last offset included in the task.
-        verify(taskManager).updatePublishedOffset(eq(TOPIC), eq(STREAM_ID), eq(LAST_INCLUDED_OFFSET));
+        verify(taskManager).updatePublishedOffset(
+                eq(TOPIC), eq(STREAM_ID), eq(LAST_INCLUDED_OFFSET), eq(CUMULATIVE_SIZE));
         verify(taskManager).deletePreparedCompactTask(TOPIC);
     }
 
@@ -96,7 +98,8 @@ public class CompactionManagerTest {
 
         compactionManager.recoverPreparedTasks(TOPIC);
 
-        verify(taskManager).updatePublishedOffset(eq(TOPIC), eq(STREAM_ID), eq(LAST_INCLUDED_OFFSET));
+        verify(taskManager).updatePublishedOffset(
+                eq(TOPIC), eq(STREAM_ID), eq(LAST_INCLUDED_OFFSET), eq(CUMULATIVE_SIZE));
         verify(taskManager).deletePreparedCompactTask(TOPIC);
         // The PUSHED_TASK branch does not re-publish or re-update the prepared task.
         verify(taskManager, never()).updatePreparedCompactTask(any(), any());
@@ -110,7 +113,8 @@ public class CompactionManagerTest {
         compactionManager.recoverPreparedTasks(TOPIC);
 
         verify(taskManager).getPreparedStreamTask(TOPIC);
-        verify(taskManager, never()).updatePublishedOffset(eq(TOPIC), anyLong(), anyLong());
+        verify(taskManager, never()).updatePublishedOffset(
+                eq(TOPIC), anyLong(), anyLong(), anyLong());
         verify(taskManager, never()).deletePreparedCompactTask(TOPIC);
     }
 
@@ -126,7 +130,8 @@ public class CompactionManagerTest {
 
         verify(taskManager).publishPreparedCompactTask(eq(task), eq(Optional.of(TOPIC)));
         verify(taskManager).updatePreparedCompactTask(eq(task), eq(Optional.of(TOPIC)));
-        verify(taskManager).updatePublishedOffset(eq(TOPIC), eq(STREAM_ID), eq(LAST_INCLUDED_OFFSET));
+        verify(taskManager).updatePublishedOffset(
+                eq(TOPIC), eq(STREAM_ID), eq(LAST_INCLUDED_OFFSET), eq(CUMULATIVE_SIZE));
         verify(taskManager).deletePreparedCompactTask(TOPIC);
         verify(latestPublishedOffset).set(LAST_INCLUDED_OFFSET,
                 Attributes.of(AttributeKey.stringKey("topic"), TOPIC));
@@ -167,7 +172,8 @@ public class CompactionManagerTest {
         verify(taskManager).getPreparedStreamTask(TOPIC);
         verify(taskManager).deletePreparedCompactTask(TOPIC);
         verify(taskManager, never()).publishCompactTask(any());
-        verify(taskManager, never()).updatePublishedOffset(eq(TOPIC), anyLong(), anyLong());
+        verify(taskManager, never()).updatePublishedOffset(
+                eq(TOPIC), anyLong(), anyLong(), anyLong());
         verifyNoMoreInteractions(taskManager);
     }
 
@@ -192,10 +198,21 @@ public class CompactionManagerTest {
     }
 
     @Test
+    public void testPublicationCursorRejectsInvalidCoordinates() {
+        assertThrows(IllegalArgumentException.class,
+                () -> new CompactionManager.PublicationCursor(-1L, -1L, 0L));
+        assertThrows(IllegalArgumentException.class,
+                () -> new CompactionManager.PublicationCursor(STREAM_ID, -2L, 0L));
+        assertThrows(IllegalArgumentException.class,
+                () -> new CompactionManager.PublicationCursor(STREAM_ID, -1L, -1L));
+    }
+
+    @Test
     public void testPublicationSessionMakesTaskVisibleOnlyAfterCursorCas() throws Exception {
         CompactTaskManager.PublicationLease lease = lease();
         CompactTaskManager.PublishedOffsetClaim initialCursor = cursor(-1L, 11L);
-        CompactTaskManager.PublishedOffsetClaim advancedCursor = cursor(LAST_INCLUDED_OFFSET, 12L);
+        CompactTaskManager.PublishedOffsetClaim advancedCursor =
+                cursor(LAST_INCLUDED_OFFSET, CUMULATIVE_SIZE, 12L);
         PreparedCompactStreamTask task = newTask(PreparedCompactStreamTask.INIT);
         CompactTaskManager.PreparedTaskClaim prepared =
                 new CompactTaskManager.PreparedTaskClaim(task, 21L);
@@ -213,13 +230,19 @@ public class CompactionManagerTest {
         CompactionManager.PublicationSession session =
                 compactionManager.tryOpenPublicationSession(TOPIC, STREAM_ID).orElseThrow();
         assertEquals(CompactionManager.PublicationResult.PUBLISHED,
-                session.publishNext(ignored -> Optional.of(task)));
+                session.publishNext(publishedCursor -> {
+                    assertEquals(STREAM_ID, publishedCursor.streamId());
+                    assertEquals(-1L, publishedCursor.offset());
+                    assertEquals(PREVIOUS_CUMULATIVE_SIZE, publishedCursor.cumulativeSize());
+                    return Optional.of(task);
+                }));
         session.close();
 
         InOrder order = inOrder(taskManager);
         order.verify(taskManager).publishCompactTaskIfAbsent(any());
         order.verify(taskManager).compareAndSetPublishedOffset(
-                eq(lease), eq(initialCursor), any(CompactedOffset.class));
+                eq(lease), eq(initialCursor),
+                eq(new CompactedOffset(STREAM_ID, LAST_INCLUDED_OFFSET, CUMULATIVE_SIZE)));
         order.verify(taskManager).publishCompactTaskIfAbsent(any());
         order.verify(taskManager).publishPackagedTaskName(task.getTaskName());
         order.verify(taskManager).deletePreparedTaskClaim(TOPIC, prepared);
@@ -261,7 +284,8 @@ public class CompactionManagerTest {
     public void testOldSessionCannotPublishMarkerAfterSuccessorClaimsLease() throws Exception {
         CompactTaskManager.PublicationLease lease = lease();
         CompactTaskManager.PublishedOffsetClaim initialCursor = cursor(-1L, 11L);
-        CompactTaskManager.PublishedOffsetClaim advancedCursor = cursor(LAST_INCLUDED_OFFSET, 12L);
+        CompactTaskManager.PublishedOffsetClaim advancedCursor =
+                cursor(LAST_INCLUDED_OFFSET, CUMULATIVE_SIZE, 12L);
         PreparedCompactStreamTask task = newTask(PreparedCompactStreamTask.INIT);
         CompactTaskManager.PreparedTaskClaim prepared =
                 new CompactTaskManager.PreparedTaskClaim(task, 21L);
@@ -315,6 +339,50 @@ public class CompactionManagerTest {
         verify(taskManager, never()).publishCompactTaskIfAbsent(any());
         verify(taskManager, never()).compareAndSetPublishedOffset(any(), any(), any());
         verify(taskManager, never()).publishPackagedTaskName(any());
+    }
+
+    @Test
+    public void testPublicationSessionRejectsRecoveredTaskWhoseCumulativeSizeDoesNotMatchCursor()
+            throws Exception {
+        CompactTaskManager.PublicationLease lease = lease();
+        PreparedCompactStreamTask task = newTask(PreparedCompactStreamTask.INIT);
+        CompactTaskManager.PreparedTaskClaim prepared =
+                new CompactTaskManager.PreparedTaskClaim(task, 21L);
+        when(taskManager.tryAcquirePublicationLease(TOPIC, STREAM_ID)).thenReturn(Optional.of(lease));
+        when(taskManager.claimPublishedOffset(lease)).thenReturn(
+                cursor(LAST_INCLUDED_OFFSET, CUMULATIVE_SIZE - 1L, 11L));
+        when(taskManager.validatePublicationLease(lease)).thenReturn(true);
+        when(taskManager.getPreparedTaskClaim(TOPIC)).thenReturn(Optional.of(prepared));
+
+        CompactionManager.PublicationSession session =
+                compactionManager.tryOpenPublicationSession(TOPIC, STREAM_ID).orElseThrow();
+
+        assertThrows(IllegalStateException.class,
+                () -> session.publishNext(ignored -> Optional.empty()));
+        verify(taskManager, never()).publishPackagedTaskName(any());
+        verify(taskManager, never()).deletePreparedTaskClaim(any(), any());
+    }
+
+    @Test
+    public void testPublicationSessionRejectsRecoveredTaskForDifferentTopic() throws Exception {
+        CompactTaskManager.PublicationLease lease = lease();
+        PreparedCompactStreamTask task = newTask(PreparedCompactStreamTask.INIT);
+        task.setTopic("different-topic");
+        CompactTaskManager.PreparedTaskClaim prepared =
+                new CompactTaskManager.PreparedTaskClaim(task, 21L);
+        when(taskManager.tryAcquirePublicationLease(TOPIC, STREAM_ID)).thenReturn(Optional.of(lease));
+        when(taskManager.claimPublishedOffset(lease)).thenReturn(
+                cursor(LAST_INCLUDED_OFFSET, CUMULATIVE_SIZE, 11L));
+        when(taskManager.validatePublicationLease(lease)).thenReturn(true);
+        when(taskManager.getPreparedTaskClaim(TOPIC)).thenReturn(Optional.of(prepared));
+
+        CompactionManager.PublicationSession session =
+                compactionManager.tryOpenPublicationSession(TOPIC, STREAM_ID).orElseThrow();
+
+        assertThrows(IllegalArgumentException.class,
+                () -> session.publishNext(ignored -> Optional.empty()));
+        verify(taskManager, never()).publishPackagedTaskName(any());
+        verify(taskManager, never()).deletePreparedTaskClaim(any(), any());
     }
 
     @Test
@@ -441,8 +509,10 @@ public class CompactionManagerTest {
         assertThrows(ExecutionException.class, session::close);
         assertTrue(session.isClosed());
         assertTrue(session.isFenced());
+        assertTrue(compactionManager.hasPendingPublicationLeaseReleases());
 
         session.close();
+        assertFalse(compactionManager.hasPendingPublicationLeaseReleases());
         session.close();
 
         verify(taskManager, times(2)).releasePublicationLease(lease);
@@ -464,11 +534,13 @@ public class CompactionManagerTest {
             assertTrue(Thread.currentThread().isInterrupted());
             assertTrue(session.isClosed());
             assertTrue(session.isFenced());
+            assertTrue(compactionManager.hasPendingPublicationLeaseReleases());
         } finally {
             Thread.interrupted();
         }
 
         session.close();
+        assertFalse(compactionManager.hasPendingPublicationLeaseReleases());
         session.close();
 
         verify(taskManager, times(2)).releasePublicationLease(lease);
@@ -521,7 +593,12 @@ public class CompactionManagerTest {
     }
 
     private static CompactTaskManager.PublishedOffsetClaim cursor(long offset, long revision) {
+        return cursor(offset, PREVIOUS_CUMULATIVE_SIZE, revision);
+    }
+
+    private static CompactTaskManager.PublishedOffsetClaim cursor(
+            long offset, long cumulativeSize, long revision) {
         return new CompactTaskManager.PublishedOffsetClaim(
-                new CompactedOffset(STREAM_ID, offset, 0L), revision);
+                new CompactedOffset(STREAM_ID, offset, cumulativeSize), revision);
     }
 }

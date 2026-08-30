@@ -141,9 +141,16 @@ public class CompactionTaskProviderV2 {
                     log.info("Fetched {} packaged compaction tasks", newTasks.size());
                     lastFetchEmptyTimestamp = System.currentTimeMillis();
                 }
-                lastFetchTimestamp = System.currentTimeMillis();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.warn("Interrupted while fetching compaction tasks", e);
             } catch (Exception e) {
                 log.error("Failed to fetch compaction tasks", e);
+            } finally {
+                // Apply the configured backoff after both successful and failed fetches. Without
+                // this, a transient metastore failure can make every worker call re-run the same
+                // fetch immediately and produce a tight error loop.
+                lastFetchTimestamp = System.currentTimeMillis();
             }
         }
     }
@@ -163,12 +170,26 @@ public class CompactionTaskProviderV2 {
         // A package marker is written only after all of its subtasks are durable. Therefore a
         // marker with no subtask is an orphan (for example after a terminal source task is
         // deleted). Remove it here so it cannot be quarantined and rediscovered forever.
-        List<CompletableFuture<Boolean>> orphanDeletes = allTasks.stream()
+        List<PackagedCompactStreamTask> orphanTasks = allTasks.stream()
             .filter(task -> task.getSubTasks().isEmpty())
-            .map(task -> taskManager.deletePackagedTaskNameIfEmpty(task.getTaskName()))
             .toList();
-        if (!orphanDeletes.isEmpty()) {
-            CompletableFuture.allOf(orphanDeletes.toArray(new CompletableFuture[0])).get();
+        if (!orphanTasks.isEmpty()) {
+            for (PackagedCompactStreamTask orphanTask : orphanTasks) {
+                try {
+                    taskManager.deletePackagedTaskNameIfEmpty(orphanTask.getTaskName())
+                        .whenComplete((deleted, cleanupFailure) -> {
+                            if (cleanupFailure != null) {
+                                log.warn("Failed to clean up orphaned compaction package marker {}; "
+                                        + "it will be retried after the fetch interval",
+                                    orphanTask.getTaskName(), cleanupFailure);
+                            }
+                        });
+                } catch (RuntimeException cleanupFailure) {
+                    log.warn("Failed to start cleanup of orphaned compaction package marker {}; "
+                            + "it will be retried after the fetch interval",
+                        orphanTask.getTaskName(), cleanupFailure);
+                }
+            }
             allTasks = allTasks.stream()
                 .filter(task -> !task.getSubTasks().isEmpty())
                 .toList();

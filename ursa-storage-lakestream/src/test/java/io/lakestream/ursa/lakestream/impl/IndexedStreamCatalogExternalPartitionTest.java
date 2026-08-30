@@ -81,6 +81,7 @@ class IndexedStreamCatalogExternalPartitionTest {
     private LogStorage logStorage;
     private CompactedObjectReaderFactory readerFactory;
     private IndexedStreamCatalog.LogFactory logFactory;
+    private VersionedRecord namespace;
 
     @BeforeEach
     void setUp() {
@@ -88,6 +89,7 @@ class IndexedStreamCatalogExternalPartitionTest {
         logStorage = mock(LogStorage.class);
         readerFactory = mock(CompactedObjectReaderFactory.class);
         logFactory = mock(IndexedStreamCatalog.LogFactory.class);
+        namespace = mockVersionedRecord(paths.namespacePath(stream.namespace()), null);
         when(logStorage.deleteLog(any()))
             .thenReturn(CompletableFuture.completedFuture(null));
     }
@@ -134,7 +136,7 @@ class IndexedStreamCatalogExternalPartitionTest {
     }
 
     @Test
-    void permanentDeletionFailsBeforeGeneratingKeyedId() {
+    void permanentDeletionFailsBeforeGeneratingKeyedId() throws Exception {
         int partition = 2;
         String configPath = paths.streamConfigPath(stream);
         when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(
@@ -154,7 +156,9 @@ class IndexedStreamCatalogExternalPartitionTest {
 
         assertThat(generationCount).hasValue(0);
         verify(readerFactory, never()).open(anyString());
-        verify(oxiaClient, never()).put(anyString(), any(byte[].class), any());
+        assertThat(json(namespace).path("properties").isObject()).isTrue();
+        assertThat(namespace.successfulPuts()).isEqualTo(1);
+        verify(oxiaClient, never()).put(eq(configPath), any(byte[].class), any());
     }
 
     @Test

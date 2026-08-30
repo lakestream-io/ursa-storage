@@ -5,6 +5,10 @@
 package io.lakestream.ursa.lakehouse.compact;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 import io.lakestream.api.EntryHeader;
 import io.lakestream.api.LifecycleState;
@@ -18,8 +22,12 @@ import io.lakestream.api.StreamIdentifier;
 import io.lakestream.api.StreamLayout;
 import io.lakestream.ursa.compaction.metrics.CompactionMetrics;
 import io.lakestream.ursa.compaction.task.CompactStreamTask;
+import io.lakestream.ursa.metrics.Counter;
 import io.lakestream.ursa.storage.impl.StorageConfig;
 import io.lakestream.ursa.storage.impl.compaction.MemoryCompactTaskManager;
+import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.api.metrics.LongGauge;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -29,10 +37,13 @@ import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 class PublishCompactTaskRunnerOffsetTest {
@@ -89,13 +100,18 @@ class PublishCompactTaskRunnerOffsetTest {
         MutablePartition partition = partition(42L, new LogOffset(0L, 10, 1L, 100, 100L));
         partition.metadata(9L, new EntryHeader(0L, 10, 1L, 100, 100L));
         catalog.add(stream("events", Map.of(), partition));
-        MemoryCompactTaskManager tasks = new MemoryCompactTaskManager();
+        ReleaseTrackingMemoryCompactTaskManager tasks =
+                new ReleaseTrackingMemoryCompactTaskManager(1);
 
         PublishCompactTaskRunner first = runner(catalog.catalog(), tasks, new Properties());
         first.scanCatalogOnce();
         assertThat(tasks.getPublishedOffset("default/events-partition-0").getOffset()).isEqualTo(9L);
+        assertThat(tasks.getPublishedOffset("default/events-partition-0").getCumulativeSize())
+                .isEqualTo(100L);
         first.stop();
+        assertThat(tasks.awaitExpectedReleases()).isTrue();
         assertThat(tasks.getPublishedOffset("default/events-partition-0").getOffset()).isEqualTo(9L);
+        partition.removeMetadata(9L);
 
         PublishCompactTaskRunner restarted = runner(catalog.catalog(), tasks, new Properties());
         restarted.scanCatalogOnce();
@@ -113,6 +129,9 @@ class PublishCompactTaskRunnerOffsetTest {
                 .containsExactly(10L, 15L);
         assertThat(published.get(1).getTotalSize()).isEqualTo(50L);
         assertThat(published.get(1).getCumulativeSize()).isEqualTo(150L);
+        assertThat(published.get(1).getTotalSize()).isEqualTo(
+                published.get(1).getCumulativeSize() - published.get(0).getCumulativeSize());
+        restarted.stop();
     }
 
     @Test
@@ -143,7 +162,8 @@ class PublishCompactTaskRunnerOffsetTest {
         MutableCatalog catalog = new MutableCatalog();
         catalog.add(stream("deleted", Map.of(),
                 partition(81L, new LogOffset(0L, 1, 1L, 10, 10L))));
-        MemoryCompactTaskManager tasks = new MemoryCompactTaskManager();
+        ReleaseTrackingMemoryCompactTaskManager tasks =
+                new ReleaseTrackingMemoryCompactTaskManager(2);
         PublishCompactTaskRunner runner = runner(catalog.catalog(), tasks, new Properties());
 
         runner.scanCatalogOnce();
@@ -157,6 +177,7 @@ class PublishCompactTaskRunnerOffsetTest {
         runner.scanCatalogOnce();
         runner.stop();
         assertThat(runner.sessionCount()).isZero();
+        assertThat(tasks.awaitExpectedReleases()).isTrue();
 
         // A successor proves that stop released the exact fenced lease and reset the incarnation cursor.
         PublishCompactTaskRunner successor = runner(catalog.catalog(), tasks, new Properties());
@@ -210,7 +231,7 @@ class PublishCompactTaskRunnerOffsetTest {
     }
 
     @Test
-    void drainsMultipleReadyBatchesInOneCatalogScan() throws Exception {
+    void drainsMultipleReadyBatchesWithoutRepeatingCatalogDiscovery() throws Exception {
         long oldTimestamp = System.currentTimeMillis() - TimeUnit.HOURS.toMillis(2);
         MutableCatalog catalog = new MutableCatalog();
         MutablePartition partition = partition(92L, new LogOffset(4L, 2, oldTimestamp, 10, 60L));
@@ -223,10 +244,11 @@ class PublishCompactTaskRunnerOffsetTest {
         config.setCheckCompactMessageStepLength(2);
         config.setCompactedFileSizeLimit(50L);
         config.setTailCompactDataVisibilityIntervalInSeconds(0);
+        config.setPublishThreadPendingTasks(1);
         MemoryCompactTaskManager tasks = new MemoryCompactTaskManager();
         PublishCompactTaskRunner runner = runner(catalog.catalog(), tasks, config);
 
-        runner.scanCatalogOnce();
+        runner.run();
 
         List<CompactStreamTask> published = tasks(tasks).stream()
                 .sorted(Comparator.comparingLong(CompactStreamTask::getStartOffset))
@@ -235,6 +257,109 @@ class PublishCompactTaskRunnerOffsetTest {
                 .containsExactly(0L, 4L);
         assertThat(published).extracting(CompactStreamTask::getEndOffset)
                 .containsExactly(4L, 6L);
+        assertThat(catalog.listNamespacesCalls()).isOne();
+        runner.stop();
+    }
+
+    @Test
+    void invalidExcludedStreamDoesNotPreventCatalogPublication() throws Exception {
+        MutableCatalog catalog = new MutableCatalog();
+        catalog.add(stream("included", Map.of(),
+                partition(111L, new LogOffset(0L, 1, 1L, 10, 10L))));
+        StorageConfig config = new StorageConfig();
+        config.setBlackTopicOfCompact(Set.of("invalid://topic"));
+        MemoryCompactTaskManager tasks = new MemoryCompactTaskManager();
+
+        PublishCompactTaskRunner runner = runner(catalog.catalog(), tasks, config);
+        runner.scanCatalogOnce();
+
+        assertThat(tasks(tasks)).extracting(CompactStreamTask::getStreamId).containsExactly(111L);
+        runner.stop();
+    }
+
+    @Test
+    void reportsLeaseContentionOncePerUnavailableTransition() throws Exception {
+        MutableCatalog catalog = new MutableCatalog();
+        catalog.add(stream("contended", Map.of(),
+                partition(112L, new LogOffset(0L, 1, 1L, 10, 10L))));
+        ReleaseTrackingMemoryCompactTaskManager tasks =
+                new ReleaseTrackingMemoryCompactTaskManager(1);
+        PublishCompactTaskRunner owner = runner(catalog.catalog(), tasks, new Properties());
+        owner.scanCatalogOnce();
+
+        CompactionMetrics metrics = mock(CompactionMetrics.class);
+        Counter unavailable = mock(Counter.class);
+        LongGauge ongoingStreams = mock(LongGauge.class);
+        when(metrics.getPublicationLeaseUnavailableCount()).thenReturn(unavailable);
+        when(metrics.getOngoingCompactionTopicCount()).thenReturn(ongoingStreams);
+        PublishCompactTaskRunner contender = runner(
+                catalog.catalog(),
+                tasks,
+                new StorageConfig(),
+                metrics,
+                Executors.newSingleThreadScheduledExecutor());
+
+        contender.scanCatalogOnce();
+        contender.scanCatalogOnce();
+
+        verify(unavailable, times(1)).increment(Attributes.of(
+                AttributeKey.stringKey("topic"), "default/contended-partition-0"));
+        verify(ongoingStreams, times(2)).set(0L);
+        contender.stop();
+        owner.stop();
+        assertThat(tasks.awaitExpectedReleases()).isTrue();
+    }
+
+    @Test
+    void ongoingTopicMetricCountsLogicalStreamsRatherThanPartitions() throws Exception {
+        MutableCatalog catalog = new MutableCatalog();
+        catalog.add(stream("first", Map.of(),
+                partition(113L, LogOffset.NOT_FOUND),
+                partition(114L, LogOffset.NOT_FOUND)));
+        catalog.add(stream("second", Map.of(),
+                partition(115L, LogOffset.NOT_FOUND)));
+        MemoryCompactTaskManager tasks = new MemoryCompactTaskManager();
+        CompactionMetrics metrics = mock(CompactionMetrics.class);
+        LongGauge ongoingStreams = mock(LongGauge.class);
+        when(metrics.getOngoingCompactionTopicCount()).thenReturn(ongoingStreams);
+        PublishCompactTaskRunner runner = runner(
+                catalog.catalog(),
+                tasks,
+                new StorageConfig(),
+                metrics,
+                Executors.newScheduledThreadPool(3));
+
+        runner.scanCatalogOnce();
+
+        verify(ongoingStreams).set(2L);
+        assertThat(runner.sessionCount()).isEqualTo(3);
+        runner.stop();
+    }
+
+    @Test
+    void namespaceDiscoveryFailureReportsRetainedActivePublishers() throws Exception {
+        MutableCatalog catalog = new MutableCatalog();
+        catalog.add(stream("retained", Map.of(),
+                partition(118L, LogOffset.NOT_FOUND)));
+        MemoryCompactTaskManager tasks = new MemoryCompactTaskManager();
+        CompactionMetrics metrics = mock(CompactionMetrics.class);
+        LongGauge ongoingStreams = mock(LongGauge.class);
+        Counter publicationFailures = mock(Counter.class);
+        when(metrics.getOngoingCompactionTopicCount()).thenReturn(ongoingStreams);
+        when(metrics.getPublishTaskFailedCount()).thenReturn(publicationFailures);
+        PublishCompactTaskRunner runner = runner(
+                catalog.catalog(),
+                tasks,
+                new StorageConfig(),
+                metrics,
+                Executors.newSingleThreadScheduledExecutor());
+        runner.scanCatalogOnce();
+        catalog.failNamespaceListing();
+
+        runner.run();
+
+        verify(ongoingStreams, times(2)).set(1L);
+        verify(publicationFailures).increment();
         runner.stop();
     }
 
@@ -385,7 +510,7 @@ class PublishCompactTaskRunnerOffsetTest {
             try {
                 runner.scanCatalogOnce();
             } catch (Exception error) {
-                throw new java.util.concurrent.CompletionException(error);
+                throw new CompletionException(error);
             }
         });
         assertThat(tasks.acquireStarted.await(5, TimeUnit.SECONDS)).isTrue();
@@ -400,6 +525,37 @@ class PublishCompactTaskRunnerOffsetTest {
         successor.stop();
     }
 
+    @Test
+    void opensColdStartPublicationLeasesConcurrently() throws Exception {
+        MutableCatalog catalog = new MutableCatalog();
+        catalog.add(stream("parallel-open", Map.of(),
+                partition(116L, LogOffset.NOT_FOUND),
+                partition(117L, LogOffset.NOT_FOUND)));
+        ConcurrentAcquireMemoryCompactTaskManager tasks =
+                new ConcurrentAcquireMemoryCompactTaskManager(2);
+        PublishCompactTaskRunner runner = runner(
+                catalog.catalog(),
+                tasks,
+                new StorageConfig(),
+                CompactionMetrics.NOOP,
+                Executors.newScheduledThreadPool(2));
+
+        CompletableFuture<Void> scan = CompletableFuture.runAsync(() -> {
+            try {
+                runner.scanCatalogOnce();
+            } catch (Exception error) {
+                throw new CompletionException(error);
+            }
+        });
+
+        boolean concurrentlyStarted = tasks.allAcquiresStarted.await(5, TimeUnit.SECONDS);
+        tasks.allowAcquire.countDown();
+        assertThat(concurrentlyStarted).isTrue();
+        scan.get(5, TimeUnit.SECONDS);
+        assertThat(runner.sessionCount()).isEqualTo(2);
+        runner.stop();
+    }
+
     private static PublishCompactTaskRunner runner(StreamCatalog catalog,
                                                    MemoryCompactTaskManager tasks,
                                                    Properties properties) {
@@ -411,13 +567,47 @@ class PublishCompactTaskRunnerOffsetTest {
     private static PublishCompactTaskRunner runner(StreamCatalog catalog,
                                                    MemoryCompactTaskManager tasks,
                                                    StorageConfig config) {
+        return runner(
+                catalog,
+                tasks,
+                config,
+                CompactionMetrics.NOOP,
+                Executors.newSingleThreadScheduledExecutor());
+    }
+
+    private static PublishCompactTaskRunner runner(StreamCatalog catalog,
+                                                   MemoryCompactTaskManager tasks,
+                                                   StorageConfig config,
+                                                   CompactionMetrics metrics,
+                                                   ScheduledExecutorService publishExecutor) {
         return new PublishCompactTaskRunner(
                 catalog,
                 tasks,
                 Executors.newSingleThreadExecutor(),
-                Executors.newSingleThreadScheduledExecutor(),
+                publishExecutor,
                 config,
-                CompactionMetrics.NOOP);
+                metrics);
+    }
+
+    private static final class ReleaseTrackingMemoryCompactTaskManager extends MemoryCompactTaskManager {
+        private final CountDownLatch expectedReleases;
+
+        private ReleaseTrackingMemoryCompactTaskManager(int expectedReleaseCount) {
+            this.expectedReleases = new CountDownLatch(expectedReleaseCount);
+        }
+
+        @Override
+        public synchronized boolean releasePublicationLease(PublicationLease lease) {
+            boolean released = super.releasePublicationLease(lease);
+            if (released) {
+                expectedReleases.countDown();
+            }
+            return released;
+        }
+
+        private boolean awaitExpectedReleases() throws InterruptedException {
+            return expectedReleases.await(5, TimeUnit.SECONDS);
+        }
     }
 
     private static final class BlockingMemoryCompactTaskManager extends MemoryCompactTaskManager {
@@ -435,6 +625,27 @@ class PublishCompactTaskRunnerOffsetTest {
                     Thread.currentThread().interrupt();
                     throw new IllegalStateException("Interrupted while acquiring publication lease", error);
                 }
+            }
+            return super.tryAcquirePublicationLease(name, streamId);
+        }
+    }
+
+    private static final class ConcurrentAcquireMemoryCompactTaskManager extends MemoryCompactTaskManager {
+        private final CountDownLatch allAcquiresStarted;
+        private final CountDownLatch allowAcquire = new CountDownLatch(1);
+
+        private ConcurrentAcquireMemoryCompactTaskManager(int expectedAcquires) {
+            this.allAcquiresStarted = new CountDownLatch(expectedAcquires);
+        }
+
+        @Override
+        public Optional<PublicationLease> tryAcquirePublicationLease(String name, long streamId) {
+            allAcquiresStarted.countDown();
+            try {
+                allowAcquire.await();
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while acquiring publication lease", error);
             }
             return super.tryAcquirePublicationLease(name, streamId);
         }
@@ -504,10 +715,18 @@ class PublishCompactTaskRunnerOffsetTest {
     private static final class MutableCatalog {
         private final List<MutableStream> streams = new ArrayList<>();
         private final Set<StreamIdentifier> failedStreams = new HashSet<>();
+        private final AtomicInteger listNamespacesCalls = new AtomicInteger();
+        private final AtomicBoolean namespaceListingFails = new AtomicBoolean();
         private final StreamCatalog catalog = proxy(StreamCatalog.class, (method, args) -> switch (method) {
-            case "listNamespaces" -> CompletableFuture.completedFuture(streams.isEmpty()
-                    ? List.of()
-                    : List.of(new Namespace(NAMESPACE)));
+            case "listNamespaces" -> {
+                listNamespacesCalls.incrementAndGet();
+                yield namespaceListingFails.get()
+                        ? CompletableFuture.failedFuture(
+                                new IllegalStateException("temporary namespace listing failure"))
+                        : CompletableFuture.completedFuture(streams.isEmpty()
+                                ? List.of()
+                                : List.of(new Namespace(NAMESPACE)));
+            }
             case "listStreams" -> CompletableFuture.completedFuture(
                     streams.stream().map(MutableStream::identifier).toList());
             case "loadStream" -> failedStreams.contains(args[0])
@@ -543,6 +762,14 @@ class PublishCompactTaskRunnerOffsetTest {
 
         private void restore(StreamIdentifier identifier) {
             failedStreams.remove(identifier);
+        }
+
+        private int listNamespacesCalls() {
+            return listNamespacesCalls.get();
+        }
+
+        private void failNamespaceListing() {
+            namespaceListingFails.set(true);
         }
     }
 
@@ -622,6 +849,10 @@ class PublishCompactTaskRunnerOffsetTest {
 
         private void metadata(long offset, EntryHeader header) {
             metadata.put(offset, header);
+        }
+
+        private void removeMetadata(long offset) {
+            metadata.remove(offset);
         }
     }
 

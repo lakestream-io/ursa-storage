@@ -35,6 +35,7 @@ public class CompactionMetrics {
     private final Counter compactedMessagesCount;
     private final Counter failedCompactTaskCount;
     private final Counter publishTaskFailedCount;
+    private final Counter publicationLeaseUnavailableCount;
     private final Counter tableCorruptedCount;
 
     // Gauge
@@ -96,6 +97,11 @@ public class CompactionMetrics {
                 Unit.Messages, "Compacted failed task count", Attributes.empty());
         this.publishTaskFailedCount = provider.newCounter("ursa.storage.compact.publish.task.failed.count",
                 Unit.Messages, "Compacted publish task failed count", Attributes.empty());
+        this.publicationLeaseUnavailableCount = provider.newCounter(
+                "ursa.storage.compact.publication.lease.unavailable.count",
+                Unit.Sessions,
+                "Compaction task publication lease contention transitions",
+                Attributes.empty());
         this.tableCorruptedCount = provider.newCounter("ursa.storage.compact.table.corrupted.count",
                 Unit.Messages, "Compacted table corrupted count", Attributes.empty());
 

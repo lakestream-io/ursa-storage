@@ -5,6 +5,7 @@
 package io.lakestream.ursa.compact;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
@@ -48,7 +49,9 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
@@ -197,10 +200,143 @@ public class CompactionWorkerMaterializationFailureTest {
     }
 
     @Test
-    public void permanentlyDeletedRegistrationDeletesTerminalTask() throws Exception {
-        StreamIdentifier id = new StreamIdentifier("default", "deleted-topic");
-        runCatalogFailureAndAssertTaskDeleted(
-            new StreamPermanentlyDeletedException(id), true);
+    public void permanentlyDeletedStreamLoadDeletesTerminalTaskWithoutRegistration() throws Exception {
+        CompactionWorker worker = createWorker();
+        String topic = "default/deleted-topic-partition-0";
+        CompactStreamTask task = new CompactStreamTask();
+        task.setTopic(topic);
+        task.setTaskName("permanently-deleted-task");
+        task.setStatus(CompactStreamTask.INIT);
+        task.setStreamId(17L);
+        task.setStartOffset(0L);
+        task.setEndOffset(5L);
+
+        PackagedCompactStreamTask packagedTask = new PackagedCompactStreamTask();
+        packagedTask.setTaskName("permanently-deleted-package");
+        packagedTask.setSubTasks(List.of("permanently-deleted-subtask"));
+        when(compactionTaskProvider.getTask()).thenReturn(packagedTask).thenReturn(null);
+        when(compactTaskManager.getCompactStreamTask("permanently-deleted-subtask"))
+            .thenReturn(CompletableFuture.completedFuture(task));
+        when(compactionTaskProvider.getQuarantinedTopic(topic)).thenReturn(null);
+        when(compactTaskManager.tryLockTask(packagedTask.getTaskName())).thenReturn(true);
+
+        StreamIdentifier id = CompactionWorker.toStreamIdentifier(topic);
+        when(streamCatalog.loadStream(id))
+            .thenReturn(CompletableFuture.failedFuture(new StreamPermanentlyDeletedException(id)));
+        CountDownLatch taskDeleted = new CountDownLatch(1);
+        when(compactTaskManager.deleteCompactTask(task)).thenAnswer(invocation -> {
+            taskDeleted.countDown();
+            return CompletableFuture.completedFuture(null);
+        });
+
+        Thread thread = new Thread(worker);
+        thread.start();
+        assertTrue(taskDeleted.await(10, TimeUnit.SECONDS));
+        thread.interrupt();
+        thread.join(2_000L);
+
+        verify(compactTaskManager).deleteCompactTask(task);
+        verify(streamCatalog, never()).registerExternalPartition(any(), anyInt(), anyLong(), any());
+        verify(compactionTaskProvider, never()).quarantineTopic(any(), anyLong());
+        verify(materializationService, never()).materialize(any());
+    }
+
+    @Test
+    public void catalogJvmErrorEscapesWorkerWithoutRegistrationOrRetry() throws Exception {
+        CompactionWorker worker = createWorker();
+        String topic = "default/linkage-failure-partition-0";
+        CompactStreamTask task = new CompactStreamTask();
+        task.setTopic(topic);
+        task.setTaskName("linkage-failure-task");
+        task.setStatus(CompactStreamTask.INIT);
+        task.setStreamId(19L);
+        task.setStartOffset(0L);
+        task.setEndOffset(5L);
+
+        PackagedCompactStreamTask packagedTask = new PackagedCompactStreamTask();
+        packagedTask.setTaskName("linkage-failure-package");
+        packagedTask.setSubTasks(List.of("linkage-failure-subtask"));
+        when(compactionTaskProvider.getTask()).thenReturn(packagedTask);
+        when(compactTaskManager.getCompactStreamTask("linkage-failure-subtask"))
+            .thenReturn(CompletableFuture.completedFuture(task));
+        when(compactionTaskProvider.getQuarantinedTopic(topic)).thenReturn(null);
+        when(compactTaskManager.tryLockTask(packagedTask.getTaskName())).thenReturn(true);
+
+        NoClassDefFoundError linkageFailure = new NoClassDefFoundError("missing sink provider");
+        when(streamCatalog.loadStream(any()))
+            .thenReturn(CompletableFuture.failedFuture(linkageFailure));
+        CountDownLatch errorObserved = new CountDownLatch(1);
+        AtomicReference<Throwable> uncaught = new AtomicReference<>();
+        Thread thread = new Thread(worker);
+        thread.setUncaughtExceptionHandler((ignored, failure) -> {
+            uncaught.set(failure);
+            errorObserved.countDown();
+        });
+
+        thread.start();
+        assertTrue(errorObserved.await(10, TimeUnit.SECONDS));
+        thread.join(2_000L);
+
+        assertFalse(thread.isAlive());
+        assertSame(linkageFailure, uncaught.get());
+        verify(streamCatalog, never()).registerExternalPartition(any(), anyInt(), anyLong(), any());
+        verify(compactTaskManager, never()).deleteCompactTask(task);
+        verify(compactionTaskProvider, never()).quarantineTopic(any(), anyLong());
+        verify(materializationService, never()).invalidate(any());
+        verify(materializationService, never()).materialize(any());
+    }
+
+    @Test
+    public void wrappedMaterializationJvmErrorEscapesWorkerWithoutQuarantine() throws Exception {
+        CompactionWorker worker = createWorker();
+        String topic = "default/materialization-linkage-failure-partition-0";
+        CompactStreamTask task = new CompactStreamTask();
+        task.setTopic(topic);
+        task.setTaskName("materialization-linkage-failure-task");
+        task.setStatus(CompactStreamTask.INIT);
+        task.setStreamId(23L);
+        task.setStartOffset(0L);
+        task.setEndOffset(5L);
+
+        PackagedCompactStreamTask packagedTask = new PackagedCompactStreamTask();
+        packagedTask.setTaskName("materialization-linkage-failure-package");
+        packagedTask.setSubTasks(List.of("materialization-linkage-failure-subtask"));
+        when(compactionTaskProvider.getTask()).thenReturn(packagedTask);
+        when(compactTaskManager.getCompactStreamTask("materialization-linkage-failure-subtask"))
+                .thenReturn(CompletableFuture.completedFuture(task));
+        when(compactionTaskProvider.getQuarantinedTopic(topic)).thenReturn(null);
+        when(compactTaskManager.tryLockTask(packagedTask.getTaskName())).thenReturn(true);
+        when(streamCatalog.registerExternalPartition(any(), anyInt(), anyLong(), any()))
+                .thenReturn(CompletableFuture.completedFuture(null));
+        stubExternalStream(task);
+        when(stream.effectiveMaterialization()).thenReturn(Optional.of(new ResolvedMaterialization(
+                new TableCatalog("delta-cat", TableCatalogType.DELTA, Map.of(), Map.of()),
+                new TableIdentifier("ns", "table"),
+                TableMaterializationPolicy.empty())));
+
+        NoClassDefFoundError linkageFailure = new NoClassDefFoundError("missing materialization sink");
+        doThrow(new MaterializationException(
+                ExceptionCode.LAKEHOUSE_COMMIT_ERROR,
+                "failed asynchronous sink operation",
+                new ExecutionException(linkageFailure)))
+                .when(materializationService).materialize(any(MaterializationTask.class));
+        CountDownLatch errorObserved = new CountDownLatch(1);
+        AtomicReference<Throwable> uncaught = new AtomicReference<>();
+        Thread thread = new Thread(worker);
+        thread.setUncaughtExceptionHandler((ignored, failure) -> {
+            uncaught.set(failure);
+            errorObserved.countDown();
+        });
+
+        thread.start();
+        assertTrue(errorObserved.await(10, TimeUnit.SECONDS));
+        thread.join(2_000L);
+
+        assertFalse(thread.isAlive());
+        assertSame(linkageFailure, uncaught.get());
+        verify(materializationService, never()).invalidate(any());
+        verify(compactionTaskProvider, never()).quarantineTopic(any(), anyLong());
+        verify(compactTaskManager, never()).deleteCompactTask(task);
     }
 
     @Test
@@ -247,6 +383,7 @@ public class CompactionWorkerMaterializationFailureTest {
         thread.join(2_000L);
 
         verify(compactTaskManager).deleteCompactTask(task);
+        verify(streamCatalog, never()).registerExternalPartition(any(), anyInt(), anyLong(), any());
         verify(compactionTaskProvider, never()).quarantineTopic(any(), anyLong());
         verify(materializationService, never()).materialize(any());
         verify(stream).close();

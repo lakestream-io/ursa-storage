@@ -34,10 +34,24 @@ public class UpdatePublishTaskOffset implements Callable<Integer> {
             required = true)
     private long offset;
 
+    @CommandLine.Option(
+            names = {"--cumulative-size"},
+            description = "Cumulative bytes through --offset; use 0 with --offset=-1",
+            required = true)
+    private long cumulativeSize;
+
     @Override
     public Integer call() throws Exception {
         if (offset < -1) {
             System.err.println("Published offset must be -1 or a non-negative last-included offset");
+            return 1;
+        }
+        if (cumulativeSize < 0) {
+            System.err.println("Published cumulative size must be non-negative");
+            return 1;
+        }
+        if (offset == -1 && cumulativeSize != 0) {
+            System.err.println("Published cumulative size must be 0 when offset is -1");
             return 1;
         }
         if (StringUtils.isEmpty(oxiaServerAddr)) {
@@ -50,9 +64,10 @@ public class UpdatePublishTaskOffset implements Callable<Integer> {
         try (var oxiaClient = OxiaClientBuilder.create(oxiaServerAddr).namespace(oxiaNamespace).asyncClient().get()) {
             OxiaCompactTaskManager taskManager = new OxiaCompactTaskManager(oxiaClient);
             String name = StreamNames.normalize(stream);
-            taskManager.updatePublishedOffset(name, streamId, offset);
+            taskManager.updatePublishedOffset(name, streamId, offset, cumulativeSize);
             System.out.println("Updated publish task offset for " + stream
-                    + " to (streamId=" + streamId + ", offset=" + offset + ")");
+                    + " to (streamId=" + streamId + ", offset=" + offset
+                    + ", cumulativeSize=" + cumulativeSize + ")");
         } catch (Exception e) {
             System.err.println("Error updating publish task offset: " + e.getMessage());
             return 1;

@@ -145,7 +145,7 @@ public class CompactionScheduler {
         this.executor = Executors.newFixedThreadPool(config.getCompactedThreadNum(),
                 new DefaultThreadFactory("compact-stream"));
         this.scheduledExecutor = Executors.newSingleThreadScheduledExecutor(
-                new DefaultThreadFactory("refresh-local-topics"));
+                new DefaultThreadFactory("compaction-maintenance"));
         long maintenanceIntervalSeconds = config.getCompactionMaintenanceIntervalInSeconds();
         if (maintenanceIntervalSeconds > 0) {
             this.maintenanceFuture = scheduledExecutor.scheduleWithFixedDelay(
@@ -268,7 +268,6 @@ public class CompactionScheduler {
                     compactTaskManager,
                     compactionMetrics,
                     commitTaskProvider,
-                    oxiaClient,
                     null,
                     scanTopicExecutor,
                     publishTaskExecutor,

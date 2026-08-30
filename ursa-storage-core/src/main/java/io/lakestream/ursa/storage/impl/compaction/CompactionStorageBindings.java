@@ -22,10 +22,6 @@ import java.util.function.BooleanSupplier;
  * inside the integration module along with their heavy lakehouse-specific
  * transitive dependencies. This keeps the abstraction in {@code ursa-storage-core}
  * while avoiding a hard move of every runner class into core.
- *
- * <p>{@link #createTopicManager()} returns a core-level {@link TopicManager}; the
- * concrete impl can live in any integration module ({@code OxiaTopicManager}
- * already implements this interface from core).
  */
 public interface CompactionStorageBindings extends AutoCloseable {
 
@@ -52,12 +48,6 @@ public interface CompactionStorageBindings extends AutoCloseable {
     StartStopRunner createAsyncCompactedDataCleaner();
 
     /**
-     * Returns the {@link TopicManager} used by the orchestrator to enumerate
-     * topics that are candidates for compaction.
-     */
-    TopicManager createTopicManager();
-
-    /**
      * Returns the sink-neutral schema service the orchestrator threads into the
      * {@code MaterializationRuntime} it hands to {@code MaterializationService}.
      *
@@ -70,8 +60,7 @@ public interface CompactionStorageBindings extends AutoCloseable {
     Object schemaService();
 
     /**
-     * Returns the schema-registry abstraction the publish runner uses to gate
-     * compaction tasks by schema readability.
+     * Returns the schema-registry abstraction used by the legacy compaction service.
      *
      * <p>The type stays {@link Object} so the lakehouse {@code SchemaRegistry} type
      * does not have to live in core; the lakehouse bindings impl exposes a

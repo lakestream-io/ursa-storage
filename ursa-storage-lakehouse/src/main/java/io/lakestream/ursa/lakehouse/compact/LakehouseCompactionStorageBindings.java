@@ -20,8 +20,6 @@ import io.lakestream.ursa.storage.impl.StorageConfig;
 import io.lakestream.ursa.storage.impl.compaction.CommitTaskProvider;
 import io.lakestream.ursa.storage.impl.compaction.CompactionStorageBindings;
 import io.lakestream.ursa.storage.impl.compaction.StartStopRunner;
-import io.lakestream.ursa.storage.impl.compaction.TopicManager;
-import io.oxia.client.api.AsyncOxiaClient;
 import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
@@ -52,8 +50,6 @@ public final class LakehouseCompactionStorageBindings implements CompactionStora
     @Getter
     private final SchemaRegistry schemaRegistry;
     private volatile KafkaSchemaService schemaService;
-    /** Legacy SPI compatibility; the catalog-backed publisher does not use a TopicManager. */
-    private volatile TopicManager topicManager;
 
     public LakehouseCompactionStorageBindings(Dependencies deps) {
         this.deps = Objects.requireNonNull(deps, "deps");
@@ -103,21 +99,6 @@ public final class LakehouseCompactionStorageBindings implements CompactionStora
     }
 
     @Override
-    public TopicManager createTopicManager() {
-        TopicManager local = topicManager;
-        if (local == null) {
-            synchronized (this) {
-                local = topicManager;
-                if (local == null) {
-                    local = new StorageTopicManager(deps.storageApi, deps.config);
-                    topicManager = local;
-                }
-            }
-        }
-        return local;
-    }
-
-    @Override
     public Object getSchemaRegistry() {
         return schemaRegistry;
     }
@@ -149,13 +130,6 @@ public final class LakehouseCompactionStorageBindings implements CompactionStora
 
     @Override
     public void close() {
-        if (topicManager != null) {
-            try {
-                topicManager.close();
-            } catch (Exception e) {
-                log.warn("Failed to close legacy topic manager during bindings shutdown", e);
-            }
-        }
         if (schemaService != null) {
             try {
                 schemaService.close();
@@ -179,7 +153,6 @@ public final class LakehouseCompactionStorageBindings implements CompactionStora
         private final CompactTaskManager compactTaskManager;
         private final CompactionMetrics compactionMetrics;
         private final CommitTaskProvider commitTaskProvider;
-        private final AsyncOxiaClient oxiaClient;
         private final SchemaRegistry schemaRegistry;
         private final ExecutorService scanTopicExecutor;
         private final ScheduledExecutorService publishTaskExecutor;
@@ -194,7 +167,6 @@ public final class LakehouseCompactionStorageBindings implements CompactionStora
                             CompactTaskManager compactTaskManager,
                             CompactionMetrics compactionMetrics,
                             CommitTaskProvider commitTaskProvider,
-                            AsyncOxiaClient oxiaClient,
                             SchemaRegistry schemaRegistry,
                             ExecutorService scanTopicExecutor,
                             ScheduledExecutorService publishTaskExecutor,
@@ -207,7 +179,6 @@ public final class LakehouseCompactionStorageBindings implements CompactionStora
             this.compactTaskManager = Objects.requireNonNull(compactTaskManager, "compactTaskManager");
             this.compactionMetrics = Objects.requireNonNull(compactionMetrics, "compactionMetrics");
             this.commitTaskProvider = Objects.requireNonNull(commitTaskProvider, "commitTaskProvider");
-            this.oxiaClient = oxiaClient;
             this.schemaRegistry = schemaRegistry;
             this.scanTopicExecutor = Objects.requireNonNull(scanTopicExecutor, "scanTopicExecutor");
             this.publishTaskExecutor = Objects.requireNonNull(publishTaskExecutor, "publishTaskExecutor");

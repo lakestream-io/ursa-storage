@@ -177,8 +177,19 @@ public class MemoryCompactTaskManager implements CompactTaskManager {
     }
 
     @Override
-    public synchronized void updatePublishedOffset(String name, long streamId, long offset) {
-        publishedOffsets.put(name, new CompactedOffset(streamId, offset, 0)); // cumulativeSize is 0 by default
+    public synchronized void updatePublishedOffset(
+            String name, long streamId, long offset, long cumulativeSize) {
+        if (offset < -1) {
+            throw new IllegalArgumentException("Published offset must be at least -1");
+        }
+        if (cumulativeSize < 0) {
+            throw new IllegalArgumentException("Published cumulative size must be non-negative");
+        }
+        if (offset == -1 && cumulativeSize != 0) {
+            throw new IllegalArgumentException(
+                    "Published cumulative size must be 0 when the published offset is -1");
+        }
+        publishedOffsets.put(name, new CompactedOffset(streamId, offset, cumulativeSize));
         publishedOffsetVersions.put(name, nextRevision++);
     }
 

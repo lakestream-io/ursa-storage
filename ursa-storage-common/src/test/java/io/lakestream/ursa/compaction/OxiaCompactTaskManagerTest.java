@@ -243,10 +243,12 @@ public class OxiaCompactTaskManagerTest {
         assertEquals(1000L, publishedOffset.getOffset(), "Published offset value should match.");
 
 
-        taskManager.updatePublishedOffset(name, streamId, 2000L);
+        taskManager.updatePublishedOffset(name, streamId, 2000L, 7000L);
         publishedOffset = taskManager.getPublishedOffset(name);
         assertNotNull(publishedOffset, "Published offset by name should not be null.");
         assertEquals(2000L, publishedOffset.getOffset(), "Published offset value by name should match.");
+        assertEquals(7000L, publishedOffset.getCumulativeSize(),
+                "Published cumulative size by name should match.");
     }
 
 

@@ -55,7 +55,6 @@ public class LakehouseCompactionServiceImpl implements CompactionService {
     @Override
     public void compactStream(CompactStreamTask task) throws Exception {
         getCompactWorker(task).doCompact(task);
-        compactionMetrics.getOngoingCompactionTopicCount().set(compactWorkers.size());
     }
 
     protected CompactionTaskProcessor getCompactWorker(CompactStreamTask task) {

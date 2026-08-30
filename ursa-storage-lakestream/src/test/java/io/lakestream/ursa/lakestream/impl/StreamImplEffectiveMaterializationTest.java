@@ -27,11 +27,14 @@ import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.GetResult;
 import io.oxia.client.api.PutResult;
 import io.oxia.client.api.Version;
+import io.oxia.client.api.exceptions.KeyAlreadyExistsException;
+import io.oxia.client.api.options.PutOption;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -92,6 +95,13 @@ class StreamImplEffectiveMaterializationTest {
         when(oxiaClient.put(any(String.class), any(byte[].class), any())).thenAnswer(inv -> {
             String key = inv.getArgument(0);
             byte[] value = inv.getArgument(1);
+            @SuppressWarnings("unchecked")
+            Set<PutOption> options = inv.getArgument(2, Set.class);
+            if (options.contains(PutOption.IfRecordDoesNotExist)
+                    && store.containsKey(key)) {
+                return CompletableFuture.failedFuture(
+                    new KeyAlreadyExistsException(key));
+            }
             store.put(key, value);
             return CompletableFuture.completedFuture(new PutResult(key, DUMMY_VERSION));
         });

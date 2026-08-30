@@ -203,6 +203,11 @@ public class CompactionWorker implements Runnable {
                                 compactionService.compactStream(validCompactTask);
                             }
                         } catch (MaterializationException me) {
+                            // Materialization implementations may bridge asynchronous APIs whose
+                            // ExecutionException is wrapped by MaterializationException. Preserve
+                            // fatal JVM failures across that boundary instead of quarantining them
+                            // as ordinary sink failures.
+                            rethrowErrorCause(me);
                             // Sink-neutral failure path: invalidate cached state when the code is
                             // non-retryable so the sink can drop writer state. The outer
                             // ExceptionWithCode handling still applies because
@@ -213,6 +218,7 @@ public class CompactionWorker implements Runnable {
                                     materializationService.invalidate(
                                             toStreamIdentifier(validCompactTask.getTopic()));
                                 } catch (RuntimeException invalidationFailure) {
+                                    rethrowErrorCause(invalidationFailure);
                                     log.warn("Failed to invalidate stream {} after materialization failure",
                                             validCompactTask.getTopic(), invalidationFailure);
                                 }
@@ -220,7 +226,7 @@ public class CompactionWorker implements Runnable {
                             failedTopicName = validCompactTask.getTopic();
                             failedCompactTask = validCompactTask;
                             throw me;
-                        } catch (Throwable e) {
+                        } catch (Exception e) {
                             failedTopicName = validCompactTask.getTopic();
                             failedCompactTask = validCompactTask;
                             throw e;
@@ -229,8 +235,11 @@ public class CompactionWorker implements Runnable {
                 } finally {
                     compactTaskManager.unlockTaskAndRemoveLock(taskName);
                 }
-            } catch (Throwable e) {
-                // To avoid the thread being interrupted by the throwable, we need to catch the throwable here.
+            } catch (Exception e) {
+                rethrowErrorCause(e);
+                // Operational failures stay within the worker's retry and quarantine policy. JVM
+                // Errors deliberately escape so linkage, memory, and other fatal failures are not
+                // laundered into retryable materialization errors.
                 if (e instanceof InterruptedException) {
                     log.warn("[{}] Compact runner thread interrupted", compactionTask, e);
                     break;
@@ -371,6 +380,10 @@ public class CompactionWorker implements Runnable {
         try {
             existing = streamCatalog.loadStream(id).join();
         } catch (RuntimeException failure) {
+            if (hasCause(failure, StreamPermanentlyDeletedException.class)) {
+                throw catalogFailure(
+                    "Stream " + id.fullName() + " was permanently deleted", failure);
+            }
             if (!hasCause(failure, NoSuchStreamException.class)) {
                 throw catalogFailure(
                     "Failed to load stream " + id.fullName() + " for materialization", failure);
@@ -381,7 +394,7 @@ public class CompactionWorker implements Runnable {
         List<LogId> logIds;
         try {
             logIds = existing.layout().logIds().join();
-        } catch (RuntimeException | Error failure) {
+        } catch (RuntimeException failure) {
             closeBeforeFallback(existing, failure);
             throw catalogFailure(
                 "Failed to read stream layout for " + id.fullName(), failure);
@@ -392,7 +405,7 @@ public class CompactionWorker implements Runnable {
         }
         try {
             verifyTaskLogIdentity(task, id, partitionIndex, logIds.get(partitionIndex));
-        } catch (RuntimeException | Error failure) {
+        } catch (RuntimeException failure) {
             closeBeforeFallback(existing, failure);
             throw catalogFailure(
                 "Stream " + id.fullName() + " does not match the compaction task", failure);
@@ -428,7 +441,7 @@ public class CompactionWorker implements Runnable {
             }
             verifyTaskLogIdentity(task, id, partitionIndex, logIds.get(partitionIndex));
             return registered;
-        } catch (RuntimeException | Error failure) {
+        } catch (RuntimeException failure) {
             closeBeforeFallback(registered, failure);
             throw catalogFailure(
                 "Registered stream " + id.fullName() + " does not match the compaction task", failure);
@@ -441,11 +454,15 @@ public class CompactionWorker implements Runnable {
             int partitionIndex,
             LogId actual) {
         if (actual.id() != task.getStreamId()) {
+            log.warn("Reject stale compaction task {} for stream {} partition {}: task logId {} "
+                    + "differs from catalog logId {}; terminal cleanup will delete the task "
+                    + "without changing the catalog registration",
+                task.getTaskName(), id.fullName(), partitionIndex, task.getStreamId(), actual.id());
             throw new PartitionLifecycleFencedException(
                 id,
                 partitionIndex,
-                "task references physical log " + task.getStreamId()
-                    + " but the catalog owns " + actual.id());
+                "stale compaction task " + task.getTaskName() + " references physical log "
+                    + task.getStreamId() + " but the catalog owns " + actual.id());
         }
     }
 
@@ -489,6 +506,7 @@ public class CompactionWorker implements Runnable {
                     + "synthesized from task properties for stream {}", name, resolved.tableIdentifier());
             }
         } catch (RuntimeException e) {
+            rethrowErrorCause(e);
             log.warn("Failed to load registered table catalog '{}'; using the catalog synthesized from "
                     + "task properties", name, e);
         }
@@ -506,12 +524,29 @@ public class CompactionWorker implements Runnable {
     }
 
     private static MaterializationException catalogFailure(
-            String message, Throwable failure) {
+            String message, RuntimeException failure) {
+        // CompletableFuture.join() wraps exceptional completion in a RuntimeException, including
+        // fatal JVM Errors. Do not turn those Errors into retryable materialization failures.
+        rethrowErrorCause(failure);
         ExceptionCode code = hasCause(failure, StreamPermanentlyDeletedException.class)
                 || hasCause(failure, PartitionLifecycleFencedException.class)
             ? ExceptionCode.NO_SUCH_STREAM
             : ExceptionCode.INTERNAL_ERROR;
         return new MaterializationException(code, message, failure);
+    }
+
+    private static void rethrowErrorCause(Throwable failure) {
+        Throwable current = failure;
+        while (current != null) {
+            if (current instanceof Error error) {
+                throw error;
+            }
+            Throwable cause = current.getCause();
+            if (cause == current) {
+                break;
+            }
+            current = cause;
+        }
     }
 
     private static boolean hasCause(Throwable failure, Class<? extends Throwable> type) {

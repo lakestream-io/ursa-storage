@@ -79,6 +79,14 @@ final class IndexedStreamConfigStore {
         this.retryDelay = Objects.requireNonNull(retryDelay, "retryDelay");
     }
 
+    /**
+     * Creates an empty namespace record only when no namespace metadata exists.
+     *
+     * <p>An existing namespace is success and is never overwritten, so its properties and
+     * materialization policy remain intact. This write deliberately precedes stream provisioning
+     * and is not rolled back when the caller's later operation fails; the retained namespace can
+     * be configured with the catalog's namespace mutation APIs.
+     */
     CompletableFuture<Void> ensureNamespaceExists(String namespace) {
         String path = catalogPaths.namespacePath(namespace);
         return oxiaClient.put(path, EMPTY_NAMESPACE, Set.of(PutOption.IfRecordDoesNotExist))

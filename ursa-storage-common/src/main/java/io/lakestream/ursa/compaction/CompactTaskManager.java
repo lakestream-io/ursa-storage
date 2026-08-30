@@ -98,8 +98,11 @@ public interface CompactTaskManager {
     void updatePublishedOffset(long streamId, long offset, long cumulativeSize)
             throws IOException, ExecutionException, InterruptedException;
 
-    /** Records the last logical offset included in a published task under a named key. */
-    void updatePublishedOffset(String name, long streamId, long offset)
+    /**
+     * Records the last logical offset and cumulative byte size included in a published task under a
+     * named key.
+     */
+    void updatePublishedOffset(String name, long streamId, long offset, long cumulativeSize)
             throws IOException, ExecutionException, InterruptedException;
 
     /**

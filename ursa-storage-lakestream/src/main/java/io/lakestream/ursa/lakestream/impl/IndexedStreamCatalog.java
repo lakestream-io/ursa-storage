@@ -87,6 +87,11 @@ import lombok.extern.slf4j.Slf4j;
  *
  * <p>{@code createStream()} and {@code loadStream()} return fully initialized
  * {@link StreamImpl} handles with layout, writer, reader, and per-log access.
+ *
+ * <p>Creation and external registration write a create-only empty namespace before provisioning.
+ * They preserve existing namespace metadata and intentionally retain a newly created namespace if
+ * provisioning fails. Callers configure such a namespace with the namespace mutation APIs; the
+ * explicit create operation retains its normal already-exists contract.
  */
 @Slf4j
 public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegistry {

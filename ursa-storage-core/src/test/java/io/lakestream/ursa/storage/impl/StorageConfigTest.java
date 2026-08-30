@@ -268,7 +268,6 @@ public class StorageConfigTest {
         assertEquals("", config.getOxiaStorageUrl());
         assertEquals("", config.getOxiaStorageConfig());
         assertEquals(60, config.getTopicToStreamCacheExpireTimeInSeconds());
-        assertEquals(60, config.getRefreshLocalTopicInternalInSeconds());
         assertEquals(300, config.getCompactionMaintenanceIntervalInSeconds());
         assertEquals(30, config.getRefreshLocalTaskIntervalInSeconds());
         assertEquals(30, config.getRetryableQuarantineInSeconds());

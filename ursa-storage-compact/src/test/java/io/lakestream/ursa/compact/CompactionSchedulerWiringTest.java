@@ -161,7 +161,6 @@ public class CompactionSchedulerWiringTest {
     public void enabledInternalTaskPublisherStartsCatalogPublisherWithoutLegacyTopicRefresh() throws Exception {
         CompactionScheduler scheduler = mock(CompactionScheduler.class, Answers.CALLS_REAL_METHODS);
         StorageConfig config = StorageConfig.builder()
-                .refreshLocalTopicInternalInSeconds(7)
                 .build();
         CompactionStorageBindings storageBindings = mock(CompactionStorageBindings.class);
         StartStopRunner runner = mock(StartStopRunner.class);

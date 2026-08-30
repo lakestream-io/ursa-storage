@@ -553,13 +553,6 @@ public class StorageConfig {
     @Builder.Default
     @FieldContext(
             category = CATEGORY_COMPACT,
-            doc = "The refresh topic interval in seconds."
-    )
-    private long refreshLocalTopicInternalInSeconds = 60;
-
-    @Builder.Default
-    @FieldContext(
-            category = CATEGORY_COMPACT,
             doc = "The compaction maintenance interval in seconds. "
                 + "This drives cache cleanup and other periodic compaction maintenance tasks."
     )

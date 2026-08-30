@@ -32,7 +32,23 @@ public class CompactionManager {
 
     @FunctionalInterface
     public interface PublicationTaskFactory {
-        Optional<PreparedCompactStreamTask> create(long lastPublishedOffset) throws Exception;
+        Optional<PreparedCompactStreamTask> create(PublicationCursor cursor) throws Exception;
+    }
+
+    /** Immutable cursor presented to a task factory while its publication lease is held. */
+    public record PublicationCursor(long streamId, long offset, long cumulativeSize) {
+
+        public PublicationCursor {
+            if (streamId < 0) {
+                throw new IllegalArgumentException("streamId must be non-negative");
+            }
+            if (offset < -1) {
+                throw new IllegalArgumentException("offset must be at least -1");
+            }
+            if (cumulativeSize < 0) {
+                throw new IllegalArgumentException("cumulativeSize must be non-negative");
+            }
+        }
     }
 
     private final CompactTaskManager taskManager;
@@ -85,11 +101,11 @@ public class CompactionManager {
     }
 
     /**
-     * Retries every lease release that was left unsettled when opening a publication session.
+     * Retries every publication-lease release left unsettled by session acquisition or close.
      *
      * <p>This is intentionally independent of a later open attempt. A publisher can lose
-     * leadership after acquiring a lease but before claiming its cursor, so its owner must be able
-     * to drain the failed acquisition even when it will never open that topic again.
+     * leadership anywhere in its session lifecycle, so its owner must be able to drain the exact
+     * failed lease even when it will never open that topic again.
      */
     public void retryPendingPublicationLeaseReleases() throws Exception {
         Throwable firstFailure = null;
@@ -186,14 +202,14 @@ public class CompactionManager {
                 ensureCurrentLease();
                 for (int attempt = 0; attempt < MAX_PREPARED_CLAIM_RETRIES; attempt++) {
                     recoverPreparedTask();
-                    long lastPublishedOffset = cursor.offset().getOffset();
-                    Optional<PreparedCompactStreamTask> nextTask = taskFactory.create(lastPublishedOffset);
+                    PublicationCursor publicationCursor = publicationCursor();
+                    Optional<PreparedCompactStreamTask> nextTask = taskFactory.create(publicationCursor);
                     ensureCurrentLease();
                     if (nextTask.isEmpty()) {
                         return PublicationResult.NO_TASK;
                     }
                     PreparedCompactStreamTask task = nextTask.get();
-                    validateNextTask(task, lastPublishedOffset);
+                    validateNextTask(task, publicationCursor);
                     Optional<CompactTaskManager.PreparedTaskClaim> preparedClaim =
                             taskManager.tryCreatePreparedTaskClaim(task, lease.name());
                     ensureCurrentLease();
@@ -268,12 +284,15 @@ public class CompactionManager {
             }
 
             long targetOffset = OffsetRange.lastIncludedOffset(task.getStartOffset(), task.getEndOffset());
-            long currentOffset = cursor.offset().getOffset();
+            PublicationCursor currentCursor = publicationCursor();
+            long currentOffset = currentCursor.offset();
             if (currentOffset == task.getStartOffset() - 1) {
+                validateNextTask(task, currentCursor);
                 publishPreparedTask(claim);
                 return;
             }
             if (currentOffset == targetOffset) {
+                validateRecoveredCommittedTask(task, currentCursor);
                 makeTaskVisible(task, claim);
                 return;
             }
@@ -289,13 +308,37 @@ public class CompactionManager {
                     + lease.name() + " is " + currentOffset);
         }
 
+        private PublicationCursor publicationCursor() {
+            CompactedOffset publishedOffset = cursor.offset();
+            if (publishedOffset.getId() != lease.streamId()) {
+                fence();
+                throw fencedException();
+            }
+            return new PublicationCursor(
+                    publishedOffset.getId(),
+                    publishedOffset.getOffset(),
+                    publishedOffset.getCumulativeSize());
+        }
+
+        private void validateRecoveredCommittedTask(
+                PreparedCompactStreamTask task, PublicationCursor publishedCursor) {
+            validateTaskIdentity(task);
+            if (task.getTotalSize() <= 0
+                    || task.getCumulativeSize() < task.getTotalSize()
+                    || task.getCumulativeSize() != publishedCursor.cumulativeSize()) {
+                throw new IllegalStateException(
+                        "Prepared task cumulative size does not match the committed cursor");
+            }
+        }
+
         private void publishPreparedTask(CompactTaskManager.PreparedTaskClaim preparedClaim) throws Exception {
             PreparedCompactStreamTask task = preparedClaim.task();
             ensureCurrentLease();
             taskManager.publishCompactTaskIfAbsent(task.toCompactStreamTask());
             ensureCurrentLease();
             long targetOffset = OffsetRange.lastIncludedOffset(task.getStartOffset(), task.getEndOffset());
-            CompactedOffset updated = new CompactedOffset(lease.streamId(), targetOffset, 0L);
+            CompactedOffset updated = new CompactedOffset(
+                    lease.streamId(), targetOffset, task.getCumulativeSize());
             cursor = taskManager.compareAndSetPublishedOffset(lease, cursor, updated);
             ensureCurrentLease();
             makeTaskVisible(task, preparedClaim);
@@ -307,8 +350,8 @@ public class CompactionManager {
         private void makeTaskVisible(
                 PreparedCompactStreamTask task,
                 CompactTaskManager.PreparedTaskClaim preparedClaim) throws Exception {
-            // The package marker is the worker-visible commit point. It is deliberately written only
-            // after the cursor CAS has committed this range to the current publisher session.
+            // The package marker is the worker-visible commit point. It is written only after the
+            // durable cursor covers this range, either through this publication or crash recovery.
             ensureCurrentLease();
             taskManager.publishCompactTaskIfAbsent(task.toCompactStreamTask());
             ensureCurrentLease();
@@ -321,17 +364,27 @@ public class CompactionManager {
             ensureCurrentLease();
         }
 
-        private void validateNextTask(PreparedCompactStreamTask task, long lastPublishedOffset) {
+        private void validateNextTask(PreparedCompactStreamTask task, PublicationCursor publishedCursor) {
+            validateTaskIdentity(task);
+            if (task.getStartOffset() != Math.addExact(publishedCursor.offset(), 1L)) {
+                throw new IllegalArgumentException("Prepared task must start immediately after the published cursor");
+            }
+            long expectedTotalSize = Math.subtractExact(
+                    task.getCumulativeSize(), publishedCursor.cumulativeSize());
+            if (expectedTotalSize <= 0 || task.getTotalSize() != expectedTotalSize) {
+                throw new IllegalArgumentException(
+                        "Prepared task total size must equal its cumulative-size advance");
+            }
+            OffsetRange.lastIncludedOffset(task.getStartOffset(), task.getEndOffset());
+        }
+
+        private void validateTaskIdentity(PreparedCompactStreamTask task) {
             if (!lease.name().equals(task.getTopic())) {
                 throw new IllegalArgumentException("Prepared task topic does not match the publication session");
             }
             if (task.getStreamId() != lease.streamId()) {
                 throw new IllegalArgumentException("Prepared task stream does not match the publication session");
             }
-            if (task.getStartOffset() != lastPublishedOffset + 1) {
-                throw new IllegalArgumentException("Prepared task must start immediately after the published cursor");
-            }
-            OffsetRange.lastIncludedOffset(task.getStartOffset(), task.getEndOffset());
         }
 
         @Override
@@ -347,13 +400,18 @@ public class CompactionManager {
                 closed = true;
                 // A false CAS result means this exact lease is already gone or superseded, which
                 // is a settled release. An exception is different: keep the release retryable on
-                // a subsequent close() while the local session remains permanently fenced.
+                // a subsequent close() or manager-level retry while the local session remains
+                // permanently fenced.
                 try {
                     taskManager.releasePublicationLease(lease);
-                } catch (InterruptedException interrupted) {
-                    Thread.currentThread().interrupt();
-                    throw interrupted;
+                } catch (Exception | Error releaseFailure) {
+                    pendingPublicationLeaseReleases.add(lease);
+                    if (releaseFailure instanceof InterruptedException) {
+                        Thread.currentThread().interrupt();
+                    }
+                    throw releaseFailure;
                 }
+                pendingPublicationLeaseReleases.remove(lease);
                 leaseReleaseSettled = true;
             } finally {
                 lifecycleLock.writeLock().unlock();
@@ -406,12 +464,12 @@ public class CompactionManager {
                 preparedCompactStreamTask.setStatus(PreparedCompactStreamTask.PUSHED_TASK);
                 taskManager.updatePreparedCompactTask(preparedCompactStreamTask, Optional.of(topicName));
                 taskManager.updatePublishedOffset(topicName, preparedCompactStreamTask.getStreamId(),
-                    publishedOffset);
+                    publishedOffset, preparedCompactStreamTask.getCumulativeSize());
                 taskManager.deletePreparedCompactTask(topicName);
             }
             if (status == PreparedCompactStreamTask.PUSHED_TASK) {
                 taskManager.updatePublishedOffset(topicName, preparedCompactStreamTask.getStreamId(),
-                    publishedOffset);
+                    publishedOffset, preparedCompactStreamTask.getCumulativeSize());
                 taskManager.deletePreparedCompactTask(topicName);
             }
         }
@@ -426,7 +484,8 @@ public class CompactionManager {
         taskManager.publishPackagedTaskName(task.getTaskName());
         task.setStatus(PreparedCompactStreamTask.PUSHED_TASK);
         taskManager.updatePreparedCompactTask(task, Optional.of(topicName));
-        taskManager.updatePublishedOffset(topicName, task.getStreamId(), publishedOffset);
+        taskManager.updatePublishedOffset(
+                topicName, task.getStreamId(), publishedOffset, task.getCumulativeSize());
         taskManager.deletePreparedCompactTask(topicName);
 
         // Record the last published offset so integrations can detect compaction lag.
