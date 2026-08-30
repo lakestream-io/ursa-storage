@@ -15,8 +15,12 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import io.lakestream.api.LogId;
 import io.lakestream.api.Stream;
 import io.lakestream.api.StreamCatalog;
+import io.lakestream.api.StreamIdentifier;
+import io.lakestream.api.StreamLayout;
+import io.lakestream.api.exception.NoSuchStreamException;
 import io.lakestream.api.materialization.ResolvedMaterialization;
 import io.lakestream.api.materialization.TableCatalog;
 import io.lakestream.api.materialization.TableCatalogType;
@@ -76,6 +80,9 @@ public class CompactionWorkerMaterializationDispatchTest {
     @Mock
     private Stream stream;
 
+    @Mock
+    private StreamLayout streamLayout;
+
     private CompactionWorker createWorker() {
         StorageConfig config = StorageConfig.builder()
                 .retryableQuarantineInSeconds(10)
@@ -120,7 +127,7 @@ public class CompactionWorkerMaterializationDispatchTest {
                 effective);
         when(streamCatalog.registerExternalPartition(any(), anyInt(), anyLong(), any()))
                 .thenReturn(CompletableFuture.completedFuture(null));
-        when(streamCatalog.loadStream(any())).thenReturn(CompletableFuture.completedFuture(stream));
+        stubExternalStream(task);
         when(stream.effectiveMaterialization()).thenReturn(Optional.of(resolved));
         // The worker no longer reads entries — it submits the offset range and the
         // MaterializationService reads + decodes. We only assert the dispatch happens here.
@@ -136,6 +143,53 @@ public class CompactionWorkerMaterializationDispatchTest {
         // resolves regardless of source. Partition 0 of "dispatch-topic-partition-0".
         verify(streamCatalog).registerExternalPartition(any(), anyInt(), anyLong(), any());
         verify(stream, never()).close();
+    }
+
+    @Test
+    public void nativeCatalogStreamDoesNotUseExternalRegistration() throws Exception {
+        CompactionWorker worker = createWorker();
+        String topic = "public/default/native-topic-partition-2";
+        CompactStreamTask task = new CompactStreamTask();
+        task.setTopic(topic);
+        task.setStatus(CompactStreamTask.INIT);
+        task.setStreamId(33L);
+        task.setStartOffset(0L);
+        task.setEndOffset(10L);
+        PackagedCompactStreamTask packagedTask = new PackagedCompactStreamTask();
+        packagedTask.setTaskName("task-native");
+        packagedTask.setSubTasks(List.of("sub-native"));
+        when(compactionTaskProvider.getTask()).thenReturn(packagedTask).thenReturn(null);
+        when(compactTaskManager.getCompactStreamTask("sub-native"))
+                .thenReturn(CompletableFuture.completedFuture(task));
+        when(compactionTaskProvider.getQuarantinedTopic(topic)).thenReturn(null);
+        when(compactTaskManager.tryLockTask(packagedTask.getTaskName())).thenReturn(true);
+
+        StreamIdentifier id = StreamIdentifier.of("public/default", "native-topic");
+        when(streamCatalog.loadStream(id)).thenReturn(CompletableFuture.completedFuture(stream));
+        when(stream.layout()).thenReturn(streamLayout);
+        when(streamLayout.logIds()).thenReturn(CompletableFuture.completedFuture(
+                List.of(LogId.of(31L), LogId.of(32L), LogId.of(33L))));
+        when(stream.effectiveMaterialization()).thenReturn(Optional.of(new ResolvedMaterialization(
+                new TableCatalog("delta-cat", TableCatalogType.DELTA, Map.of(), Map.of()),
+                new TableIdentifier("ns", "table"),
+                TableMaterializationPolicy.empty())));
+        CountDownLatch materialized = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            materialized.countDown();
+            return null;
+        }).when(materializationService).materialize(any(MaterializationTask.class));
+
+        Thread thread = new Thread(worker);
+        thread.start();
+        org.junit.jupiter.api.Assertions.assertTrue(materialized.await(10, TimeUnit.SECONDS));
+        thread.interrupt();
+        thread.join(2_000L);
+
+        ArgumentCaptor<MaterializationTask> captor = ArgumentCaptor.forClass(MaterializationTask.class);
+        verify(materializationService).materialize(captor.capture());
+        assertEquals(id, captor.getValue().stream());
+        assertEquals(33L, captor.getValue().streamId());
+        verify(streamCatalog, never()).registerExternalPartition(any(), anyInt(), anyLong(), any());
     }
 
     @Test
@@ -167,7 +221,7 @@ public class CompactionWorkerMaterializationDispatchTest {
         when(compactTaskManager.tryLockTask(packagedTask.getTaskName())).thenReturn(true);
         when(streamCatalog.registerExternalPartition(any(), anyInt(), anyLong(), any()))
                 .thenReturn(CompletableFuture.completedFuture(null));
-        when(streamCatalog.loadStream(any())).thenReturn(CompletableFuture.completedFuture(stream));
+        stubExternalStream(task);
         when(stream.effectiveMaterialization()).thenReturn(Optional.empty());
 
         // Task-property fallback resolves the catalog NAME ("ch") but no connection — a placeholder.
@@ -224,7 +278,7 @@ public class CompactionWorkerMaterializationDispatchTest {
         when(compactTaskManager.tryLockTask(packagedTask.getTaskName())).thenReturn(true);
         when(streamCatalog.registerExternalPartition(any(), anyInt(), anyLong(), any()))
                 .thenReturn(CompletableFuture.completedFuture(null));
-        when(streamCatalog.loadStream(any())).thenReturn(CompletableFuture.completedFuture(stream));
+        stubExternalStream(task);
         when(stream.effectiveMaterialization()).thenReturn(Optional.empty());
 
         Thread thread = new Thread(worker);
@@ -254,7 +308,7 @@ public class CompactionWorkerMaterializationDispatchTest {
         when(compactTaskManager.tryLockTask(packagedTask.getTaskName())).thenReturn(true);
         when(streamCatalog.registerExternalPartition(any(), anyInt(), anyLong(), any()))
                 .thenReturn(CompletableFuture.completedFuture(null));
-        when(streamCatalog.loadStream(any())).thenReturn(CompletableFuture.completedFuture(stream));
+        stubExternalStream(task);
         when(stream.effectiveMaterialization()).thenReturn(Optional.of(new ResolvedMaterialization(
                 new TableCatalog("delta-cat", TableCatalogType.DELTA, Map.of(), Map.of()),
                 new TableIdentifier("ns", "table"),
@@ -317,5 +371,15 @@ public class CompactionWorkerMaterializationDispatchTest {
 
         verify(compactionService).compactStream(task);
         verify(materializationService, never()).materialize(any());
+    }
+
+    private void stubExternalStream(CompactStreamTask task) {
+        StreamIdentifier id = CompactionWorker.toStreamIdentifier(task.getTopic());
+        when(streamCatalog.loadStream(any()))
+                .thenReturn(CompletableFuture.failedFuture(new NoSuchStreamException(id)))
+                .thenReturn(CompletableFuture.completedFuture(stream));
+        when(stream.layout()).thenReturn(streamLayout);
+        when(streamLayout.logIds())
+                .thenReturn(CompletableFuture.completedFuture(List.of(LogId.of(task.getStreamId()))));
     }
 }

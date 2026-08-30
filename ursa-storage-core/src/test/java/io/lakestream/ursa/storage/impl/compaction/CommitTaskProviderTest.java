@@ -12,6 +12,8 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 
 import io.lakestream.ursa.compaction.CompactTaskManager;
 import io.lakestream.ursa.compaction.metrics.CompactionMetrics;
@@ -49,7 +51,7 @@ public class CommitTaskProviderTest {
             String taskName = invocation.getArgument(0);
             tasks.remove(taskName);
             return CompletableFuture.completedFuture(true);
-        }).when(manager).deletePackagedTaskName(anyString());
+        }).when(manager).deletePackagedTaskNameIfEmpty(anyString());
     }
 
     @Test
@@ -199,6 +201,7 @@ public class CommitTaskProviderTest {
         var existingTasks = tasks.values().stream().flatMap(Collection::stream).toList();
         assertEquals(2, existingTasks.size());
         assertEquals(List.of(sub1Key, sub2Key), existingTasks.stream().sorted().toList());
+        verify(manager, times(2)).deletePackagedTaskNameIfEmpty(anyString());
     }
 
     private List<CompactStreamTask> generateTaskForTopic(String topic, long streamId, int numbers) {

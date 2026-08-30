@@ -4,6 +4,7 @@
  */
 package io.lakestream.ursa.compact;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -13,6 +14,7 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import io.lakestream.api.StreamIdentifier;
 import io.lakestream.ursa.compaction.CompactTaskManager;
 import io.lakestream.ursa.compaction.metrics.CompactionMetrics;
 import io.lakestream.ursa.compaction.task.CompactStreamTask;
@@ -57,9 +59,18 @@ public class CompactionWorkerTest {
     }
 
     @Test
+    public void parsesNestedNamespaceAndPartitionSuffix() {
+        String taskTopic = "public/default/orders-partition-2";
+
+        assertEquals(StreamIdentifier.of("public/default", "orders"),
+                CompactionWorker.toStreamIdentifier(taskTopic));
+        assertEquals(2, CompactionWorker.partitionIndexOf(taskTopic));
+    }
+
+    @Test
     public void testBlacklistedTopicIsSkipped() throws Exception {
         Set<String> blackTopics = new HashSet<>();
-        blackTopics.add("default/my-topic");
+        blackTopics.add("default/my-topic-partition-2");
         CompactionWorker worker = createWorker(blackTopics);
 
         // The topic in the task uses persistence naming encoding with partition suffix

@@ -120,11 +120,25 @@ Operator-side keys read on `CompactionScheduler` startup:
 | `materializationServiceClass` | `io.lakestream.ursa.lakehouse.compact.LakehouseMaterializationService` | Active `MaterializationService` SPI impl. |
 | `compactionStorageBindingsClass` | `io.lakestream.ursa.lakehouse.compact.LakehouseCompactionStorageBindings` | Wires the publish / commit / cleanup runners. |
 | `compactionServiceClass` | _(deprecated alias)_ | Honoured for one release. The scheduler logs a WARN when set without `materializationServiceClass`. |
+| `blackTopicOfCompact` | _(none)_ | Comma-separated logical stream names. A `-partition-N` suffix is normalized to the logical stream, so per-partition exclusion is not supported. |
 | `iceberg.catalog.<name>.*` / `delta.catalog.<name>.*` / `unityCatalog*` | _(none)_ | Per-catalog connection settings. Translated into `TableCatalog` records on startup by `TableCatalogBootstrap`. |
 | `clickhouse.catalog.<name>.dsn` / `…user` / `…password-ref` | _(none)_ | ClickHouse catalog connection bootstrap. |
 
 See [ursa-storage-compact/CLAUDE.md](../../ursa-storage-compact/CLAUDE.md#configuration-keys-operator-surface)
 for the full table.
+
+## Version 1.0 Metadata Boundary
+
+The 1.0 catalog-based task publisher is a clean metadata boundary. It discovers streams from
+Lakestream namespace indexes and stores publication cursors under each canonical
+`namespace/stream-partition-N` name. It does not migrate metadata written by the earlier
+stream-ID-based publisher.
+
+Before moving a pre-1.0 deployment to this publisher, stop every old publisher and either use a
+fresh catalog/compaction metadata namespace or run an explicit offline migration. Reusing an old
+materialized table with a fresh cursor can replay the stream from offset zero, so reset or migrate
+the table and cursor together. Rolling old and new publishers against the same metadata is not
+supported.
 
 ## Supported Sinks
 

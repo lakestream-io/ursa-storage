@@ -4,13 +4,13 @@
  */
 package io.lakestream.ursa.compact;
 
+import io.lakestream.api.StreamCatalog;
 import io.lakestream.ursa.compact.elect.CompactLeader;
 import io.lakestream.ursa.compact.elect.LeaderElectionService;
 import io.lakestream.ursa.compaction.CompactTaskManager;
 import io.lakestream.ursa.compaction.OxiaCompactTaskManager;
 import io.lakestream.ursa.compaction.metrics.CompactionMetrics;
 import io.lakestream.ursa.lakestream.impl.DefaultCatalogPaths;
-import io.lakestream.ursa.lakestream.impl.IndexedStreamCatalog;
 import io.lakestream.ursa.lakestream.impl.StreamCatalogService;
 import io.lakestream.ursa.materialization.FailureMessageHandler;
 import io.lakestream.ursa.materialization.MaterializationMetrics;
@@ -31,8 +31,6 @@ import io.lakestream.ursa.storage.impl.compaction.CompactionService;
 import io.lakestream.ursa.storage.impl.compaction.CompactionStorageBindings;
 import io.lakestream.ursa.storage.impl.compaction.CompactionTaskProviderV2;
 import io.lakestream.ursa.storage.impl.compaction.StartStopRunner;
-import io.lakestream.ursa.storage.impl.compaction.TopicManager;
-import io.lakestream.ursa.storage.impl.compaction.TopicProvider;
 import io.lakestream.ursa.utils.lock.LockManager;
 import io.netty.util.concurrent.DefaultThreadFactory;
 import io.opentelemetry.sdk.OpenTelemetrySdk;
@@ -95,14 +93,12 @@ public class CompactionScheduler {
     private final String hostname;
     protected AsyncOxiaClient oxiaClient;
     protected AsyncOxiaClient storageOxiaClient;
-    private TopicManager topicManager;
     @Getter
     private final CompactTaskManager compactTaskManager;
     private final CompactionService compactionService;
     private final MaterializationService materializationService;
     private final CompactionStorageBindings storageBindings;
     private final ExecutorService executor;
-    private final TopicProvider topicProvider;
     private final CompactionTaskProviderV2 compactionTaskProvider;
     private final CommitTaskProvider commitTaskProvider;
     private final ScheduledExecutorService scheduledExecutor;
@@ -118,14 +114,13 @@ public class CompactionScheduler {
     private StartStopRunner commitParquetFileRunner;
     private StartStopRunner asyncCompactedDataCleaner;
     private final CompactionMetrics compactionMetrics;
-    private ScheduledFuture<?> updateLocalTopicsFuture;
     private ScheduledFuture<?> updateCommitTasksFuture;
     private ScheduledFuture<?> maintenanceFuture;
     private final InstrumentProvider instrumentProvider;
 
     private UrsaStorage ursaStorage;
     @Nullable
-    private IndexedStreamCatalog streamCatalog;
+    private StreamCatalog streamCatalog;
 
     public CompactionScheduler(StorageConfig config)
             throws Exception {
@@ -140,8 +135,6 @@ public class CompactionScheduler {
         initializeWithUrsaStorage(openTelemetrySdk);
 
         this.hostname = NetUtils.getLocalHostname();
-        this.topicProvider = new TopicProvider();
-
         // The distributed lock implementation relies on the metadata notification.
         // We must use cluster metadata Oxia because storage metadata didn't enable notification feature.
         this.lockManager = createLockManagerReflectively(oxiaClient);
@@ -177,7 +170,6 @@ public class CompactionScheduler {
         this.storageBindings = buildStorageBindings(config);
         this.compactionService = buildCompactionService(config, resolveCompactionServiceClass(config), storageApi,
                 compactTaskManager, storageOxiaClient, compactionMetrics, storageBindings.getSchemaRegistry());
-        this.topicManager = storageBindings.createTopicManager();
         this.materializationService = buildMaterializationService(config, storageBindings, compactionMetrics);
     }
 
@@ -213,18 +205,46 @@ public class CompactionScheduler {
     private void initializeWithUrsaStorage(OpenTelemetrySdk openTelemetrySdk) throws Exception {
         this.ursaStorage = new UrsaStorage(config, openTelemetrySdk, storageOxiaClient);
         this.storageApi = ursaStorage.getDefaultStorageApi();
-        this.streamCatalog = openStreamCatalog(openTelemetrySdk);
+        if (requiresStreamCatalog(config)) {
+            try {
+                this.streamCatalog = openStreamCatalog(openTelemetrySdk);
+            } catch (RuntimeException | Error error) {
+                closeCatalogStartupResources(error);
+                throw error;
+            }
+        }
     }
 
-    @Nullable
-    private IndexedStreamCatalog openStreamCatalog(OpenTelemetrySdk openTelemetrySdk) {
+    static boolean requiresStreamCatalog(StorageConfig storageConfig) {
+        return storageConfig.isInternalCompactionTaskPublisherEnabled()
+                || storageConfig.isMaterializationEnabled();
+    }
+
+    private void closeCatalogStartupResources(Throwable startupFailure) {
+        closeAfterStartupFailure(ursaStorage, startupFailure);
+        closeAfterStartupFailure(storageOxiaClient, startupFailure);
+        closeAfterStartupFailure(oxiaClient, startupFailure);
+    }
+
+    private static void closeAfterStartupFailure(AutoCloseable resource, Throwable startupFailure) {
+        if (resource == null) {
+            return;
+        }
+        try {
+            resource.close();
+        } catch (Exception | Error closeFailure) {
+            startupFailure.addSuppressed(closeFailure);
+        }
+    }
+
+    private StreamCatalog openStreamCatalog(OpenTelemetrySdk openTelemetrySdk) {
         try {
             return new StreamCatalogService()
                     .open(config.getMetadataStoreUrl(), new DefaultCatalogPaths(), config.getProperties(),
                             openTelemetrySdk, ursaStorage);
         } catch (Exception e) {
-            log.warn("Failed to open IndexedStreamCatalog; materialization dispatch will be disabled", e);
-            return null;
+            throw new IllegalStateException(
+                    "Failed to open StreamCatalog required for compaction publication and materialization", e);
         }
     }
 
@@ -242,13 +262,12 @@ public class CompactionScheduler {
             Constructor<?> depsCtor = depsClass.getConstructors()[0];
             Object depsInstance = depsCtor.newInstance(
                     storageConfig,
+                    streamCatalog,
                     storageApi,
                     ursaStorage == null ? null : ursaStorage.getFileStorage(),
                     compactTaskManager,
                     compactionMetrics,
                     commitTaskProvider,
-                    topicProvider,
-                    topicManager,
                     oxiaClient,
                     null,
                     scanTopicExecutor,
@@ -435,8 +454,6 @@ public class CompactionScheduler {
             log.info("Internal compaction task publisher is disabled; waiting for externally published tasks");
             return;
         }
-        updateLocalTopicsFuture = scheduledExecutor.scheduleWithFixedDelay(this::updateLocalTopics,
-            0, config.getRefreshLocalTopicInternalInSeconds(), TimeUnit.SECONDS);
         streamCompactTaskRunner = storageBindings.createPublishCompactTaskRunner();
         streamCompactTaskRunner.start();
     }
@@ -456,10 +473,6 @@ public class CompactionScheduler {
             streamCompactTaskRunner.stop();
         }
 
-        if (updateLocalTopicsFuture != null) {
-            updateLocalTopicsFuture.cancel(true);
-            updateLocalTopicsFuture = null;
-        }
     }
 
     private void startCommitParquetFileRunner() {
@@ -505,19 +518,6 @@ public class CompactionScheduler {
         }
     }
 
-    public void updateLocalTopics() {
-        try {
-            List<String> allTopics = topicManager.getAllTopics();
-            if (topicProvider.getNumTopics() != allTopics.size()) {
-                log.info("Update local topics, current: {}, new: {}", topicProvider.getNumTopics(), allTopics.size());
-            }
-            compactionMetrics.getOngoingCompactionTopicCount().set(allTopics.size());
-            topicProvider.updateTopics(allTopics);
-        } catch (Exception e) {
-            log.error("Failed to update local topics.", e);
-        }
-    }
-
     private void runCompactionMaintenance() {
         try {
             compactionService.maintenance();
@@ -527,10 +527,6 @@ public class CompactionScheduler {
     }
 
     public void close() throws InterruptedException {
-        if (updateLocalTopicsFuture != null) {
-            updateLocalTopicsFuture.cancel(true);
-        }
-
         if (updateCommitTasksFuture != null) {
             updateCommitTasksFuture.cancel(true);
         }
@@ -539,7 +535,9 @@ public class CompactionScheduler {
             maintenanceFuture.cancel(true);
         }
 
+        stopPublishCompactTaskRunner();
         stopCommitParquetFileRunner();
+        stopAsyncCompactedDataCleaner();
 
         InterruptedException shutdownInterrupted = null;
         ExecutorService[] executors = {
@@ -575,10 +573,6 @@ public class CompactionScheduler {
         } catch (Exception e) {
             log.warn("Failed to close lock manager", e);
         }
-        if (topicManager != null) {
-            topicManager.close();
-        }
-
         if (compactionService != null) {
             compactionService.close();
         }
@@ -677,7 +671,7 @@ public class CompactionScheduler {
      * Properties)} reflectively so this module stays free of integration-package imports. The
      * bootstrap is idempotent; failures are logged and do not fail startup.
      */
-    private static void bootstrapTableCatalogs(IndexedStreamCatalog catalog, Properties properties) {
+    private static void bootstrapTableCatalogs(StreamCatalog catalog, Properties properties) {
         try {
             Class<?> bootstrapClass = Class.forName(LAKEHOUSE_BOOTSTRAP_CLASS);
             Method bootstrap = bootstrapClass.getMethod("bootstrap",

@@ -75,6 +75,14 @@ public class MemoryCompactTaskManager implements CompactTaskManager {
     }
 
     @Override
+    public synchronized CompletableFuture<Boolean> deletePackagedTaskNameIfEmpty(String taskName) {
+        if (compactTasks.containsKey(taskName)) {
+            return CompletableFuture.completedFuture(false);
+        }
+        return CompletableFuture.completedFuture(packagedTasks.remove(taskName) != null);
+    }
+
+    @Override
     public void deleteDLQPackagedTaskName(String taskName) {
         dLQPackagedTasks.remove(taskName);
     }

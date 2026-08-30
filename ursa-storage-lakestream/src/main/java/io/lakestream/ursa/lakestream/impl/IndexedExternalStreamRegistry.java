@@ -32,7 +32,9 @@ final class IndexedExternalStreamRegistry implements ExternalStreamRegistry {
     @Override
     public CompletableFuture<Void> registerExternalStream(
             StreamIdentifier id, int partitionCount, Map<String, String> properties) {
-        return streamConfigStore.registerExternalStream(id, partitionCount, properties);
+        return streamConfigStore.ensureNamespaceExists(id.namespace())
+            .thenCompose(ignored ->
+                streamConfigStore.registerExternalStream(id, partitionCount, properties));
     }
 
     @Override

@@ -84,20 +84,64 @@ public class CompactionManager {
         }
     }
 
+    /**
+     * Retries every lease release that was left unsettled when opening a publication session.
+     *
+     * <p>This is intentionally independent of a later open attempt. A publisher can lose
+     * leadership after acquiring a lease but before claiming its cursor, so its owner must be able
+     * to drain the failed acquisition even when it will never open that topic again.
+     */
+    public void retryPendingPublicationLeaseReleases() throws Exception {
+        Throwable firstFailure = null;
+        for (CompactTaskManager.PublicationLease pending : pendingPublicationLeaseReleases) {
+            try {
+                settlePendingPublicationLeaseRelease(pending);
+            } catch (Throwable error) {
+                if (error instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+                if (firstFailure == null) {
+                    firstFailure = error;
+                } else {
+                    firstFailure.addSuppressed(error);
+                }
+            }
+        }
+        if (firstFailure != null) {
+            if (firstFailure instanceof Exception exception) {
+                throw exception;
+            }
+            if (firstFailure instanceof Error error) {
+                throw error;
+            }
+            throw new RuntimeException(firstFailure);
+        }
+    }
+
+    /** Returns whether an acquired lease still needs a confirmed release. */
+    public boolean hasPendingPublicationLeaseReleases() {
+        return !pendingPublicationLeaseReleases.isEmpty();
+    }
+
     private void retryPendingPublicationLeaseRelease(String topicName) throws Exception {
         for (CompactTaskManager.PublicationLease pending : pendingPublicationLeaseReleases) {
             if (!topicName.equals(pending.name())) {
                 continue;
             }
-            try {
-                // Both true (released by this call) and false (already absent or superseded) settle the
-                // exact lease. Only an exception leaves the handle pending for the next open attempt.
-                taskManager.releasePublicationLease(pending);
-                pendingPublicationLeaseReleases.remove(pending);
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-                throw interrupted;
-            }
+            settlePendingPublicationLeaseRelease(pending);
+        }
+    }
+
+    private void settlePendingPublicationLeaseRelease(
+            CompactTaskManager.PublicationLease pending) throws Exception {
+        try {
+            // Both true (released by this call) and false (already absent or superseded) settle the
+            // exact lease. Only an exception leaves the handle pending for a later retry.
+            taskManager.releasePublicationLease(pending);
+            pendingPublicationLeaseReleases.remove(pending);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw interrupted;
         }
     }
 

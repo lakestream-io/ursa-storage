@@ -18,9 +18,11 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import io.lakestream.api.LogId;
 import io.lakestream.api.Stream;
 import io.lakestream.api.StreamCatalog;
 import io.lakestream.api.StreamIdentifier;
+import io.lakestream.api.StreamLayout;
 import io.lakestream.api.exception.NoSuchStreamException;
 import io.lakestream.api.exception.PartitionLifecycleFencedException;
 import io.lakestream.api.exception.StreamPermanentlyDeletedException;
@@ -81,6 +83,9 @@ public class CompactionWorkerMaterializationFailureTest {
     @Mock
     private Stream stream;
 
+    @Mock
+    private StreamLayout streamLayout;
+
     private CompactionWorker createWorker() {
         return createWorker(true);
     }
@@ -128,7 +133,7 @@ public class CompactionWorkerMaterializationFailureTest {
                 TableMaterializationPolicy.empty());
         when(streamCatalog.registerExternalPartition(any(), anyInt(), anyLong(), any()))
                 .thenReturn(CompletableFuture.completedFuture(null));
-        when(streamCatalog.loadStream(any())).thenReturn(CompletableFuture.completedFuture(stream));
+        stubExternalStream(task);
         when(stream.effectiveMaterialization()).thenReturn(Optional.of(resolved));
 
         doThrow(new MaterializationException(ExceptionCode.INTERNAL_ERROR,
@@ -172,7 +177,7 @@ public class CompactionWorkerMaterializationFailureTest {
         });
         when(streamCatalog.registerExternalPartition(any(), anyInt(), anyLong(), any()))
                 .thenReturn(CompletableFuture.completedFuture(null));
-        when(streamCatalog.loadStream(any())).thenReturn(CompletableFuture.completedFuture(stream));
+        stubExternalStream(task);
         when(stream.effectiveMaterialization()).thenReturn(Optional.of(new ResolvedMaterialization(
                 new TableCatalog("delta-cat", TableCatalogType.DELTA, Map.of(), Map.of()),
                 new TableIdentifier("ns", "table"),
@@ -207,6 +212,47 @@ public class CompactionWorkerMaterializationFailureTest {
     }
 
     @Test
+    public void staleNativeLogIdentityDeletesTerminalTask() throws Exception {
+        CompactionWorker worker = createWorker();
+        String topic = "default/stale-native-partition-0";
+        CompactStreamTask task = new CompactStreamTask();
+        task.setTopic(topic);
+        task.setTaskName("stale-native-task");
+        task.setStatus(CompactStreamTask.INIT);
+        task.setStreamId(41L);
+        task.setStartOffset(0L);
+        task.setEndOffset(5L);
+        PackagedCompactStreamTask packagedTask = new PackagedCompactStreamTask();
+        packagedTask.setTaskName("stale-native-package");
+        packagedTask.setSubTasks(List.of("stale-native-subtask"));
+        when(compactionTaskProvider.getTask()).thenReturn(packagedTask).thenReturn(null);
+        when(compactTaskManager.getCompactStreamTask("stale-native-subtask"))
+                .thenReturn(CompletableFuture.completedFuture(task));
+        when(compactionTaskProvider.getQuarantinedTopic(topic)).thenReturn(null);
+        when(compactTaskManager.tryLockTask(packagedTask.getTaskName())).thenReturn(true);
+        when(streamCatalog.loadStream(any())).thenReturn(CompletableFuture.completedFuture(stream));
+        when(stream.layout()).thenReturn(streamLayout);
+        when(streamLayout.logIds())
+                .thenReturn(CompletableFuture.completedFuture(List.of(LogId.of(42L))));
+        CountDownLatch taskDeleted = new CountDownLatch(1);
+        when(compactTaskManager.deleteCompactTask(task)).thenAnswer(invocation -> {
+            taskDeleted.countDown();
+            return CompletableFuture.completedFuture(null);
+        });
+
+        Thread thread = new Thread(worker);
+        thread.start();
+        assertTrue(taskDeleted.await(10, TimeUnit.SECONDS));
+        thread.interrupt();
+        thread.join(2_000L);
+
+        verify(compactTaskManager).deleteCompactTask(task);
+        verify(compactionTaskProvider, never()).quarantineTopic(any(), anyLong());
+        verify(materializationService, never()).materialize(any());
+        verify(stream).close();
+    }
+
+    @Test
     public void missingStreamDuringLoadKeepsTaskForRetry() throws Exception {
         StreamIdentifier id = new StreamIdentifier("default", "missing-topic");
         runCatalogFailureAndAssertTaskRetained(new NoSuchStreamException(id));
@@ -233,13 +279,17 @@ public class CompactionWorkerMaterializationFailureTest {
         when(compactionTaskProvider.getQuarantinedTopic(topic)).thenReturn(null);
         when(compactTaskManager.tryLockTask(packagedTask.getTaskName())).thenReturn(true);
 
+        StreamIdentifier id = CompactionWorker.toStreamIdentifier(topic);
         if (failRegistration) {
+            when(streamCatalog.loadStream(any()))
+                .thenReturn(CompletableFuture.failedFuture(new NoSuchStreamException(id)));
             when(streamCatalog.registerExternalPartition(any(), anyInt(), anyLong(), any()))
                 .thenReturn(CompletableFuture.failedFuture(catalogFailure));
         } else {
             when(streamCatalog.registerExternalPartition(any(), anyInt(), anyLong(), any()))
                 .thenReturn(CompletableFuture.completedFuture(null));
             when(streamCatalog.loadStream(any()))
+                .thenReturn(CompletableFuture.failedFuture(new NoSuchStreamException(id)))
                 .thenReturn(CompletableFuture.failedFuture(catalogFailure));
         }
 
@@ -282,7 +332,9 @@ public class CompactionWorkerMaterializationFailureTest {
         when(compactTaskManager.tryLockTask(packagedTask.getTaskName())).thenReturn(true);
         when(streamCatalog.registerExternalPartition(any(), anyInt(), anyLong(), any()))
             .thenReturn(CompletableFuture.completedFuture(null));
+        StreamIdentifier id = CompactionWorker.toStreamIdentifier(topic);
         when(streamCatalog.loadStream(any()))
+            .thenReturn(CompletableFuture.failedFuture(new NoSuchStreamException(id)))
             .thenReturn(CompletableFuture.failedFuture(catalogFailure));
         CountDownLatch quarantined = new CountDownLatch(1);
         doAnswer(invocation -> {
@@ -321,7 +373,7 @@ public class CompactionWorkerMaterializationFailureTest {
         when(compactTaskManager.tryLockTask(packagedTask.getTaskName())).thenReturn(true);
         when(streamCatalog.registerExternalPartition(any(), anyInt(), anyLong(), any()))
                 .thenReturn(CompletableFuture.completedFuture(null));
-        when(streamCatalog.loadStream(any())).thenReturn(CompletableFuture.completedFuture(stream));
+        stubExternalStream(task);
         when(stream.effectiveMaterialization()).thenReturn(Optional.of(new ResolvedMaterialization(
                 new TableCatalog("delta-cat", TableCatalogType.DELTA, Map.of(), Map.of()),
                 new TableIdentifier("ns", "table"),
@@ -389,5 +441,15 @@ public class CompactionWorkerMaterializationFailureTest {
         assertFalse(runner.isAlive());
         assertTrue(runner.isInterrupted());
         verify(materializationService, never()).materialize(any());
+    }
+
+    private void stubExternalStream(CompactStreamTask task) {
+        StreamIdentifier id = CompactionWorker.toStreamIdentifier(task.getTopic());
+        when(streamCatalog.loadStream(any()))
+                .thenReturn(CompletableFuture.failedFuture(new NoSuchStreamException(id)))
+                .thenReturn(CompletableFuture.completedFuture(stream));
+        when(stream.layout()).thenReturn(streamLayout);
+        when(streamLayout.logIds())
+                .thenReturn(CompletableFuture.completedFuture(List.of(LogId.of(task.getStreamId()))));
     }
 }

@@ -111,6 +111,12 @@ class IndexedStreamCatalogTest {
         lenient().when(oxiaClient.get(anyString()))
             .thenReturn(CompletableFuture.completedFuture(null));
         catalogPaths = new DefaultCatalogPaths();
+        String namespacePath = catalogPaths.namespacePath("public/default");
+        lenient().when(oxiaClient.put(
+                eq(namespacePath), any(byte[].class),
+                eq(Set.of(PutOption.IfRecordDoesNotExist))))
+            .thenReturn(CompletableFuture.completedFuture(
+                new PutResult(namespacePath, DUMMY_VERSION)));
         defaultStorage = new FencedStorageHarness(
             key -> CompletableFuture.completedFuture(nextStreamId++));
         catalog = fencedCatalog(defaultStorage);
@@ -2159,7 +2165,7 @@ class IndexedStreamCatalogTest {
 
         catalog.registerExternalStream(streamId, 3, Map.of("owner", "replacement")).get();
 
-        verify(oxiaClient, never()).put(any(), any(byte[].class), any());
+        verify(oxiaClient, never()).put(eq(configPath), any(byte[].class), any());
     }
 
     @Test

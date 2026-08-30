@@ -4,35 +4,32 @@
  */
 package io.lakestream.ursa.lakehouse.compact;
 
-import io.confluent.kafka.schemaregistry.client.SchemaMetadata;
-import io.lakestream.api.EntryHeader;
+import io.lakestream.api.LifecycleState;
+import io.lakestream.api.Log;
+import io.lakestream.api.LogEntryHeader;
+import io.lakestream.api.LogId;
+import io.lakestream.api.LogOffset;
+import io.lakestream.api.Namespace;
+import io.lakestream.api.Stream;
+import io.lakestream.api.StreamCatalog;
+import io.lakestream.api.StreamIdentifier;
 import io.lakestream.ursa.compaction.CompactTaskManager;
+import io.lakestream.ursa.compaction.CompactionManager;
 import io.lakestream.ursa.compaction.DynamicConfigs;
+import io.lakestream.ursa.compaction.PublicationFencedException;
 import io.lakestream.ursa.compaction.metrics.CompactionMetrics;
-import io.lakestream.ursa.compaction.task.CompactStreamTask;
-import io.lakestream.ursa.compaction.task.CompactedOffset;
-import io.lakestream.ursa.compaction.task.OffsetRange;
 import io.lakestream.ursa.compaction.task.PreparedCompactStreamTask;
-import io.lakestream.ursa.lakehouse.exception.FetchSchemaFailedException;
-import io.lakestream.ursa.lakehouse.exception.SchemaNotFoundException;
-import io.lakestream.ursa.lakehouse.exception.TopicNotFoundException;
-import io.lakestream.ursa.lakehouse.schema.SchemaRegistry;
-import io.lakestream.ursa.lakehouse.utils.TopicName;
-import io.lakestream.ursa.storage.StorageApi;
+import io.lakestream.ursa.lakehouse.utils.TopicNames;
 import io.lakestream.ursa.storage.impl.StorageConfig;
 import io.lakestream.ursa.storage.impl.compaction.StartStopRunner;
-import io.lakestream.ursa.storage.impl.compaction.TopicManager;
-import io.lakestream.ursa.storage.impl.compaction.TopicMetadata;
-import io.lakestream.ursa.storage.impl.compaction.TopicProvider;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
-import io.oxia.client.api.exceptions.KeyAlreadyExistsException;
-import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
@@ -41,486 +38,611 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import lombok.Getter;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.lang3.tuple.Pair;
 
+/**
+ * Publishes compaction tasks by discovering streams through {@link StreamCatalog}.
+ *
+ * <p>The catalog is the source of truth for both native streams and externally registered streams.
+ * A long-lived fenced {@link CompactionManager.PublicationSession} is held for every physical log
+ * incarnation. Stream deletion, partition removal, or replacement by a different physical log ID
+ * fences the old session before it can be removed or replaced.
+ */
 @Slf4j
-public class PublishCompactTaskRunner implements Runnable, StartStopRunner {
+public final class PublishCompactTaskRunner implements Runnable, StartStopRunner {
 
-    private Future<?> scanTopicFuture;
-    private volatile boolean isCancel = false;
-    private final TopicManager topicManager;
-    private final TopicProvider topicProvider;
-    private final ExecutorService scanTopicExecutor;
-    @Getter
-    private final ScheduledExecutorService publishTaskExecutor;
+    static final String ENTRY_FORMAT_PROPERTY = "entryFormat";
+    private static final int MAX_FAIR_PUBLICATION_QUANTUM = 100;
+
+    private final StreamCatalog streamCatalog;
+    private final CompactionManager compactionManager;
+    private final ExecutorService scanExecutor;
+    private final ScheduledExecutorService publishExecutor;
+    private final long scanIntervalMillis;
     private final int checkMessageStepLength;
-    private final StorageApi storageApi;
-    private final CompactTaskManager compactTaskManager;
+    private final int maxTasksPerPublisherPerScan;
     private final long compactedFileSizeLimit;
-    private final long waitForAvailableTopicIntervalInMs;
-    private final SchemaRegistry schemaRegistry;
-    private final Set<String> schemaCacheTopics = ConcurrentHashMap.newKeySet();
-    @Getter
-    private final Map<String, Long> fetchSchemaFailedQuarantineTime = new ConcurrentHashMap<>();
-    @Getter
-    private final Map<String, Long> notEnoughDataQuarantineTime = new ConcurrentHashMap<>();
-    private final Map<String, AtomicInteger> schemaNotFoundCont = new ConcurrentHashMap<>();
-    private final Map<Long, Long> lastTailUnCompactTimestampMap = new ConcurrentHashMap<>();
-    private final long retryableTopicQuarantineInMs;
-    private final long nonRetryableTopicQuarantineInMs;
-    private final long tailCompactDataVisibilityIntervalInMs;
-    private final CompactionMetrics compactionMetrics;
+    private final long tailVisibilityMillis;
     private final Properties baseProperties;
-    @Getter
-    private final Set<String> runningTopics = ConcurrentHashMap.newKeySet();
-    private final Map<String, Future<?>> publishTaskFutures = new ConcurrentHashMap<>();
-    @Getter
-    private final Map<String, ScheduledFuture<?>> delayPublishTaskFutures = new ConcurrentHashMap<>();
-    private final List<String> removedTmpTopics = new ArrayList<>();
-    private long lastPrintTime = 0;
+    private final Set<String> excludedNamespaces;
+    private final Set<String> excludedStreams;
+    private final CompactionMetrics compactionMetrics;
+    private final Map<String, PartitionPublisher> publishers = new ConcurrentHashMap<>();
+    private final Map<String, Long> tailWaitStartedAtMillis = new ConcurrentHashMap<>();
+    private final AtomicBoolean pendingLeaseReleaseRetryScheduled = new AtomicBoolean();
 
-    public PublishCompactTaskRunner(StorageApi storageApi, CompactTaskManager compactTaskManager,
-                                    TopicManager topicManager,
-                                    ExecutorService scanTopicExecutor,
-                                    ScheduledExecutorService publishTaskExecutor,
-                                    TopicProvider topicProvider, StorageConfig storageConfig,
-                                    SchemaRegistry schemaRegistry,
+    private volatile boolean stopped;
+    private volatile boolean backlogRemaining;
+    private volatile boolean publicationLeaseUnavailable;
+    private volatile Future<?> scanFuture;
+    private volatile ScheduledFuture<?> nextScanFuture;
+
+    public PublishCompactTaskRunner(StreamCatalog streamCatalog,
+                                    CompactTaskManager compactTaskManager,
+                                    ExecutorService scanExecutor,
+                                    ScheduledExecutorService publishExecutor,
+                                    StorageConfig storageConfig,
                                     CompactionMetrics compactionMetrics) {
-        this.storageApi = storageApi;
-        this.compactTaskManager = compactTaskManager;
-        this.topicManager = topicManager;
-        this.topicProvider = topicProvider;
-        this.retryableTopicQuarantineInMs =
-                TimeUnit.SECONDS.toMillis(storageConfig.getRetryableQuarantineInSeconds());
-        this.nonRetryableTopicQuarantineInMs =
-                TimeUnit.SECONDS.toMillis(storageConfig.getNonRetryableQuarantineInSeconds());
-        this.scanTopicExecutor = scanTopicExecutor;
-        this.publishTaskExecutor = publishTaskExecutor;
-        this.checkMessageStepLength = storageConfig.getCheckCompactMessageStepLength();
+        this(streamCatalog,
+                new CompactionManager(compactTaskManager, compactionMetrics),
+                scanExecutor,
+                publishExecutor,
+                storageConfig,
+                compactionMetrics);
+    }
+
+    PublishCompactTaskRunner(StreamCatalog streamCatalog,
+                             CompactionManager compactionManager,
+                             ExecutorService scanExecutor,
+                             ScheduledExecutorService publishExecutor,
+                             StorageConfig storageConfig,
+                             CompactionMetrics compactionMetrics) {
+        this.streamCatalog = Objects.requireNonNull(streamCatalog, "streamCatalog");
+        this.compactionManager = Objects.requireNonNull(compactionManager, "compactionManager");
+        this.scanExecutor = Objects.requireNonNull(scanExecutor, "scanExecutor");
+        this.publishExecutor = Objects.requireNonNull(publishExecutor, "publishExecutor");
+        this.baseProperties = Objects.requireNonNull(storageConfig, "storageConfig").getProperties();
+        this.compactionMetrics = Objects.requireNonNull(compactionMetrics, "compactionMetrics");
+        this.scanIntervalMillis = TimeUnit.SECONDS.toMillis(
+                Math.max(1L, storageConfig.getRefreshLocalTaskIntervalInSeconds()));
+        this.checkMessageStepLength = Math.max(1, storageConfig.getCheckCompactMessageStepLength());
+        this.maxTasksPerPublisherPerScan = Math.max(1,
+                Math.min(MAX_FAIR_PUBLICATION_QUANTUM, storageConfig.getPublishThreadPendingTasks()));
         this.compactedFileSizeLimit = storageConfig.getCompactedFileSizeLimit();
-        this.waitForAvailableTopicIntervalInMs =
-                TimeUnit.SECONDS.toMillis(storageConfig.getRefreshLocalTaskIntervalInSeconds());
-        this.tailCompactDataVisibilityIntervalInMs =
-                TimeUnit.SECONDS.toMillis(storageConfig.getTailCompactDataVisibilityIntervalInSeconds());
-        this.schemaRegistry = schemaRegistry;
-        this.compactionMetrics = compactionMetrics;
-        this.baseProperties = storageConfig.getProperties();
+        this.tailVisibilityMillis = TimeUnit.SECONDS.toMillis(
+                Math.max(0L, storageConfig.getTailCompactDataVisibilityIntervalInSeconds()));
+        this.excludedNamespaces = Set.copyOf(storageConfig.getBlackNamespaceOfCompact());
+        this.excludedStreams = storageConfig.getBlackTopicOfCompact().stream()
+                .map(TopicNames::partitionedTopicName)
+                .collect(Collectors.toUnmodifiableSet());
     }
 
-    public enum SchemaStatus {
-        SUPPORTED,
-        NOT_SUPPORTED,
-        FETCH_FAILED,
-        NOT_FOUND,
-        INVALID
-    }
-
-    public void publishStreamCompactTask(String topic, TopicMetadata topicMetadata)
-            throws IOException, ExecutionException, InterruptedException {
-        long streamId = topicMetadata.streamId();
-        SchemaStatus schemaStatus = checkSchemaExist(topic, schemaCacheTopics, schemaRegistry);
-        if (schemaStatus != SchemaStatus.SUPPORTED) {
-            if (retryableTopicQuarantineInMs <= 0) {
+    @Override
+    public void start() {
+        synchronized (this) {
+            if (stopped || (scanFuture != null && !scanFuture.isDone())) {
                 return;
             }
-
-            long quarantineUntil = System.currentTimeMillis();
-            switch (schemaStatus) {
-                case FETCH_FAILED:
-                    quarantineUntil += retryableTopicQuarantineInMs;
-                    log.info("Quarantine topic {} for {}ms until {} due to fetch schema failed",
-                        topic, retryableTopicQuarantineInMs, quarantineUntil);
-                    fetchSchemaFailedQuarantineTime.put(TopicName.get(topic).getPartitionedTopicName(),
-                        quarantineUntil);
-                    return;
-                case INVALID:
-                case NOT_SUPPORTED:
-                    quarantineUntil += nonRetryableTopicQuarantineInMs;
-                    log.info("Quarantine topic {} for {}ms until {} due to not supported schema",
-                        topic, nonRetryableTopicQuarantineInMs, quarantineUntil);
-                    fetchSchemaFailedQuarantineTime.put(TopicName.get(topic).getPartitionedTopicName(),
-                        quarantineUntil);
-                    return;
-                case NOT_FOUND:
-                    // schema not found. It should be three cases:
-                    // - The topic is newly created and doesn't write any data
-                    // - The schema registry fetch schema failed
-                    // - The topic has primitive schema, which doesn't register to the schema registry
-                    // Retry to fetch schema when the topic has data to compact
-                    break;
-                default:
-                    return;
-            }
-        }
-
-        PreparedCompactStreamTask preparedCompactStreamTask =
-            compactTaskManager.getPreparedStreamTask(streamId);
-        if (preparedCompactStreamTask != null) {
-            int status = preparedCompactStreamTask.getStatus();
-            long recoveredPublishedOffset = OffsetRange.lastIncludedOffset(
-                    preparedCompactStreamTask.getStartOffset(), preparedCompactStreamTask.getEndOffset());
-            if (status == PreparedCompactStreamTask.INIT) {
-                CompactStreamTask compactStreamTask = preparedCompactStreamTask.toCompactStreamTask();
-                try {
-                    compactTaskManager.publishCompactTask(compactStreamTask);
-                } catch (ExecutionException e) {
-                    if (e.getCause() instanceof KeyAlreadyExistsException) {
-                        log.info("The task {} already pushed, ignore it.", compactStreamTask);
-                    } else {
-                        throw e;
-                    }
-                }
-                compactTaskManager.publishPackagedTaskName(preparedCompactStreamTask.getTaskName());
-                preparedCompactStreamTask.setStatus(PreparedCompactStreamTask.PUSHED_TASK);
-                compactTaskManager.updatePreparedCompactTask(preparedCompactStreamTask, Optional.empty());
-                compactTaskManager.updatePublishedOffset(streamId, recoveredPublishedOffset,
-                        preparedCompactStreamTask.getCumulativeSize());
-                recordPublishedOffsetMetrics(topic, streamId, recoveredPublishedOffset);
-                compactTaskManager.deletePreparedCompactTask(streamId);
-            }
-            if (status == PreparedCompactStreamTask.PUSHED_TASK) {
-                compactTaskManager.updatePublishedOffset(streamId, recoveredPublishedOffset,
-                        preparedCompactStreamTask.getCumulativeSize());
-                recordPublishedOffsetMetrics(topic, streamId, recoveredPublishedOffset);
-                compactTaskManager.deletePreparedCompactTask(streamId);
-            }
-        }
-        CompactedOffset compactedOffset = compactTaskManager.getPublishedOffset(streamId);
-        if (compactedOffset == null) {
-            compactedOffset = new CompactedOffset(streamId, -1, 0);
-        }
-        long startOffset = compactedOffset.getOffset() + 1;
-        Pair<Long, Long> pair = calculateTheEndOffset(streamId, startOffset, compactedOffset.getCumulativeSize());
-        if (pair == null || pair.equals(Pair.of(0L, 0L))) {
-            // pair == null means the topic has new messages, but the number of new messages is not enough for the batch
-            // Pair.of(0L, 0L) means the topic doesn't have new messages
-            if (retryableTopicQuarantineInMs > 0) {
-                long quarantineMs = Math.min(retryableTopicQuarantineInMs, tailCompactDataVisibilityIntervalInMs);
-                long quarantineUntil = System.currentTimeMillis() + quarantineMs;
-                // Only log the topic that has new messages but not enough for the batch
-                if (pair == null) {
-                    log.info("Quarantine topic {} for {}ms until {} due to not enough data",
-                        topic, quarantineMs, quarantineUntil);
-                }
-                notEnoughDataQuarantineTime.put(TopicName.get(topic).toString(), quarantineUntil);
-            }
-            return;
-        }
-        // We have data to compaction, check if the schema is NOT_FOUND
-        if (schemaStatus == SchemaStatus.NOT_FOUND) {
-            String partitionedTopicName = TopicName.get(topic).getPartitionedTopicName();
-            schemaCacheTopics.add(partitionedTopicName);
-        }
-
-        Long endOffset = pair.getLeft();
-        Long endCumulativeSize = pair.getRight();
-        long publishedOffset = OffsetRange.lastIncludedOffset(startOffset, endOffset);
-        long totalSize = endCumulativeSize - compactedOffset.getCumulativeSize();
-        String taskName = generateTaskName();
-
-        // Resolve deployment defaults with topic-level overrides.
-        // This ensures cluster/namespace-level defaults are applied with topic-level overrides.
-        Map<String, String> resolvedProperties = resolveDynamicConfigProperties(topicMetadata.properties());
-
-        PreparedCompactStreamTask initTask =
-                new PreparedCompactStreamTask(streamId, startOffset, endOffset, totalSize, endCumulativeSize,
-                        PreparedCompactStreamTask.INIT, taskName, topic, resolvedProperties);
-
-        EntryHeader lacHeader = storageApi.getLastEntry(streamId).get().header();
-        long latestOffset = OffsetRange.lastIncludedOffset(lacHeader.offset(),
-                Math.addExact(lacHeader.offset(), lacHeader.numberOfMessages()));
-        compactionMetrics.getLatestMessageOffset().set(latestOffset,
-                Attributes.of(AttributeKey.stringKey("topic"), topic));
-
-        compactTaskManager.publishPreparedCompactTask(initTask, Optional.empty());
-        compactTaskManager.publishCompactTask(initTask.toCompactStreamTask());
-        compactTaskManager.publishPackagedTaskName(initTask.getTaskName());
-        initTask.setStatus(PreparedCompactStreamTask.PUSHED_TASK);
-        compactTaskManager.updatePreparedCompactTask(initTask, Optional.empty());
-        compactTaskManager.updatePublishedOffset(streamId, publishedOffset, endCumulativeSize);
-        recordPublishedOffsetMetricsWithLatest(topic, latestOffset, publishedOffset);
-        compactTaskManager.deletePreparedCompactTask(streamId);
-    }
-
-    private void recordPublishedOffsetMetrics(String topic, long streamId, long publishedOffset)
-            throws ExecutionException, InterruptedException {
-        EntryHeader lastEntryHeader = storageApi.getLastEntry(streamId).get().header();
-        long latestOffset = OffsetRange.lastIncludedOffset(lastEntryHeader.offset(),
-                Math.addExact(lastEntryHeader.offset(), lastEntryHeader.numberOfMessages()));
-        compactionMetrics.getLatestMessageOffset().set(latestOffset,
-                Attributes.of(AttributeKey.stringKey("topic"), topic));
-        recordPublishedOffsetMetricsWithLatest(topic, latestOffset, publishedOffset);
-    }
-
-    private void recordPublishedOffsetMetricsWithLatest(String topic, long latestOffset, long publishedOffset) {
-        Attributes attributes = Attributes.of(AttributeKey.stringKey("topic"), topic);
-        compactionMetrics.getLatestPublishedOffset().set(publishedOffset, attributes);
-        compactionMetrics.getCompactionLag().set(Math.subtractExact(latestOffset, publishedOffset), attributes);
-    }
-
-    public static SchemaStatus checkSchemaExist(String topic,
-                                           Set<String> schemaCacheTopics,
-                                           SchemaRegistry schemaRegistry) {
-        String partitionedTopicName = TopicName.get(topic).getPartitionedTopicName();
-        if (schemaCacheTopics.contains(partitionedTopicName)) {
-            return SchemaStatus.SUPPORTED;
-        }
-        try {
-            SchemaMetadata schemaMetadata = schemaRegistry.fetchLatest(topic);
-            switch (schemaMetadata.getSchemaType()) {
-                case "AVRO":
-                case "JSON":
-                case "PROTOBUF":
-                    break;
-                default:
-                    return SchemaStatus.NOT_SUPPORTED;
-            }
-            schemaCacheTopics.add(partitionedTopicName);
-            return SchemaStatus.SUPPORTED;
-        } catch (FetchSchemaFailedException e) {
-            return SchemaStatus.FETCH_FAILED;
-        } catch (SchemaNotFoundException ex) {
-            return SchemaStatus.NOT_FOUND;
-        } catch (Exception ee) {
-            log.warn("Unexpected error when fetch schema for topic {} ", topic, ee);
-            return SchemaStatus.INVALID;
-        }
-    }
-
-    private Map<String, String> resolveDynamicConfigProperties(Map<String, String> topicProperties) {
-        String clusterName = baseProperties.getProperty("clusterName");
-        DynamicConfigs dynamicConfigs = (clusterName == null || clusterName.isBlank())
-            ? DynamicConfigs.of(baseProperties)
-            : new DynamicConfigs(clusterName, baseProperties);
-        Map<String, String> taskProperties = new HashMap<>(
-                topicProperties != null ? topicProperties : Collections.emptyMap());
-        dynamicConfigs.overrideWith(taskProperties);
-        taskProperties.putAll(dynamicConfigs.toTaskProperties());
-        return taskProperties;
-    }
-
-    private String generateTaskName() {
-        return UUID.randomUUID().toString();
-    }
-
-    private Pair<Long, Long> calculateTheEndOffset(long streamId, long startOffset, long startCumulativeSize)
-            throws ExecutionException, InterruptedException {
-        long baseOffset = startOffset + checkMessageStepLength - 1;
-        long endOffset;
-        long endCumulativeSize;
-        long diffSize;
-        long latestWriteTimestamp = -1;
-        while (true) {
-            EntryHeader entryHeader = storageApi.readEntryHeader(streamId, baseOffset).get();
-            if (EntryHeader.NOT_FOUND == entryHeader) {
-                entryHeader = storageApi.getLastEntry(streamId).get().header();
-                diffSize = entryHeader.cumulativeSize() - startCumulativeSize;
-                endOffset = entryHeader.offset() + entryHeader.numberOfMessages();
-                endCumulativeSize = entryHeader.cumulativeSize();
-                if (latestWriteTimestamp == -1) {
-                    EntryHeader firstEntryHeader = storageApi.readEntryHeader(streamId, startOffset).get();
-                    if (EntryHeader.NOT_FOUND != firstEntryHeader) {
-                        latestWriteTimestamp = firstEntryHeader.writtenTimestamp();
-                    } else {
-                        latestWriteTimestamp = entryHeader.writtenTimestamp();
-                    }
-                }
-                break;
-            }
-            diffSize = entryHeader.cumulativeSize() - startCumulativeSize;
-            endOffset = entryHeader.offset() + entryHeader.numberOfMessages();
-            endCumulativeSize = entryHeader.cumulativeSize();
-            // record first uncompacted message's write timestamp
-            if (latestWriteTimestamp == -1) {
-                latestWriteTimestamp = entryHeader.writtenTimestamp();
-            }
-            if (compactedFileSizeLimit > 0 && diffSize >= compactedFileSizeLimit) {
-                break;
-            }
-            baseOffset += checkMessageStepLength;
-        }
-        if (compactedFileSizeLimit > 0 && diffSize >= compactedFileSizeLimit) {
-            compactionMetrics.getPublishedTaskBytes().set(diffSize);
-            return Pair.of(endOffset, endCumulativeSize);
-        } else {
-            if (diffSize > 0) {
-                if (latestWriteTimestamp != -1
-                        && System.currentTimeMillis() - latestWriteTimestamp >= tailCompactDataVisibilityIntervalInMs) {
-                    compactionMetrics.getPublishedTaskBytes().set(diffSize);
-                    return Pair.of(endOffset, endCumulativeSize);
-                } else if (latestWriteTimestamp == -1) { // use to handle `latestWriteTimestamp == -1` case
-                    Long lastTailUnCompactTimestamp = lastTailUnCompactTimestampMap.get(streamId);
-                    if (lastTailUnCompactTimestamp == null) {
-                        lastTailUnCompactTimestampMap.put(streamId, System.currentTimeMillis());
-                        return null;
-                    } else if (System.currentTimeMillis() - lastTailUnCompactTimestamp
-                            >= tailCompactDataVisibilityIntervalInMs) {
-                        lastTailUnCompactTimestampMap.remove(streamId);
-                        return Pair.of(endOffset, endCumulativeSize);
-                    } else {
-                        return null;
-                    }
-                } else {
-                    return null;
-                }
-            } else {
-                // Represent no new messages in the topic
-                return Pair.of(0L, 0L);
-            }
+            scanFuture = scanExecutor.submit(this);
         }
     }
 
     @Override
     public void run() {
-        if (isCancel) {
+        try {
+            do {
+                scanCatalogOnce();
+            } while (!stopped && backlogRemaining);
+        } catch (Throwable error) {
+            if (!stopped) {
+                log.warn("Failed to discover streams and publish compaction tasks", error);
+                compactionMetrics.getPublishTaskFailedCount().increment();
+            }
+        } finally {
+            synchronized (this) {
+                if (!stopped) {
+                    long nextDelayMillis = publicationLeaseUnavailable
+                            ? Math.min(1000L, scanIntervalMillis) : scanIntervalMillis;
+                    nextScanFuture = publishExecutor.schedule(
+                            this::start, nextDelayMillis, TimeUnit.MILLISECONDS);
+                }
+            }
+        }
+    }
+
+    /** Performs one complete catalog scan. Visible for deterministic unit tests. */
+    void scanCatalogOnce() throws Exception {
+        backlogRemaining = false;
+        publicationLeaseUnavailable = false;
+        retryPendingLeaseReleases();
+        Map<String, PartitionIdentity> discovered = discoverPartitions();
+        if (stopped) {
             return;
         }
-        try {
-            List<String> topics = topicProvider.getAllTopics();
-            removedTmpTopics.clear();
-            for (String runningTopic : runningTopics) {
-                if (!topics.contains(runningTopic)) {
-                    removedTmpTopics.add(runningTopic);
+
+        // Fence removed or replaced physical logs before attempting to acquire their replacements.
+        for (Map.Entry<String, PartitionPublisher> entry : List.copyOf(publishers.entrySet())) {
+            PartitionIdentity current = discovered.get(entry.getKey());
+            if (current == null || current.logId().id() != entry.getValue().streamId()) {
+                if (publishers.remove(entry.getKey(), entry.getValue())) {
+                    tailWaitStartedAtMillis.remove(entry.getKey());
+                    closePublisher(entry.getValue());
                 }
             }
-            removedTmpTopics.forEach(ele -> {
-                runningTopics.remove(ele);
-                Future<?> publishTaskFuture = publishTaskFutures.remove(ele);
-                if (publishTaskFuture != null) {
-                    publishTaskFuture.cancel(false);
-                }
-                ScheduledFuture<?> delayPublishTaskFuture = delayPublishTaskFutures.remove(ele);
-                if (delayPublishTaskFuture != null) {
-                    delayPublishTaskFuture.cancel(false);
-                }
+        }
 
-            });
-            if (topics.isEmpty()) {
-                if (log.isDebugEnabled()) {
-                    log.debug("No available topic, wait for {}ms. ", waitForAvailableTopicIntervalInMs);
-                }
-                Thread.sleep(waitForAvailableTopicIntervalInMs);
+        List<Future<?>> publicationFutures = new ArrayList<>();
+        for (PartitionIdentity identity : discovered.values()) {
+            if (stopped) {
                 return;
             }
-            for (String pickedTopic : topics) {
-                if (runningTopics.contains(pickedTopic)) {
+            try {
+                PartitionPublisher publisher = publishers.get(identity.taskTopic());
+                if (publisher == null) {
+                    publisher = openPublisher(identity);
+                    if (publisher == null) {
+                        continue;
+                    }
+                }
+                publisher.identity(identity);
+                PartitionPublisher selected = publisher;
+                publicationFutures.add(publishExecutor.submit(() -> publishAvailable(selected)));
+            } catch (RejectedExecutionException rejected) {
+                if (!stopped) {
+                    recordPartitionFailure(identity.taskTopic(), "schedule task publication", rejected);
+                }
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw interrupted;
+            } catch (Exception error) {
+                recordPartitionFailure(identity.taskTopic(), "open task publisher", error);
+            }
+        }
+        for (Future<?> publicationFuture : publicationFutures) {
+            try {
+                publicationFuture.get();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw interrupted;
+            } catch (ExecutionException error) {
+                recordPartitionFailure("catalog scan", "complete task publication", error.getCause());
+            }
+        }
+        compactionMetrics.getOngoingCompactionTopicCount().set(discovered.size());
+    }
+
+    private Map<String, PartitionIdentity> discoverPartitions() throws Exception {
+        Map<String, PartitionIdentity> discovered = new LinkedHashMap<>();
+        for (Namespace namespace : streamCatalog.listNamespaces().get()) {
+            if (excludedNamespaces.contains(namespace.name())) {
+                continue;
+            }
+            List<StreamIdentifier> identifiers;
+            try {
+                identifiers = streamCatalog.listStreams(namespace.name()).get();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw interrupted;
+            } catch (Exception error) {
+                recordPartitionFailure(namespace.name(), "list namespace streams", error);
+                retainExistingNamespace(namespace.name(), discovered);
+                continue;
+            }
+            for (StreamIdentifier identifier : identifiers) {
+                if (excludedStreams.contains(identifier.fullName())) {
                     continue;
                 }
-                runningTopics.add(pickedTopic);
-                publishTaskFutures.put(pickedTopic, submitPublishTaskNow(pickedTopic));
+                try (Stream stream = streamCatalog.loadStream(identifier).get()) {
+                    if (stream.state() == LifecycleState.ACTIVE || stream.state() == LifecycleState.SEALED) {
+                        List<LogId> logIds = stream.layout().logIds().get();
+                        for (int partition = 0; partition < logIds.size(); partition++) {
+                            LogId logId = logIds.get(partition);
+                            if (logId.id() < 0) {
+                                continue;
+                            }
+                            String taskTopic = taskTopic(identifier, partition);
+                            PartitionIdentity previous = discovered.putIfAbsent(taskTopic,
+                                    new PartitionIdentity(identifier, partition, logId, taskTopic));
+                            if (previous != null) {
+                                recordPartitionFailure(taskTopic, "discover physical log",
+                                        new IllegalStateException(
+                                                "Catalog returned duplicate compaction identity " + taskTopic));
+                            }
+                        }
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw interrupted;
+                } catch (Exception error) {
+                    recordPartitionFailure(identifier.fullName(), "discover stream partitions", error);
+                    retainExistingStream(identifier, discovered);
+                }
             }
-            Thread.sleep(1000);
-        } catch (Throwable e) {
-            log.warn("Error during the publish stream compact task.", e);
-            compactionMetrics.getPublishTaskFailedCount().increment();
-            // TODO we need shutdown the runner when encontered exception and trigger another round leader election.
-        } finally {
-            start();
         }
+        return discovered;
     }
 
-    public ScheduledFuture<?> submitPublishTaskDelay(String pickedTopic, long delayMillis) {
-        return publishTaskExecutor.schedule(() -> {
-            publishTaskFutures.put(pickedTopic, submitPublishTaskNow(pickedTopic));
-        }, delayMillis, TimeUnit.MILLISECONDS);
-    }
-
-    public Future<?> submitPublishTaskNow(String pickedTopic) {
-        return publishTaskExecutor.submit(() -> {
-            if (isCancel || !runningTopics.contains(pickedTopic)) {
-                return null;
-            }
-            delayPublishTaskFutures.remove(pickedTopic);
-            long current = System.currentTimeMillis();
-            if (retryableTopicQuarantineInMs > 0 && !fetchSchemaFailedQuarantineTime.isEmpty()) {
-                String fetchSchemaFailedTopic =
-                        TopicName.get(pickedTopic).getPartitionedTopicName();
-                Long quarantineTime = fetchSchemaFailedQuarantineTime.get(fetchSchemaFailedTopic);
-                if (quarantineTime != null) {
-                    long differTime = current - quarantineTime;
-                    if (differTime >= 0) {
-                        fetchSchemaFailedQuarantineTime.remove(pickedTopic);
-                    } else {
-                        //delay
-                        ScheduledFuture<?> delayPublishTask = submitPublishTaskDelay(pickedTopic, -differTime);
-                        delayPublishTaskFutures.put(pickedTopic, delayPublishTask);
-                        return null;
-                    }
-                }
-            }
-
-            if (tailCompactDataVisibilityIntervalInMs > 0 && !notEnoughDataQuarantineTime.isEmpty()) {
-                Long quarantineTime = notEnoughDataQuarantineTime.get(pickedTopic);
-                if (quarantineTime != null) {
-                    long differTime = current - quarantineTime;
-                    if (differTime >= 0) {
-                        notEnoughDataQuarantineTime.remove(pickedTopic);
-                    } else {
-                        //delay
-                        ScheduledFuture<?> delayPublishTask = submitPublishTaskDelay(pickedTopic, -differTime);
-                        delayPublishTaskFutures.put(pickedTopic, delayPublishTask);
-                        return null;
-                    }
-                }
-            }
-            boolean delayTask = false;
-            try {
-                TopicMetadata topicMetadata = topicManager.getTopicMetadata(pickedTopic).get();
-                publishStreamCompactTask(TopicName.get(pickedTopic).toString(), topicMetadata);
-            } catch (Throwable e) {
-                if (e instanceof ExecutionException && e.getCause() instanceof TopicNotFoundException) {
-                    delayTask = true;
-                    log.warn("Can't get topic metadata for topic {}", pickedTopic);
-                }
-
-                if (System.currentTimeMillis() - lastPrintTime > 5000) {
-                    log.warn("Error during the publish stream compact task for {}.", pickedTopic, e);
-                    lastPrintTime = System.currentTimeMillis();
-                }
-            } finally {
-                if (!isCancel && runningTopics.contains(pickedTopic)) {
-                    if (delayTask) {
-                        //delay
-                        ScheduledFuture<?> delayPublishTask = submitPublishTaskDelay(pickedTopic,
-                                nonRetryableTopicQuarantineInMs);
-                        delayPublishTaskFutures.put(pickedTopic, delayPublishTask);
-                    } else {
-                        publishTaskFutures.put(pickedTopic, submitPublishTaskNow(pickedTopic));
-                    }
-                }
-            }
+    private PartitionPublisher openPublisher(PartitionIdentity identity) throws Exception {
+        Optional<CompactionManager.PublicationSession> session;
+        try {
+            session = compactionManager.tryOpenPublicationSession(
+                    identity.taskTopic(), identity.logId().id());
+        } catch (Exception | Error error) {
+            schedulePendingLeaseReleaseRetry();
+            throw error;
+        }
+        if (session.isEmpty()) {
+            publicationLeaseUnavailable = true;
             return null;
-        });
+        }
+
+        PartitionPublisher candidate = new PartitionPublisher(identity, session.orElseThrow());
+        PartitionPublisher selected = null;
+        synchronized (this) {
+            if (!stopped) {
+                PartitionPublisher raced = publishers.putIfAbsent(identity.taskTopic(), candidate);
+                selected = raced == null ? candidate : raced;
+            }
+        }
+        if (selected != candidate) {
+            // stop() and session installation share the same monitor. If leadership was lost while
+            // the remote lease was being acquired, this closes the late session instead of letting
+            // it escape the stop-time fencing snapshot.
+            closePublisher(candidate);
+        }
+        return selected;
     }
 
-    @Override
-    public void start() {
-        if (!isCancel && scanTopicExecutor != null) {
-            scanTopicFuture = scanTopicExecutor.submit(this);
+    private void publishAvailable(PartitionPublisher publisher) {
+        try {
+            for (int published = 0; published < maxTasksPerPublisherPerScan; published++) {
+                if (stopped || publishers.get(publisher.identity().taskTopic()) != publisher
+                        || publishNext(publisher) != CompactionManager.PublicationResult.PUBLISHED) {
+                    return;
+                }
+            }
+            backlogRemaining = true;
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        } catch (Exception error) {
+            recordPartitionFailure(publisher.identity().taskTopic(), "publish compaction task", error);
         }
+    }
+
+    private CompactionManager.PublicationResult publishNext(PartitionPublisher publisher) throws Exception {
+        try {
+            TaskSnapshot[] task = new TaskSnapshot[1];
+            CompactionManager.PublicationResult result = publisher.session().publishNext(lastPublishedOffset -> {
+                TaskSnapshot snapshot = createTask(publisher.identity(), lastPublishedOffset);
+                task[0] = snapshot;
+                return snapshot == null ? Optional.empty() : Optional.of(snapshot.task());
+            });
+            if (result == CompactionManager.PublicationResult.PUBLISHED && task[0] != null) {
+                long latestOffset = task[0].latestOffset();
+                Attributes attributes = Attributes.of(
+                        AttributeKey.stringKey("topic"), publisher.identity().taskTopic());
+                compactionMetrics.getLatestMessageOffset().set(latestOffset, attributes);
+                compactionMetrics.getCompactionLag().set(
+                        latestOffset - task[0].publishedOffset(), attributes);
+                compactionMetrics.getPublishedTaskBytes().set(task[0].task().getTotalSize());
+            }
+            return result;
+        } catch (PublicationFencedException fenced) {
+            if (publishers.remove(publisher.identity().taskTopic(), publisher)) {
+                tailWaitStartedAtMillis.remove(publisher.identity().taskTopic());
+                closePublisher(publisher);
+            }
+            log.info("Compaction task publisher for {} was fenced", publisher.identity().taskTopic());
+            return CompactionManager.PublicationResult.NO_TASK;
+        }
+    }
+
+    private TaskSnapshot createTask(PartitionIdentity expected, long lastPublishedOffset) throws Exception {
+        try (Stream stream = streamCatalog.loadStream(expected.stream()).get()) {
+            List<LogId> logIds = stream.layout().logIds().get();
+            if (expected.partition() >= logIds.size()
+                    || logIds.get(expected.partition()).id() != expected.logId().id()) {
+                throw new PublicationFencedException("Physical log for " + expected.taskTopic() + " changed");
+            }
+            try (Log logHandle = stream.getLog(expected.logId())) {
+                LogOffset last = logHandle.getLastOffset().get();
+                if (LogOffset.NOT_FOUND.equals(last)) {
+                    return null;
+                }
+                long endOffset = Math.addExact(last.offset(), last.numberOfRecords());
+                long startOffset = Math.addExact(lastPublishedOffset, 1L);
+                if (startOffset >= endOffset) {
+                    return null;
+                }
+
+                long startCumulativeSize = cumulativeSizeAt(logHandle, lastPublishedOffset);
+                LogOffset selectedEnd = selectTaskEnd(
+                        logHandle, expected.taskTopic(), startOffset, startCumulativeSize, last);
+                if (selectedEnd == null) {
+                    return null;
+                }
+                long selectedEndOffset = Math.addExact(
+                        selectedEnd.offset(), selectedEnd.numberOfRecords());
+                long totalSize = Math.max(0L, selectedEnd.cumulativeSize() - startCumulativeSize);
+                Map<String, String> taskProperties = resolveTaskProperties(stream.properties());
+                PreparedCompactStreamTask task = new PreparedCompactStreamTask(
+                        expected.logId().id(),
+                        startOffset,
+                        selectedEndOffset,
+                        totalSize,
+                        selectedEnd.cumulativeSize(),
+                        PreparedCompactStreamTask.INIT,
+                        UUID.randomUUID().toString(),
+                        expected.taskTopic(),
+                        taskProperties);
+                return new TaskSnapshot(
+                        task,
+                        Math.subtractExact(endOffset, 1L),
+                        Math.subtractExact(selectedEndOffset, 1L));
+            }
+        }
+    }
+
+    /**
+     * Preserves the existing file-size and tail-visibility batching policy while reading only
+     * through the catalog-owned {@link Log} API.
+     */
+    private LogOffset selectTaskEnd(Log logHandle,
+                                    String taskTopic,
+                                    long startOffset,
+                                    long startCumulativeSize,
+                                    LogOffset last) throws Exception {
+        LogOffset selected = last;
+        if (compactedFileSizeLimit > 0) {
+            long lastEndOffset = Math.addExact(last.offset(), last.numberOfRecords());
+            long probeOffset = Math.addExact(startOffset, checkMessageStepLength - 1L);
+            while (probeOffset < lastEndOffset) {
+                LogEntryHeader header = logHandle.getEntryMetadata(probeOffset).get();
+                if (header != null && header.offset() >= 0
+                        && header.cumulativeSize() - startCumulativeSize >= compactedFileSizeLimit) {
+                    selected = new LogOffset(
+                            header.offset(),
+                            header.numberOfRecords(),
+                            header.timestamp(),
+                            header.entrySize(),
+                            header.cumulativeSize());
+                    break;
+                }
+                probeOffset = Math.addExact(probeOffset, checkMessageStepLength);
+            }
+        }
+
+        long selectedSize = selected.cumulativeSize() - startCumulativeSize;
+        if (selectedSize <= 0) {
+            tailWaitStartedAtMillis.remove(taskTopic);
+            return null;
+        }
+        boolean reachedFileSizeLimit = compactedFileSizeLimit > 0
+                && selectedSize >= compactedFileSizeLimit;
+        if (!reachedFileSizeLimit && tailVisibilityMillis > 0) {
+            LogEntryHeader first = logHandle.getEntryMetadata(startOffset).get();
+            long firstTimestamp = first == null || first.offset() < 0 ? last.timestamp() : first.timestamp();
+            long now = System.currentTimeMillis();
+            if (firstTimestamp > 0) {
+                tailWaitStartedAtMillis.remove(taskTopic);
+                if (now - firstTimestamp < tailVisibilityMillis) {
+                    return null;
+                }
+            } else {
+                long waitStarted = tailWaitStartedAtMillis.computeIfAbsent(taskTopic, ignored -> now);
+                if (now - waitStarted < tailVisibilityMillis) {
+                    return null;
+                }
+                tailWaitStartedAtMillis.remove(taskTopic);
+            }
+        } else {
+            tailWaitStartedAtMillis.remove(taskTopic);
+        }
+        return selected;
+    }
+
+    private static long cumulativeSizeAt(Log logHandle, long offset) throws Exception {
+        if (offset < 0) {
+            return 0L;
+        }
+        LogEntryHeader header = logHandle.getEntryMetadata(offset).get();
+        return header == null || header.offset() < 0 ? 0L : header.cumulativeSize();
+    }
+
+    private Map<String, String> resolveTaskProperties(Map<String, String> streamProperties) {
+        Map<String, String> taskProperties = new HashMap<>();
+        if (streamProperties != null) {
+            taskProperties.putAll(streamProperties);
+        }
+        String clusterName = baseProperties.getProperty("clusterName");
+        DynamicConfigs dynamicConfigs = clusterName == null || clusterName.isBlank()
+                ? DynamicConfigs.of(baseProperties)
+                : new DynamicConfigs(clusterName, baseProperties);
+        dynamicConfigs.overrideWith(taskProperties);
+        taskProperties.putAll(dynamicConfigs.toTaskProperties());
+        taskProperties.putIfAbsent(ENTRY_FORMAT_PROPERTY,
+                baseProperties.getProperty(ENTRY_FORMAT_PROPERTY,
+                        baseProperties.getProperty("dataSourceForCompaction", "URSA")));
+        return Map.copyOf(taskProperties);
+    }
+
+    static String taskTopic(StreamIdentifier identifier, int partition) {
+        return identifier.fullName() + "-partition-" + partition;
     }
 
     @Override
     public void stop() {
-        isCancel = true;
-        if (scanTopicFuture != null) {
-            scanTopicFuture.cancel(false);
+        Map<String, PartitionPublisher> sessions;
+        synchronized (this) {
+            if (stopped) {
+                return;
+            }
+            stopped = true;
+            if (nextScanFuture != null) {
+                nextScanFuture.cancel(false);
+            }
+            if (scanFuture != null) {
+                scanFuture.cancel(false);
+            }
+            sessions = Map.copyOf(publishers);
+            // Fence every local owner synchronously before waiting for any remote lease release.
+            sessions.values().forEach(PartitionPublisher::fence);
+            publishers.clear();
+            tailWaitStartedAtMillis.clear();
         }
-        for (Future<?> publishTaskFuture : publishTaskFutures.values()) {
-            publishTaskFuture.cancel(false);
-        }
-        publishTaskFutures.clear();
-
-        for (ScheduledFuture<?> delayPublishTaskFuture : delayPublishTaskFutures.values()) {
-            delayPublishTaskFuture.cancel(false);
-        }
-        delayPublishTaskFutures.clear();
+        sessions.values().forEach(this::closePublisherAfterStop);
+        schedulePendingLeaseReleaseRetry();
     }
 
+    private void closePublisherAfterStop(PartitionPublisher publisher) {
+        try {
+            publishExecutor.execute(() -> tryClosePublisher(publisher));
+        } catch (RejectedExecutionException rejected) {
+            log.warn("Failed to schedule publication-session close for {}; closing inline",
+                    publisher.identity().taskTopic(), rejected);
+            tryClosePublisher(publisher);
+        }
+    }
+
+    private void closePublisher(PartitionPublisher publisher) {
+        publisher.fence();
+        tryClosePublisher(publisher);
+    }
+
+    private void tryClosePublisher(PartitionPublisher publisher) {
+        try {
+            publisher.session().close();
+            publisher.closeRetryScheduled().set(false);
+        } catch (Exception error) {
+            if (error instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            log.warn("Failed to close compaction publication session for {}",
+                    publisher.identity().taskTopic(), error);
+            scheduleCloseRetry(publisher);
+        }
+    }
+
+    private void scheduleCloseRetry(PartitionPublisher publisher) {
+        if (!publisher.closeRetryScheduled().compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            publishExecutor.schedule(() -> {
+                publisher.closeRetryScheduled().set(false);
+                tryClosePublisher(publisher);
+            }, Math.min(1000L, scanIntervalMillis), TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException rejected) {
+            publisher.closeRetryScheduled().set(false);
+            log.warn("Failed to schedule publication-session close retry for {}",
+                    publisher.identity().taskTopic(), rejected);
+        }
+    }
+
+    private void retryPendingLeaseReleases() {
+        if (!compactionManager.hasPendingPublicationLeaseReleases()) {
+            return;
+        }
+        try {
+            compactionManager.retryPendingPublicationLeaseReleases();
+        } catch (Exception error) {
+            if (error instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            log.warn("Failed to release an incompletely opened compaction publication lease", error);
+            schedulePendingLeaseReleaseRetry();
+        }
+    }
+
+    private void schedulePendingLeaseReleaseRetry() {
+        if (!compactionManager.hasPendingPublicationLeaseReleases()
+                || !pendingLeaseReleaseRetryScheduled.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            publishExecutor.schedule(() -> {
+                pendingLeaseReleaseRetryScheduled.set(false);
+                retryPendingLeaseReleases();
+                if (compactionManager.hasPendingPublicationLeaseReleases()) {
+                    schedulePendingLeaseReleaseRetry();
+                }
+            }, Math.min(1000L, scanIntervalMillis), TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException rejected) {
+            pendingLeaseReleaseRetryScheduled.set(false);
+            log.warn("Failed to schedule an incomplete publication-lease release retry", rejected);
+        }
+    }
+
+    private void recordPartitionFailure(String name, String operation, Throwable error) {
+        log.warn("Failed to {} for {}", operation, name, error);
+        compactionMetrics.getPublishTaskFailedCount().increment();
+    }
+
+    private void retainExistingNamespace(
+            String namespace, Map<String, PartitionIdentity> discovered) {
+        publishers.values().stream()
+                .map(PartitionPublisher::identity)
+                .filter(identity -> identity.stream().namespace().equals(namespace))
+                .forEach(identity -> discovered.putIfAbsent(identity.taskTopic(), identity));
+    }
+
+    private void retainExistingStream(
+            StreamIdentifier stream, Map<String, PartitionIdentity> discovered) {
+        publishers.values().stream()
+                .map(PartitionPublisher::identity)
+                .filter(identity -> identity.stream().equals(stream))
+                .forEach(identity -> discovered.putIfAbsent(identity.taskTopic(), identity));
+    }
+
+    int sessionCount() {
+        return publishers.size();
+    }
+
+    private record PartitionIdentity(StreamIdentifier stream, int partition, LogId logId, String taskTopic) {
+    }
+
+    private record TaskSnapshot(PreparedCompactStreamTask task, long latestOffset, long publishedOffset) {
+    }
+
+    private static final class PartitionPublisher {
+        private volatile PartitionIdentity identity;
+        private final CompactionManager.PublicationSession session;
+        private final AtomicBoolean closeRetryScheduled = new AtomicBoolean();
+
+        private PartitionPublisher(PartitionIdentity identity,
+                                   CompactionManager.PublicationSession session) {
+            this.identity = identity;
+            this.session = session;
+        }
+
+        private PartitionIdentity identity() {
+            return identity;
+        }
+
+        private void identity(PartitionIdentity identity) {
+            this.identity = identity;
+        }
+
+        private long streamId() {
+            return session.streamId();
+        }
+
+        private CompactionManager.PublicationSession session() {
+            return session;
+        }
+
+        private AtomicBoolean closeRetryScheduled() {
+            return closeRetryScheduled;
+        }
+
+        private void fence() {
+            session.fence();
+        }
+    }
 }

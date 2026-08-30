@@ -286,6 +286,33 @@ public class OxiaCompactTaskManager implements CompactTaskManager {
     }
 
     @Override
+    public CompletableFuture<Boolean> deletePackagedTaskNameIfEmpty(String taskName) {
+        String taskNameKey = buildPackageTaskKey(taskName);
+        String subtaskPrefix = taskNameKey + "/";
+        return oxiaClient.get(taskNameKey).thenCompose(marker -> {
+            if (marker == null) {
+                return CompletableFuture.completedFuture(false);
+            }
+            return oxiaClient.list(subtaskPrefix, subtaskPrefix + "\uffff")
+                .thenCompose(subtasks -> {
+                    if (!subtasks.isEmpty()) {
+                        return CompletableFuture.completedFuture(false);
+                    }
+                    return oxiaClient.delete(taskNameKey, Set.of(
+                            DeleteOption.IfVersionIdEquals(marker.version().versionId())))
+                        .exceptionally(error -> {
+                            Throwable cause = error instanceof CompletionException
+                                    ? error.getCause() : error;
+                            if (cause instanceof UnexpectedVersionIdException) {
+                                return false;
+                            }
+                            throw new CompletionException(cause);
+                        });
+                });
+        });
+    }
+
+    @Override
     public void deleteDLQPackagedTaskName(String taskName) throws ExecutionException, InterruptedException {
         String taskNameKey = buildDLQPackageTaskKey(taskName);
         oxiaClient.delete(taskNameKey).get();

@@ -10,9 +10,6 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyLong;
-import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -34,7 +31,6 @@ import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.mockito.Answers;
@@ -131,42 +127,50 @@ public class CompactionSchedulerWiringTest {
     }
 
     @Test
-    public void disabledInternalTaskPublisherDoesNotStartPublisherOrTopicRefresh() throws Exception {
+    public void disabledInternalTaskPublisherDoesNotStartPublisher() throws Exception {
         CompactionScheduler scheduler = mock(CompactionScheduler.class, Answers.CALLS_REAL_METHODS);
         StorageConfig config = StorageConfig.builder()
                 .internalCompactionTaskPublisherEnabled(false)
                 .build();
-        ScheduledExecutorService scheduledExecutor = mock(ScheduledExecutorService.class);
         CompactionStorageBindings storageBindings = mock(CompactionStorageBindings.class);
         setField(scheduler, "config", config);
-        setField(scheduler, "scheduledExecutor", scheduledExecutor);
         setField(scheduler, "storageBindings", storageBindings);
 
         invokeStartPublishCompactTaskRunner(scheduler);
 
-        verify(scheduledExecutor, never()).scheduleWithFixedDelay(
-                any(Runnable.class), anyLong(), anyLong(), any(TimeUnit.class));
         verify(storageBindings, never()).createPublishCompactTaskRunner();
     }
 
     @Test
-    public void enabledInternalTaskPublisherStartsPublisherAndTopicRefresh() throws Exception {
+    public void legacyExternalPublisherModeDoesNotRequireStreamCatalog() {
+        StorageConfig config = StorageConfig.builder()
+                .internalCompactionTaskPublisherEnabled(false)
+                .materializationEnabled(false)
+                .build();
+
+        assertFalse(CompactionScheduler.requiresStreamCatalog(config));
+
+        config.setInternalCompactionTaskPublisherEnabled(true);
+        assertTrue(CompactionScheduler.requiresStreamCatalog(config));
+        config.setInternalCompactionTaskPublisherEnabled(false);
+        config.setMaterializationEnabled(true);
+        assertTrue(CompactionScheduler.requiresStreamCatalog(config));
+    }
+
+    @Test
+    public void enabledInternalTaskPublisherStartsCatalogPublisherWithoutLegacyTopicRefresh() throws Exception {
         CompactionScheduler scheduler = mock(CompactionScheduler.class, Answers.CALLS_REAL_METHODS);
         StorageConfig config = StorageConfig.builder()
                 .refreshLocalTopicInternalInSeconds(7)
                 .build();
-        ScheduledExecutorService scheduledExecutor = mock(ScheduledExecutorService.class);
         CompactionStorageBindings storageBindings = mock(CompactionStorageBindings.class);
         StartStopRunner runner = mock(StartStopRunner.class);
         when(storageBindings.createPublishCompactTaskRunner()).thenReturn(runner);
         setField(scheduler, "config", config);
-        setField(scheduler, "scheduledExecutor", scheduledExecutor);
         setField(scheduler, "storageBindings", storageBindings);
 
         invokeStartPublishCompactTaskRunner(scheduler);
 
-        verify(scheduledExecutor).scheduleWithFixedDelay(
-                any(Runnable.class), eq(0L), eq(7L), eq(TimeUnit.SECONDS));
         verify(storageBindings).createPublishCompactTaskRunner();
         verify(runner).start();
     }

@@ -54,6 +54,14 @@ public interface CompactTaskManager {
 
     CompletableFuture<Boolean> deletePackagedTaskName(String taskName);
 
+    /**
+     * Deletes a package marker only when a fresh storage read confirms that it has no subtasks.
+     *
+     * <p>The check and conditional marker deletion must be safe against a publisher concurrently
+     * making a package visible.
+     */
+    CompletableFuture<Boolean> deletePackagedTaskNameIfEmpty(String taskName);
+
     void deleteDLQPackagedTaskName(String taskName) throws ExecutionException, InterruptedException;
 
     void publishCompactTask(CompactStreamTask compactStreamTask)

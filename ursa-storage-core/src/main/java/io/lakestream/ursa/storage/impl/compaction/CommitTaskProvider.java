@@ -163,7 +163,7 @@ public class CommitTaskProvider {
                 }
             }
             if (deleteTask) {
-                manager.deletePackagedTaskName(packagedCompactStreamTask.getTaskName());
+                manager.deletePackagedTaskNameIfEmpty(packagedCompactStreamTask.getTaskName());
             }
         }
         currentTaskStat = new TaskStat(totalTasks, readyToCommitTasks);

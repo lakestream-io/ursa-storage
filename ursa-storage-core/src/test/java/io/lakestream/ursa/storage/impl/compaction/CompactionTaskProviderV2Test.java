@@ -103,6 +103,20 @@ class CompactionTaskProviderV2Test {
     }
 
     @Test
+    void testGetTask_RemovesOrphanedPackageMarker() throws Exception {
+        provider = new CompactionTaskProviderV2(taskManager, compactionMetrics, 1000, 10.0);
+        PackagedCompactStreamTask orphan = createMockPackagedTask("orphan", List.of());
+        when(taskManager.getAllTasks())
+            .thenReturn(CompletableFuture.completedFuture(List.of(orphan)));
+        when(taskManager.deletePackagedTaskNameIfEmpty("orphan"))
+            .thenReturn(CompletableFuture.completedFuture(true));
+
+        assertNull(provider.getTask());
+
+        verify(taskManager).deletePackagedTaskNameIfEmpty("orphan");
+    }
+
+    @Test
     void testGetTask_RespectMinFetchInterval() throws Exception {
         // Given
         provider = new CompactionTaskProviderV2(taskManager, compactionMetrics, 5000, 10.0);

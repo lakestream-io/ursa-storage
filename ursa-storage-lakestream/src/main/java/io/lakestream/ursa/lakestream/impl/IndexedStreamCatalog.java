@@ -514,7 +514,9 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
                                                     Optional<TableMaterializationPolicy> materialization) {
         int numPartitions = partitioning.numPartitions();
         String ownerToken = UUID.randomUUID().toString();
-        return preflightRetiredPartitionJournals(id, numPartitions, "Stream creation")
+        return streamConfigStore.ensureNamespaceExists(id.namespace())
+            .thenCompose(ignored ->
+                preflightRetiredPartitionJournals(id, numPartitions, "Stream creation"))
             .thenCompose(ignored -> streamConfigStore.claimCreation(
                 id, numPartitions, properties, materialization,
                 IndexedStreamConfigStore.CreationKind.NATIVE_CREATE, ownerToken))
@@ -982,8 +984,9 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
         if (partitionCount <= 0) {
             throw new IllegalArgumentException("partitionCount must be positive");
         }
-        return preflightRetiredPartitionJournals(
-                id, partitionCount, "External stream registration")
+        return streamConfigStore.ensureNamespaceExists(id.namespace())
+            .thenCompose(ignored -> preflightRetiredPartitionJournals(
+                id, partitionCount, "External stream registration"))
             .thenCompose(ignored ->
                 streamConfigStore.registerExternalStream(id, partitionCount, properties));
     }
@@ -1050,8 +1053,10 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
                                                              long streamId,
                                                              @Nullable Map<String, String> properties) {
         Map<String, String> props = properties == null ? Map.of() : properties;
-        CompletableFuture<Void> registrationResult = preflightRetiredPartitionJournal(
-                id, partitionIndex, "External partition registration")
+        CompletableFuture<Void> registrationResult =
+            streamConfigStore.ensureNamespaceExists(id.namespace())
+            .thenCompose(ignored -> preflightRetiredPartitionJournal(
+                id, partitionIndex, "External partition registration"))
             .thenCompose(ignored -> preflightLegacyDeletedExternalPartition(
                 id, partitionIndex, props))
             .thenCompose(ignored -> streamConfigStore.beginExternalPartitionRegistration(
@@ -1188,8 +1193,10 @@ public class IndexedStreamCatalog implements StreamCatalog, ExternalStreamRegist
             throw new IllegalArgumentException("partitionIndex must be non-negative");
         }
         String logName = catalogPaths.compactedReaderName(id, partitionIndex);
-        CompletableFuture<Log> openResult = preflightRetiredPartitionJournal(
-                id, partitionIndex, "External partition creation")
+        CompletableFuture<Log> openResult =
+            streamConfigStore.ensureNamespaceExists(id.namespace())
+            .thenCompose(ignored -> preflightRetiredPartitionJournal(
+                id, partitionIndex, "External partition creation"))
             .thenCompose(ignored -> preflightLegacyDeletedExternalPartition(
                 id, partitionIndex, properties))
             .thenCompose(ignored -> streamConfigStore.beginExternalPartitionRegistration(

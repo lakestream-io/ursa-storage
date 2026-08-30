@@ -21,6 +21,7 @@ import io.oxia.client.api.PutResult;
 import io.oxia.client.api.exceptions.KeyAlreadyExistsException;
 import io.oxia.client.api.exceptions.UnexpectedVersionIdException;
 import io.oxia.client.api.options.PutOption;
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -41,6 +42,8 @@ import lombok.extern.slf4j.Slf4j;
 final class IndexedStreamConfigStore {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final byte[] EMPTY_NAMESPACE =
+        "{\"properties\":{}}".getBytes(StandardCharsets.UTF_8);
     static final int MAX_CONFIG_WRITE_RETRIES = 3;
     static final long INITIAL_RETRY_BACKOFF_MILLIS = 10L;
     static final long NO_METADATA_GENERATION = -2L;
@@ -74,6 +77,18 @@ final class IndexedStreamConfigStore {
         this.oxiaClient = Objects.requireNonNull(oxiaClient, "oxiaClient");
         this.catalogPaths = Objects.requireNonNull(catalogPaths, "catalogPaths");
         this.retryDelay = Objects.requireNonNull(retryDelay, "retryDelay");
+    }
+
+    CompletableFuture<Void> ensureNamespaceExists(String namespace) {
+        String path = catalogPaths.namespacePath(namespace);
+        return oxiaClient.put(path, EMPTY_NAMESPACE, Set.of(PutOption.IfRecordDoesNotExist))
+            .handle((ignored, failure) -> {
+                Throwable cause = unwrapNullable(failure);
+                if (cause == null || cause instanceof KeyAlreadyExistsException) {
+                    return null;
+                }
+                throw new CompletionException(cause);
+            });
     }
 
     CompletableFuture<Void> registerExternalStream(

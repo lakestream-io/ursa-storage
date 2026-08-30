@@ -498,6 +498,10 @@ public class CompactionManagerTest {
         assertEquals(claimFailure, openFailure);
         assertEquals(1, openFailure.getSuppressed().length);
         assertEquals(releaseFailure, openFailure.getSuppressed()[0]);
+        assertTrue(compactionManager.hasPendingPublicationLeaseReleases());
+
+        compactionManager.retryPendingPublicationLeaseReleases();
+        assertFalse(compactionManager.hasPendingPublicationLeaseReleases());
 
         CompactionManager.PublicationSession recovered =
                 compactionManager.tryOpenPublicationSession(TOPIC, STREAM_ID).orElseThrow();

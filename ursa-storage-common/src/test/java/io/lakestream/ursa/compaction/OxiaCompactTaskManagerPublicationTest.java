@@ -13,6 +13,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.startsWith;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -30,6 +31,7 @@ import io.oxia.client.api.options.DeleteOption;
 import io.oxia.client.api.options.GetOption;
 import io.oxia.client.api.options.PutOption;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -158,6 +160,59 @@ class OxiaCompactTaskManagerPublicationTest {
 
         verify(client).delete(eq("prepared-task-" + TOPIC), eq(Set.of(
                 DeleteOption.PartitionKey(TOPIC), DeleteOption.IfVersionIdEquals(21L))));
+    }
+
+    @Test
+    void emptyPackageDeletionRechecksSubtasksAndUsesMarkerRevision() throws Exception {
+        AsyncOxiaClient client = mock(AsyncOxiaClient.class);
+        String taskName = "orphan";
+        String markerKey = "/compact-stream-tasks/" + taskName;
+        when(client.get(markerKey)).thenReturn(CompletableFuture.completedFuture(
+                new GetResult(markerKey, new byte[0], version(31L))));
+        when(client.list(markerKey + "/", markerKey + "/\uffff"))
+                .thenReturn(CompletableFuture.completedFuture(List.of()));
+        when(client.delete(markerKey, Set.of(DeleteOption.IfVersionIdEquals(31L))))
+                .thenReturn(CompletableFuture.completedFuture(true));
+        OxiaCompactTaskManager manager = new OxiaCompactTaskManager(client);
+
+        assertTrue(manager.deletePackagedTaskNameIfEmpty(taskName).get());
+
+        verify(client).delete(markerKey, Set.of(DeleteOption.IfVersionIdEquals(31L)));
+    }
+
+    @Test
+    void emptyPackageDeletionRetainsRewrittenMarker() throws Exception {
+        AsyncOxiaClient client = mock(AsyncOxiaClient.class);
+        String taskName = "rewritten";
+        String markerKey = "/compact-stream-tasks/" + taskName;
+        when(client.get(markerKey)).thenReturn(CompletableFuture.completedFuture(
+                new GetResult(markerKey, new byte[0], version(31L))));
+        when(client.list(markerKey + "/", markerKey + "/\uffff"))
+                .thenReturn(CompletableFuture.completedFuture(List.of()));
+        when(client.delete(markerKey, Set.of(DeleteOption.IfVersionIdEquals(31L))))
+                .thenReturn(CompletableFuture.failedFuture(
+                        new UnexpectedVersionIdException(markerKey, 32L)));
+        OxiaCompactTaskManager manager = new OxiaCompactTaskManager(client);
+
+        assertFalse(manager.deletePackagedTaskNameIfEmpty(taskName).get());
+
+        verify(client).delete(markerKey, Set.of(DeleteOption.IfVersionIdEquals(31L)));
+    }
+
+    @Test
+    void emptyPackageDeletionRetainsMarkerWhenSubtaskAppears() throws Exception {
+        AsyncOxiaClient client = mock(AsyncOxiaClient.class);
+        String taskName = "still-visible";
+        String markerKey = "/compact-stream-tasks/" + taskName;
+        when(client.get(markerKey)).thenReturn(CompletableFuture.completedFuture(
+                new GetResult(markerKey, new byte[0], version(32L))));
+        when(client.list(markerKey + "/", markerKey + "/\uffff"))
+                .thenReturn(CompletableFuture.completedFuture(List.of(markerKey + "/42-0-10")));
+        OxiaCompactTaskManager manager = new OxiaCompactTaskManager(client);
+
+        assertFalse(manager.deletePackagedTaskNameIfEmpty(taskName).get());
+
+        verify(client, never()).delete(eq(markerKey), anySet());
     }
 
     private static Version version(long versionId) {

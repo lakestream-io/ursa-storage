@@ -160,6 +160,23 @@ public class CompactionTaskProviderV2 {
             return allTasks;
         }
 
+        // A package marker is written only after all of its subtasks are durable. Therefore a
+        // marker with no subtask is an orphan (for example after a terminal source task is
+        // deleted). Remove it here so it cannot be quarantined and rediscovered forever.
+        List<CompletableFuture<Boolean>> orphanDeletes = allTasks.stream()
+            .filter(task -> task.getSubTasks().isEmpty())
+            .map(task -> taskManager.deletePackagedTaskNameIfEmpty(task.getTaskName()))
+            .toList();
+        if (!orphanDeletes.isEmpty()) {
+            CompletableFuture.allOf(orphanDeletes.toArray(new CompletableFuture[0])).get();
+            allTasks = allTasks.stream()
+                .filter(task -> !task.getSubTasks().isEmpty())
+                .toList();
+            if (allTasks.isEmpty()) {
+                return List.of();
+            }
+        }
+
         // Collect all sub-task futures asynchronously
         List<CompletableFuture<CompactStreamTask>> futures = new ArrayList<>();
         for (PackagedCompactStreamTask task : allTasks) {

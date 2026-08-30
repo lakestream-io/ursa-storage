@@ -4,9 +4,11 @@
  */
 package io.lakestream.ursa.compact;
 
+import io.lakestream.api.LogId;
 import io.lakestream.api.Stream;
 import io.lakestream.api.StreamCatalog;
 import io.lakestream.api.StreamIdentifier;
+import io.lakestream.api.exception.NoSuchStreamException;
 import io.lakestream.api.exception.PartitionLifecycleFencedException;
 import io.lakestream.api.exception.StreamPermanentlyDeletedException;
 import io.lakestream.api.materialization.ResolvedMaterialization;
@@ -299,29 +301,8 @@ public class CompactionWorker implements Runnable {
             throw new MaterializationException(ExceptionCode.INTERNAL_ERROR,
                 "Skipping materialization for unparsable topic " + task.getTopic(), re);
         }
-        // Broker-created streams might not pass through StreamCatalog.createStream(). Register this
-        // partition idempotently from the task's streamId so loadStream() resolves the stream
-        // regardless of source.
         Map<String, String> props = task.getProperties() == null ? Map.of() : task.getProperties();
-        try {
-            int partitionIndex = partitionIndexOf(task.getTopic());
-            // The catalog uses streamId to distinguish the stream from any other stream with the
-            // same namespace + name.
-            // The partition index is used to distinguish the partition from any other partition of the same stream.
-            // This bridge makes externally-created stream metadata visible to Lakestream.
-            streamCatalog.registerExternalPartition(id, partitionIndex, task.getStreamId(), props).join();
-        } catch (RuntimeException re) {
-            throw catalogFailure(
-                "Failed to register stream " + id.fullName() + " for materialization", re);
-        }
-        Stream stream;
-        try {
-            stream = streamCatalog.loadStream(id).join();
-        } catch (RuntimeException re) {
-            // Do not silently skip: a transient load failure would drop the range. Retry.
-            throw catalogFailure(
-                "Failed to load stream " + id.fullName() + " for materialization", re);
-        }
+        Stream stream = resolveMaterializationStream(task, id, props);
         boolean ownershipTransferred = false;
         Throwable materializationFailure = null;
         try {
@@ -381,6 +362,108 @@ public class CompactionWorker implements Runnable {
         }
     }
 
+    private Stream resolveMaterializationStream(
+            CompactStreamTask task,
+            StreamIdentifier id,
+            Map<String, String> properties) {
+        int partitionIndex = partitionIndexOf(task.getTopic());
+        Stream existing;
+        try {
+            existing = streamCatalog.loadStream(id).join();
+        } catch (RuntimeException failure) {
+            if (!hasCause(failure, NoSuchStreamException.class)) {
+                throw catalogFailure(
+                    "Failed to load stream " + id.fullName() + " for materialization", failure);
+            }
+            return registerExternalAndLoad(task, id, partitionIndex, properties);
+        }
+
+        List<LogId> logIds;
+        try {
+            logIds = existing.layout().logIds().join();
+        } catch (RuntimeException | Error failure) {
+            closeBeforeFallback(existing, failure);
+            throw catalogFailure(
+                "Failed to read stream layout for " + id.fullName(), failure);
+        }
+        if (partitionIndex >= logIds.size() || logIds.get(partitionIndex).id() < 0) {
+            closeBeforeFallback(existing, null);
+            return registerExternalAndLoad(task, id, partitionIndex, properties);
+        }
+        try {
+            verifyTaskLogIdentity(task, id, partitionIndex, logIds.get(partitionIndex));
+        } catch (RuntimeException | Error failure) {
+            closeBeforeFallback(existing, failure);
+            throw catalogFailure(
+                "Stream " + id.fullName() + " does not match the compaction task", failure);
+        }
+        return existing;
+    }
+
+    private Stream registerExternalAndLoad(
+            CompactStreamTask task,
+            StreamIdentifier id,
+            int partitionIndex,
+            Map<String, String> properties) {
+        try {
+            streamCatalog.registerExternalPartition(
+                id, partitionIndex, task.getStreamId(), properties).join();
+        } catch (RuntimeException failure) {
+            throw catalogFailure(
+                "Failed to register stream " + id.fullName() + " for materialization", failure);
+        }
+
+        Stream registered;
+        try {
+            registered = streamCatalog.loadStream(id).join();
+        } catch (RuntimeException failure) {
+            throw catalogFailure(
+                "Failed to load registered stream " + id.fullName() + " for materialization", failure);
+        }
+        try {
+            List<LogId> logIds = registered.layout().logIds().join();
+            if (partitionIndex >= logIds.size()) {
+                throw new PartitionLifecycleFencedException(
+                    id, partitionIndex, "registered stream layout does not contain the task partition");
+            }
+            verifyTaskLogIdentity(task, id, partitionIndex, logIds.get(partitionIndex));
+            return registered;
+        } catch (RuntimeException | Error failure) {
+            closeBeforeFallback(registered, failure);
+            throw catalogFailure(
+                "Registered stream " + id.fullName() + " does not match the compaction task", failure);
+        }
+    }
+
+    private static void verifyTaskLogIdentity(
+            CompactStreamTask task,
+            StreamIdentifier id,
+            int partitionIndex,
+            LogId actual) {
+        if (actual.id() != task.getStreamId()) {
+            throw new PartitionLifecycleFencedException(
+                id,
+                partitionIndex,
+                "task references physical log " + task.getStreamId()
+                    + " but the catalog owns " + actual.id());
+        }
+    }
+
+    private static void closeBeforeFallback(Stream stream, @Nullable Throwable failure) {
+        try {
+            stream.close();
+        } catch (Exception closeFailure) {
+            if (failure != null) {
+                failure.addSuppressed(closeFailure);
+            } else {
+                throw new MaterializationException(
+                    ExceptionCode.INTERNAL_ERROR,
+                    "Failed to close stream before external registration fallback",
+                    closeFailure);
+            }
+        }
+    }
+
     /**
      * Prefers the operator-registered {@link TableCatalog} over the one the task-property fallback
      * synthesizes from flat connection properties. Catalog definitions are loaded once at startup from
@@ -423,7 +506,7 @@ public class CompactionWorker implements Runnable {
     }
 
     private static MaterializationException catalogFailure(
-            String message, RuntimeException failure) {
+            String message, Throwable failure) {
         ExceptionCode code = hasCause(failure, StreamPermanentlyDeletedException.class)
                 || hasCause(failure, PartitionLifecycleFencedException.class)
             ? ExceptionCode.NO_SUCH_STREAM
@@ -517,17 +600,16 @@ public class CompactionWorker implements Runnable {
             if (value == null || value.isBlank() || value.contains("://")) {
                 throw new IllegalArgumentException("Invalid stream name: " + value);
             }
-            String[] parts = value.strip().split("/", -1);
+            String canonical = value.strip();
             String namespace;
             String localName;
-            if (parts.length == 1) {
+            int separator = canonical.lastIndexOf('/');
+            if (separator < 0) {
                 namespace = "default";
-                localName = parts[0];
-            } else if (parts.length == 2) {
-                namespace = parts[0];
-                localName = parts[1];
+                localName = canonical;
             } else {
-                throw new IllegalArgumentException("Invalid stream name: " + value);
+                namespace = canonical.substring(0, separator);
+                localName = canonical.substring(separator + 1);
             }
             if (namespace.isBlank() || localName.isBlank()) {
                 throw new IllegalArgumentException("Invalid stream name: " + value);

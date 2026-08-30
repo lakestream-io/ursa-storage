@@ -4,7 +4,9 @@
  */
 package io.lakestream.ursa.lakehouse.compact;
 
+import io.lakestream.api.StreamCatalog;
 import io.lakestream.ursa.compaction.CompactTaskManager;
+import io.lakestream.ursa.compaction.CompactionManager;
 import io.lakestream.ursa.compaction.metrics.CompactionMetrics;
 import io.lakestream.ursa.lakehouse.cleaner.AsyncCompactedDataCleaner;
 import io.lakestream.ursa.lakehouse.cleaner.CompactedDataCleanupHandler;
@@ -19,12 +21,12 @@ import io.lakestream.ursa.storage.impl.compaction.CommitTaskProvider;
 import io.lakestream.ursa.storage.impl.compaction.CompactionStorageBindings;
 import io.lakestream.ursa.storage.impl.compaction.StartStopRunner;
 import io.lakestream.ursa.storage.impl.compaction.TopicManager;
-import io.lakestream.ursa.storage.impl.compaction.TopicProvider;
 import io.oxia.client.api.AsyncOxiaClient;
 import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.BooleanSupplier;
+import javax.annotation.Nullable;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 
@@ -46,14 +48,17 @@ import lombok.extern.slf4j.Slf4j;
 public final class LakehouseCompactionStorageBindings implements CompactionStorageBindings {
 
     private final Dependencies deps;
+    private final CompactionManager compactionManager;
     @Getter
     private final SchemaRegistry schemaRegistry;
     private volatile KafkaSchemaService schemaService;
-    /** Memoised TopicManager so the scheduler and publish runner share one storage view. */
+    /** Legacy SPI compatibility; the catalog-backed publisher does not use a TopicManager. */
     private volatile TopicManager topicManager;
 
     public LakehouseCompactionStorageBindings(Dependencies deps) {
         this.deps = Objects.requireNonNull(deps, "deps");
+        this.compactionManager = new CompactionManager(
+                deps.compactTaskManager, deps.compactionMetrics);
         this.schemaRegistry = deps.schemaRegistry != null
                 ? deps.schemaRegistry
                 : new KafkaSchemaRegistry(deps.config.getProperties());
@@ -61,15 +66,15 @@ public final class LakehouseCompactionStorageBindings implements CompactionStora
 
     @Override
     public StartStopRunner createPublishCompactTaskRunner() {
+        StreamCatalog streamCatalog = Objects.requireNonNull(
+                deps.streamCatalog,
+                "StreamCatalog is required when the internal compaction task publisher is enabled");
         return new PublishCompactTaskRunner(
-                deps.storageApi,
-                deps.compactTaskManager,
-                createTopicManager(),
+                streamCatalog,
+                compactionManager,
                 deps.scanTopicExecutor,
                 deps.publishTaskExecutor,
-                deps.topicProvider,
                 deps.config,
-                schemaRegistry,
                 deps.compactionMetrics);
     }
 
@@ -99,9 +104,6 @@ public final class LakehouseCompactionStorageBindings implements CompactionStora
 
     @Override
     public TopicManager createTopicManager() {
-        if (deps.topicManager != null) {
-            return deps.topicManager;
-        }
         TopicManager local = topicManager;
         if (local == null) {
             synchronized (this) {
@@ -147,6 +149,13 @@ public final class LakehouseCompactionStorageBindings implements CompactionStora
 
     @Override
     public void close() {
+        if (topicManager != null) {
+            try {
+                topicManager.close();
+            } catch (Exception e) {
+                log.warn("Failed to close legacy topic manager during bindings shutdown", e);
+            }
+        }
         if (schemaService != null) {
             try {
                 schemaService.close();
@@ -163,13 +172,13 @@ public final class LakehouseCompactionStorageBindings implements CompactionStora
      */
     public static final class Dependencies {
         private final StorageConfig config;
+        @Nullable
+        private final StreamCatalog streamCatalog;
         private final StorageApi storageApi;
         private final FileStorage fileStorage;
         private final CompactTaskManager compactTaskManager;
         private final CompactionMetrics compactionMetrics;
         private final CommitTaskProvider commitTaskProvider;
-        private final TopicProvider topicProvider;
-        private final TopicManager topicManager;
         private final AsyncOxiaClient oxiaClient;
         private final SchemaRegistry schemaRegistry;
         private final ExecutorService scanTopicExecutor;
@@ -179,13 +188,12 @@ public final class LakehouseCompactionStorageBindings implements CompactionStora
 
         @SuppressWarnings("ParameterNumber")
         public Dependencies(StorageConfig config,
+                            @Nullable StreamCatalog streamCatalog,
                             StorageApi storageApi,
                             FileStorage fileStorage,
                             CompactTaskManager compactTaskManager,
                             CompactionMetrics compactionMetrics,
                             CommitTaskProvider commitTaskProvider,
-                            TopicProvider topicProvider,
-                            TopicManager topicManager,
                             AsyncOxiaClient oxiaClient,
                             SchemaRegistry schemaRegistry,
                             ExecutorService scanTopicExecutor,
@@ -193,13 +201,12 @@ public final class LakehouseCompactionStorageBindings implements CompactionStora
                             ExecutorService compactedTaskExecutor,
                             ExecutorService commitParquetFileExecutor) {
             this.config = Objects.requireNonNull(config, "config");
+            this.streamCatalog = streamCatalog;
             this.storageApi = Objects.requireNonNull(storageApi, "storageApi");
             this.fileStorage = Objects.requireNonNull(fileStorage, "fileStorage");
             this.compactTaskManager = Objects.requireNonNull(compactTaskManager, "compactTaskManager");
             this.compactionMetrics = Objects.requireNonNull(compactionMetrics, "compactionMetrics");
             this.commitTaskProvider = Objects.requireNonNull(commitTaskProvider, "commitTaskProvider");
-            this.topicProvider = Objects.requireNonNull(topicProvider, "topicProvider");
-            this.topicManager = topicManager;
             this.oxiaClient = oxiaClient;
             this.schemaRegistry = schemaRegistry;
             this.scanTopicExecutor = Objects.requireNonNull(scanTopicExecutor, "scanTopicExecutor");

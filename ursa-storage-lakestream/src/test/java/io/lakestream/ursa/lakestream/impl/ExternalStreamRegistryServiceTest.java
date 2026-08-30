@@ -51,7 +51,11 @@ class ExternalStreamRegistryServiceTest {
         properties.setProperty("oxiaStorageConfig", "{\"requestTimeout\":\"5s\"}");
         properties.setProperty("backendStorageType", "this-is-never-parsed");
         String configPath = "/admin/streams/public/default/topic";
+        String namespacePath = "/admin/streams/_namespaces/public/default";
         AtomicReference<byte[]> storedConfig = new AtomicReference<>();
+        when(oxiaClient.put(eq(namespacePath), any(byte[].class),
+                eq(Set.of(PutOption.IfRecordDoesNotExist))))
+            .thenReturn(CompletableFuture.completedFuture(new PutResult(namespacePath, VERSION)));
         when(oxiaClient.get(configPath)).thenAnswer(ignored ->
             CompletableFuture.completedFuture(storedConfig.get() == null ? null
                 : new GetResult(configPath, storedConfig.get(), VERSION)));
@@ -76,6 +80,8 @@ class ExternalStreamRegistryServiceTest {
 
         assertThat(capturedUri.get()).isEqualTo("oxia://localhost/catalog");
         assertThat(capturedConfig.get()).isEqualTo("{\"requestTimeout\":\"5s\"}");
+        verify(oxiaClient).put(eq(namespacePath), any(byte[].class),
+            eq(Set.of(PutOption.IfRecordDoesNotExist)));
         verify(oxiaClient).put(eq(configPath), any(byte[].class),
             eq(Set.of(PutOption.IfRecordDoesNotExist)));
         verify(oxiaClient).put(eq(configPath), any(byte[].class),
