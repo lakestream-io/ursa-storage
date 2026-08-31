@@ -8,7 +8,6 @@ import com.google.common.annotations.VisibleForTesting;
 import io.lakestream.ursa.compaction.DynamicConfigs;
 import io.lakestream.ursa.lakehouse.LakehouseConfiguration;
 import io.lakestream.ursa.lakehouse.compact.FailureMessage;
-import io.lakestream.ursa.lakehouse.compact.KafkaEntryProcessFactory;
 import io.lakestream.ursa.lakehouse.compact.KeyedObjectPoolManager;
 import io.lakestream.ursa.lakehouse.compact.ObjectPool;
 import io.lakestream.ursa.lakehouse.v2.delta.DeltaExternalDLTTableWriter;
@@ -20,6 +19,7 @@ import io.lakestream.ursa.lakehouse.v2.io.parquet.ParquetConfig;
 import io.lakestream.ursa.materialization.serde.EntrySerdeFactory;
 import io.lakestream.ursa.materialization.serde.GenericEntry;
 import io.lakestream.ursa.materialization.serde.SchemaService;
+import io.lakestream.ursa.materialization.serde.kafka.KafkaSourceMetadata;
 import io.lakestream.ursa.metrics.InstrumentProvider;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -78,7 +78,7 @@ public class LakehouseFactory implements AutoCloseable {
     public Optional<LakehouseRecordWriter<GenericEntry>> getManagedWriter(String topic, Map<String, String> prop) {
         log.info("Creating managed writer for topic: {} with properties: {}", topic, prop);
         LakehouseConfiguration lakehouseConfiguration = generateLakehouseConfiguration(prop);
-        String schemaTopic = schemaTopic(topic, prop);
+        String schemaTopic = KafkaSourceMetadata.topicName(topic, prop);
 
         var dynamicConfigs = resolveDynamicConfigs(lakehouseConfiguration);
         if (!dynamicConfigs.sbtEnabled()) {
@@ -116,7 +116,7 @@ public class LakehouseFactory implements AutoCloseable {
             String topic, Map<String, String> properties) {
         log.info("Creating external writer for topic: {} with properties: {}", topic, properties);
         LakehouseConfiguration lakehouseConfiguration = generateLakehouseConfiguration(properties);
-        String schemaTopic = schemaTopic(topic, properties);
+        String schemaTopic = KafkaSourceMetadata.topicName(topic, properties);
         var dynamicConfigs = resolveDynamicConfigs(lakehouseConfiguration);
         if (!dynamicConfigs.sdtEnabled()) {
             log.info("Skip creating the external writer for the topic {} because sdt is disabled", topic);
@@ -234,7 +234,4 @@ public class LakehouseFactory implements AutoCloseable {
         );
     }
 
-    private static String schemaTopic(String destinationTopic, Map<String, String> properties) {
-        return KafkaEntryProcessFactory.resolveSchemaTopic(destinationTopic, properties);
-    }
 }

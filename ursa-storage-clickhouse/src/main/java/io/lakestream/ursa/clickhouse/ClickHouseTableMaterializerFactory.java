@@ -17,18 +17,17 @@ import io.lakestream.ursa.materialization.MaterializationRuntime;
 import io.lakestream.ursa.materialization.TableMaterializer;
 import io.lakestream.ursa.materialization.TableMaterializerFactory;
 import io.lakestream.ursa.materialization.serde.EntryEncoder;
-import io.lakestream.ursa.materialization.serde.EntryFormat;
 import io.lakestream.ursa.materialization.serde.EntrySerdeFactory;
 import io.lakestream.ursa.materialization.serde.EntrySerdeFactory.SerdeType;
 import io.lakestream.ursa.materialization.serde.SchemaService;
 import io.lakestream.ursa.materialization.serde.TableSchemaService;
 import io.lakestream.ursa.materialization.serde.kafka.KafkaSchemaService;
+import io.lakestream.ursa.materialization.serde.kafka.KafkaSourceMetadata;
 import java.sql.Connection;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.regex.Pattern;
 import javax.annotation.Nullable;
 
 /**
@@ -41,8 +40,6 @@ import javax.annotation.Nullable;
  * ClickHouse catalog.
  */
 public final class ClickHouseTableMaterializerFactory implements TableMaterializerFactory {
-
-    private static final Pattern PARTITION_SUFFIX = Pattern.compile("-partition-\\d+$");
 
     @Override
     public TableCatalogType catalogType() {
@@ -81,7 +78,6 @@ public final class ClickHouseTableMaterializerFactory implements TableMaterializ
             // Ensure the ClickHouse serde providers are registered before constructing the factory.
             ClickHouseSerdeRegistry.ensureRegistered();
             SchemaService<?> sourceSchemaService = runtime.schemaService();
-            EntryFormat entryFormat = runtime.entryFormat();
             EntryEncoder<Map<String, Object>> rowEncoder = null;
             if (sourceSchemaService instanceof KafkaSchemaService) {
                 rowEncoder = new EntrySerdeFactory(sourceSchemaService).getEncoder(SerdeType.KAFKA_CLICKHOUSE);
@@ -93,11 +89,11 @@ public final class ClickHouseTableMaterializerFactory implements TableMaterializ
                 ClickHouseTableSchemaService chSchemaService = new ClickHouseTableSchemaService(
                         connection, tableId, engine, primaryKey, sourceTopic);
                 return new ClickHouseTableMaterializer(connection, tableId, engine, primaryKey, batchSize,
-                        chSchemaService, rowEncoder, entryFormat, sourceTopic);
+                        chSchemaService, rowEncoder, sourceTopic);
             }
             return new ClickHouseTableMaterializer(
                     connection, tableId, engine, primaryKey, batchSize,
-                    null, null, entryFormat, null);
+                    null, null, null);
         } catch (RuntimeException | Error constructionFailure) {
             try {
                 connection.close();
@@ -109,16 +105,8 @@ public final class ClickHouseTableMaterializerFactory implements TableMaterializ
     }
 
     static String sourceTopic(Stream stream, MaterializationRuntime runtime) {
-        String destinationIdentity = stream.identifier().fullName();
-        String schemaTopic = runtime.taskProperties().get("sourceSchemaTopic");
-        if (schemaTopic != null && !schemaTopic.isBlank()) {
-            return schemaTopic;
-        }
-        String sourceTopic = runtime.taskProperties().get("sourceTopic");
-        String legacyTopic = sourceTopic == null || sourceTopic.isBlank()
-                ? destinationIdentity : sourceTopic;
-        int localNameStart = legacyTopic.lastIndexOf('/') + 1;
-        return PARTITION_SUFFIX.matcher(legacyTopic.substring(localNameStart)).replaceFirst("");
+        return KafkaSourceMetadata.topicName(
+                stream.identifier().fullName(), runtime.taskProperties());
     }
 
     @Override

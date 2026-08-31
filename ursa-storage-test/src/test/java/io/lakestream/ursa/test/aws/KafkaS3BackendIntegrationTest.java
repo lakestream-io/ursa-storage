@@ -32,26 +32,26 @@ class KafkaS3BackendIntegrationTest {
     }
 
     @Test
-    void roundTripsKafkaFrame() throws Exception {
+    void roundTripsKafkaMemoryRecords() throws Exception {
         var config = new StorageConfig();
         config.setRegion(S3.getRegion());
         config.setBucket(BUCKET);
-        config.setPrefix("frames");
+        config.setPrefix("records");
         config.setCloudStorageEndpoint(S3.endpoint().toString());
         config.setS3AccessKeyId(S3.getAccessKey());
         config.setS3SecretAccessKey(S3.getSecretKey());
 
         try (var storage = new S3FileStorage(config, InstrumentProvider.NOOP)) {
-            ByteBuf frame = KafkaBackendTestSupport.frame();
+            ByteBuf payload = KafkaBackendTestSupport.payload();
             try {
-                storage.put(frame, "orders/17");
+                storage.put(payload, "orders/17");
             } finally {
-                frame.release();
+                payload.release();
             }
 
             ByteBuf stored = storage.get("orders/17");
             try {
-                KafkaBackendTestSupport.assertFrame(stored);
+                KafkaBackendTestSupport.assertPayload(stored);
             } finally {
                 stored.release();
             }

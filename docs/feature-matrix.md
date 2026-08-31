@@ -4,11 +4,11 @@ Each feature below lists supported options as columns. ✔ = Supported  ✖ 
 
 ## Data Formats
 
-### Entry Format
+### Stored Entry Payload
 
-|                | Kafka Records | Arrow |
-|:---------------|:-------------:|:-----:|
-| **Supported**  |      ✔        |  ✖    |
+|                | Kafka MemoryRecords | Arrow |
+|:---------------|:-------------------:|:-----:|
+| **Supported**  |          ✔          |  ✖    |
 
 
 ### WO Format

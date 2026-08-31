@@ -7,8 +7,6 @@ package io.lakestream.ursa.materialization.serde.kafka;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.lakestream.api.EntryHeader;
-import io.lakestream.ursa.materialization.serde.EntryFormat;
-import io.lakestream.ursa.materialization.serde.KafkaEntry;
 import io.lakestream.ursa.materialization.util.EntryUtils;
 import io.lakestream.ursa.materialization.util.KafkaMessage;
 import io.lakestream.ursa.storage.Entry;
@@ -21,10 +19,10 @@ import org.apache.kafka.common.record.MemoryRecords;
 import org.apache.kafka.common.record.SimpleRecord;
 import org.junit.jupiter.api.Test;
 
-class EntryUtilsKafkaFramingTest {
+class EntryUtilsMemoryRecordsTest {
 
     @Test
-    void ursaFormatVisitsEveryRecordInMemoryRecords() throws Exception {
+    void visitsEveryRecordInMemoryRecords() throws Exception {
         MemoryRecords records = MemoryRecords.withRecords(
                 Compression.NONE,
                 new SimpleRecord(KafkaBrokerEntryFixtures.RECORD_TIMESTAMP, bytes("one")),
@@ -34,7 +32,7 @@ class EntryUtilsKafkaFramingTest {
         Entry entry = entry(payload, 9L, 3);
         List<KafkaMessage> messages = new ArrayList<>();
         try {
-            EntryUtils.entryToKafkaMessage(entry, EntryFormat.URSA, messages::add);
+            EntryUtils.entryToKafkaMessage(entry, messages::add);
 
             assertThat(messages).extracting(KafkaMessage::offset).containsExactly(9L, 10L, 11L);
             assertThat(messages).extracting(message -> new String(message.value(), StandardCharsets.UTF_8))
@@ -46,12 +44,16 @@ class EntryUtilsKafkaFramingTest {
     }
 
     @Test
-    void kafkaFormatKeepsTheNormalizedSingleRecordPath() throws Exception {
-        ByteBuf payload = new KafkaEntry(bytes("key"), bytes("value")).toByteBuf();
+    void preservesKeyAndValueFromOneRecordMemoryRecords() throws Exception {
+        MemoryRecords records = MemoryRecords.withRecords(
+                0L,
+                Compression.NONE,
+                new SimpleRecord(KafkaBrokerEntryFixtures.RECORD_TIMESTAMP, bytes("key"), bytes("value")));
+        ByteBuf payload = KafkaBrokerEntryFixtures.rawEntry(records);
         Entry entry = entry(payload, 17L, 1);
         List<KafkaMessage> messages = new ArrayList<>();
         try {
-            EntryUtils.entryToKafkaMessage(entry, EntryFormat.KAFKA, messages::add);
+            EntryUtils.entryToKafkaMessage(entry, messages::add);
 
             assertThat(messages).singleElement().satisfies(message -> {
                 assertThat(message.offset()).isEqualTo(17L);

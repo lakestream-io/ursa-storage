@@ -16,7 +16,6 @@ import io.lakestream.ursa.exception.RuntimeExceptionWithCode;
 import io.lakestream.ursa.lakehouse.v2.IWriteResult;
 import io.lakestream.ursa.lakehouse.v2.LakehouseFactory;
 import io.lakestream.ursa.lakehouse.v2.LakehouseRecordWriter;
-import io.lakestream.ursa.materialization.serde.EntryFormat;
 import io.lakestream.ursa.materialization.serde.GenericEntry;
 import io.lakestream.ursa.storage.impl.StorageConfig;
 import io.opentelemetry.api.common.AttributeKey;
@@ -25,7 +24,6 @@ import io.opentelemetry.api.common.AttributesBuilder;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import lombok.Getter;
@@ -46,7 +44,6 @@ public class LakehouseCompactionWorker implements CompactionTaskProcessor {
     private final long readTimeoutSeconds;
     private final long maxWaitForTxnResolutionSeconds;
     private final CompactionTaskCompleter taskCompleter;
-    private final EntryFormat entryFormat;
     // Tracks when each task was first attempted by this worker, so the reader can bound its wait
     // on potentially-pending transactions. Reset on worker restart (over-wait, safe direction).
     private final ConcurrentHashMap<String, Long> firstAttemptTimes = new ConcurrentHashMap<>();
@@ -61,18 +58,10 @@ public class LakehouseCompactionWorker implements CompactionTaskProcessor {
                                   EntryProcessFactory entryReaderFactory,
                                   CompactTaskManager compactTaskManager, CompactionMetrics metrics,
                                   StorageConfig storageConfig) {
-        this(lakehouseFactory, entryReaderFactory, compactTaskManager, metrics, storageConfig, EntryFormat.URSA);
-    }
-
-    public LakehouseCompactionWorker(LakehouseFactory lakehouseFactory,
-                                  EntryProcessFactory entryReaderFactory,
-                                  CompactTaskManager compactTaskManager, CompactionMetrics metrics,
-                                  StorageConfig storageConfig, EntryFormat entryFormat) {
         this.lakehouseFactory = lakehouseFactory;
         this.entryReaderFactory = entryReaderFactory;
         this.compactTaskManager = compactTaskManager;
         this.compactionMetrics = metrics;
-        this.entryFormat = entryFormat;
         this.managedTableSchemaEvolutionEnabled = Boolean.parseBoolean(storageConfig
             .getProperties().getOrDefault("managedTableSchemaEvolutionEnabled", "false").toString());
         this.skipMarkerMessages = Boolean.parseBoolean(storageConfig.getProperties()
@@ -99,7 +88,6 @@ public class LakehouseCompactionWorker implements CompactionTaskProcessor {
         if (task.getProperties() != null) {
             propertiesForWriter.putAll(task.getProperties());
         }
-        propertiesForWriter.put("entryFormat", entryFormat.name());
         long firstAttemptTimeMs = firstAttemptTimes.computeIfAbsent(task.getTaskName(),
             k -> System.currentTimeMillis());
         var entryReaderOptions = new EntryReaderOptions(skipMarkerMessages, readTimeoutSeconds,
@@ -110,7 +98,7 @@ public class LakehouseCompactionWorker implements CompactionTaskProcessor {
         long totalReadSize = 0;
         try (var reader =
                  entryReaderFactory.createEntryReader(topic, streamId, startOffset, endOffset, avgEntrySize.get(),
-                     entryReaderOptions, propertiesForWriter)) {
+                     entryReaderOptions)) {
             managedWriter = lakehouseFactory.getManagedWriter(topic, propertiesForWriter);
             externalWriter = lakehouseFactory.getExternalWriter(topic, propertiesForWriter);
             dltWriter = externalWriter.flatMap(writer -> {
@@ -214,11 +202,6 @@ public class LakehouseCompactionWorker implements CompactionTaskProcessor {
         }
         return new ExceptionWithCode(ExceptionCode.INTERNAL_ERROR,
                 "Failed to compact the data into the lakehouse", error);
-    }
-
-    @VisibleForTesting
-    static String sourceTopic(String taskTopic, Map<String, String> taskProperties, EntryFormat entryFormat) {
-        return KafkaEntryProcessFactory.resolveSourceTopic(taskTopic, entryFormat, taskProperties);
     }
 
     @VisibleForTesting

@@ -41,7 +41,7 @@ public final class LakehouseDeltaUcTableMaterializerFactory implements TableMate
                 LakehouseWriterFactory.deltaUc(policy, resolvedCatalog, stream, runtime);
         Optional<LakehouseRecordWriter<FailureMessage>> dltWriter =
                 LakehouseWriterFactory.externalDltWriter(policy, resolvedCatalog, stream, "delta",
-                        runtime.entryFormat(), runtime.taskProperties());
+                        runtime.taskProperties());
         dltWriter.ifPresent(dlt -> writer.registerFailureMessageHandler(DLTFailureMessageHandler.of(dlt)));
         return new LakehouseTableMaterializer(writer, EvolutionPolicy.forDelta(), dltWriter.orElse(null));
     }

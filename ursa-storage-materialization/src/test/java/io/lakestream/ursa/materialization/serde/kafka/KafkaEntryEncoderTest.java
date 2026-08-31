@@ -13,14 +13,14 @@ import io.lakestream.api.EntryHeader;
 import io.lakestream.ursa.exception.ExceptionCode;
 import io.lakestream.ursa.exception.MessageSerDeException;
 import io.lakestream.ursa.materialization.serde.EntryEncoderContext;
-import io.lakestream.ursa.materialization.serde.EntryFormat;
 import io.lakestream.ursa.materialization.serde.GenericEntry;
-import io.lakestream.ursa.materialization.serde.KafkaEntry;
+import io.lakestream.ursa.materialization.serde.LakehouseEntryMetadata;
 import io.lakestream.ursa.materialization.serde.MaterializationRecord;
 import io.lakestream.ursa.materialization.serde.ResultConsumer;
 import io.lakestream.ursa.materialization.serde.SchemaKey;
 import io.lakestream.ursa.materialization.serde.TableSchemaService;
 import io.lakestream.ursa.materialization.serde.exception.FatalException;
+import io.lakestream.ursa.materialization.util.KafkaMessage;
 import io.lakestream.ursa.storage.Entry;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
@@ -37,7 +37,7 @@ class KafkaEntryEncoderTest {
 
     @Test
     void releasesConsumedEntryOnSuccess() {
-        ByteBuf payload = new KafkaEntry(null, "value".getBytes(StandardCharsets.UTF_8)).toByteBuf();
+        ByteBuf payload = singleRecord(null, bytes("value"));
         GenericEntry entry = genericEntry(payload);
         AtomicReference<MaterializationRecord<String>> result = new AtomicReference<>();
 
@@ -51,7 +51,7 @@ class KafkaEntryEncoderTest {
             public void onErrorWithCtx(Object context, Throwable throwable) {
                 throw new AssertionError(throwable);
             }
-        }, null, EntryEncoderContext.builder().entryFormat(EntryFormat.KAFKA).build());
+        }, null, EntryEncoderContext.builder().build());
 
         assertThat(payload.refCnt()).isZero();
         assertThat(result.get().record()).isEqualTo("value");
@@ -60,7 +60,7 @@ class KafkaEntryEncoderTest {
 
     @Test
     void createsOwnedSingleRecordErrorContext() {
-        ByteBuf payload = new KafkaEntry(null, "value".getBytes(StandardCharsets.UTF_8)).toByteBuf();
+        ByteBuf payload = singleRecord(null, bytes("value"));
         GenericEntry entry = genericEntry(payload);
         AtomicReference<GenericEntry> errorContext = new AtomicReference<>();
 
@@ -74,12 +74,11 @@ class KafkaEntryEncoderTest {
             public void onErrorWithCtx(Object context, Throwable throwable) {
                 errorContext.set((GenericEntry) context);
             }
-        }, null, EntryEncoderContext.builder().entryFormat(EntryFormat.KAFKA).build());
+        }, null, EntryEncoderContext.builder().build());
 
         assertThat(errorContext.get()).isNotSameAs(entry);
         assertThat(errorContext.get().entry().header().offset()).isEqualTo(7L);
-        assertThat(KafkaEntry.fromByteBuf(errorContext.get().entry().payload().duplicate()).value())
-                .isEqualTo(bytes("value"));
+        assertSingleValue(errorContext.get(), "value");
         assertThat(payload.refCnt()).isZero();
         assertThat(errorContext.get().entry().payload().refCnt()).isOne();
         errorContext.get().entry().payload().release();
@@ -87,7 +86,7 @@ class KafkaEntryEncoderTest {
 
     @Test
     void rawRecordRemainsPrimitiveWhenTopicAlsoHasRegisteredSchemas() {
-        ByteBuf payload = new KafkaEntry(null, "raw-value".getBytes(StandardCharsets.UTF_8)).toByteBuf();
+        ByteBuf payload = singleRecord(null, bytes("raw-value"));
         AtomicReference<MaterializationRecord<String>> result = new AtomicReference<>();
 
         encoder(false, true).encode("events", genericEntry(payload), new ResultConsumer<>() {
@@ -100,14 +99,14 @@ class KafkaEntryEncoderTest {
             public void onErrorWithCtx(Object context, Throwable throwable) {
                 throw new AssertionError(throwable);
             }
-        }, null, EntryEncoderContext.builder().entryFormat(EntryFormat.KAFKA).build());
+        }, null, EntryEncoderContext.builder().build());
 
         assertThat(result.get().record()).isEqualTo("raw-value");
         assertThat(payload.refCnt()).isZero();
     }
 
     @Test
-    void decodesMemoryRecordsIntoOneResultPerRecordWithAbsoluteOffsetsAndEventTimes() {
+    void decodesMemoryRecordsIntoOneResultPerRecordWithAbsoluteOffsetsAndEventTimes() throws Exception {
         MemoryRecords firstBatch = MemoryRecords.withRecords(
                 0L,
                 Compression.gzip().build(),
@@ -137,7 +136,7 @@ class KafkaEntryEncoderTest {
             public void onErrorWithCtx(Object context, Throwable throwable) {
                 throw new AssertionError(throwable);
             }
-        }, null, EntryEncoderContext.builder().entryFormat(EntryFormat.URSA).build());
+        }, null, EntryEncoderContext.builder().build());
 
         assertThat(payload.refCnt()).isZero();
         assertThat(results).extracting(MaterializationRecord::record)
@@ -147,6 +146,18 @@ class KafkaEntryEncoderTest {
         assertThat(results).extracting(result -> result.metadata().orElseThrow()
                         .getLakehouseEntryOffset().entryId())
                 .containsExactly(100L, 101L, 102L);
+        assertThat(results).extracting(result -> result.metadata().orElseThrow()
+                        .getEntryHeader().offset())
+                .containsExactly(100L, 101L, 102L);
+        assertThat(results).allSatisfy(result -> assertThat(result.metadata().orElseThrow()
+                .getEntryHeader().numberOfMessages()).isOne());
+        List<Long> persistedOffsets = new ArrayList<>();
+        for (MaterializationRecord<String> result : results) {
+            LakehouseEntryMetadata persisted = LakehouseEntryMetadata.of(
+                    result.metadata().orElseThrow().serializeTo());
+            persistedOffsets.add(persisted.getEntryHeader().offset());
+        }
+        assertThat(persistedOffsets).containsExactly(100L, 101L, 102L);
         assertThat(contexts).extracting(EntryEncoderContext::messageOffset)
                 .containsExactly("100", "101", "102");
         assertThat(contexts).extracting(EntryEncoderContext::eventTime)
@@ -181,13 +192,12 @@ class KafkaEntryEncoderTest {
                     public void onErrorWithCtx(Object context, Throwable throwable) {
                         errorContext.set((GenericEntry) context);
                     }
-                }, null, EntryEncoderContext.builder().entryFormat(EntryFormat.URSA).build());
+                }, null, EntryEncoderContext.builder().build());
 
         assertThat(results).containsExactly("one", "three");
         assertThat(payload.refCnt()).isZero();
         assertThat(errorContext.get().entry().header().offset()).isEqualTo(21L);
-        assertThat(KafkaEntry.fromByteBuf(errorContext.get().entry().payload().duplicate()).value())
-                .isEqualTo(bytes("bad"));
+        assertSingleValue(errorContext.get(), "bad");
         errorContext.get().entry().payload().release();
     }
 
@@ -208,7 +218,7 @@ class KafkaEntryEncoderTest {
                 ((GenericEntry) context).entry().payload().release();
                 throw callbackFailure;
             }
-        }, null, EntryEncoderContext.builder().entryFormat(EntryFormat.URSA).build()))
+        }, null, EntryEncoderContext.builder().build()))
                 .isSameAs(callbackFailure);
 
         assertThat(payload.refCnt()).isZero();
@@ -230,7 +240,7 @@ class KafkaEntryEncoderTest {
             public void onErrorWithCtx(Object context, Throwable throwable) {
                 failureContext.set((GenericEntry) context);
             }
-        }, null, EntryEncoderContext.builder().entryFormat(EntryFormat.URSA).build());
+        }, null, EntryEncoderContext.builder().build());
 
         assertThat(failureContext.get()).isSameAs(entry);
         assertThat(payload.refCnt()).isOne();
@@ -240,7 +250,7 @@ class KafkaEntryEncoderTest {
 
     @Test
     void callbackOwnsSingleRecordErrorContextEvenWhenItThrows() {
-        ByteBuf payload = new KafkaEntry(null, bytes("value")).toByteBuf();
+        ByteBuf payload = singleRecord(null, bytes("value"));
         GenericEntry entry = genericEntry(payload);
         AtomicReference<ByteBuf> failurePayload = new AtomicReference<>();
         RuntimeException callbackFailure = new RuntimeException("callback failed");
@@ -258,7 +268,7 @@ class KafkaEntryEncoderTest {
                 ownedPayload.release();
                 throw callbackFailure;
             }
-        }, null, EntryEncoderContext.builder().entryFormat(EntryFormat.KAFKA).build()))
+        }, null, EntryEncoderContext.builder().build()))
                 .isInstanceOf(FatalException.class)
                 .hasCause(callbackFailure);
 
@@ -270,6 +280,21 @@ class KafkaEntryEncoderTest {
         EntryHeader header = new EntryHeader(7L, 1, 11L,
                 payload.readableBytes(), payload.readableBytes());
         return new GenericEntry(new Entry(header, payload));
+    }
+
+    private static ByteBuf singleRecord(byte[] key, byte[] value) {
+        MemoryRecords records = MemoryRecords.withRecords(
+                0L,
+                Compression.NONE,
+                new SimpleRecord(KafkaBrokerEntryFixtures.RECORD_TIMESTAMP, key, value));
+        return KafkaBrokerEntryFixtures.rawEntry(records);
+    }
+
+    private static void assertSingleValue(GenericEntry entry, String expectedValue) {
+        List<KafkaMessage> messages = KafkaStorageEntryDecoder.decode(
+                entry.entry().payload().duplicate(), entry.entry().header().offset(), 1);
+        assertThat(messages).singleElement().satisfies(message ->
+                assertThat(message.value()).isEqualTo(bytes(expectedValue)));
     }
 
     private static KafkaEntryEncoder<String> encoder(boolean fail) {

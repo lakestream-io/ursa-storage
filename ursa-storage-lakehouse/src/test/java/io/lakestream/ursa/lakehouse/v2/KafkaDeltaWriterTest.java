@@ -14,34 +14,33 @@ import io.confluent.kafka.serializers.KafkaAvroSerializerConfig;
 import io.delta.kernel.data.ColumnVector;
 import io.delta.kernel.data.MapValue;
 import io.delta.kernel.data.Row;
-import io.lakestream.ursa.lakehouse.compact.EntryReaderOptions;
-import io.lakestream.ursa.lakehouse.compact.KafkaEntryReader;
+import io.lakestream.api.EntryHeader;
 import io.lakestream.ursa.lakehouse.delta.GenericRow;
 import io.lakestream.ursa.lakehouse.v2.serde.delta.KafkaEntryToDeltaRecordEncoder;
 import io.lakestream.ursa.materialization.serde.EntryEncoderContext;
-import io.lakestream.ursa.materialization.serde.EntryFormat;
 import io.lakestream.ursa.materialization.serde.GenericEntry;
 import io.lakestream.ursa.materialization.serde.MaterializationRecord;
 import io.lakestream.ursa.materialization.serde.ResultConsumer;
 import io.lakestream.ursa.materialization.serde.kafka.KafkaSchemaService;
 import io.lakestream.ursa.materialization.util.kafka.json.KafkaJsonSchemaSerializer;
+import io.lakestream.ursa.storage.Entry;
 import io.lakestream.ursa.test.containers.util.KafkaStandalone;
+import io.netty.buffer.Unpooled;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Properties;
 import lombok.Cleanup;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.commons.lang3.RandomStringUtils;
-import org.apache.kafka.clients.producer.KafkaProducer;
-import org.apache.kafka.clients.producer.ProducerConfig;
-import org.apache.kafka.clients.producer.ProducerRecord;
-import org.apache.kafka.common.serialization.StringSerializer;
+import org.apache.kafka.common.compress.Compression;
+import org.apache.kafka.common.record.MemoryRecords;
+import org.apache.kafka.common.record.SimpleRecord;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -64,25 +63,20 @@ public class KafkaDeltaWriterTest {
         }
     }
 
-    record ProducedMessage<T>(T content, long offset) { }
+    record ProducedMessage<T>(T content, byte[] key, byte[] serializedValue, long offset) { }
 
     @Test
     void simpleTest() throws Exception {
         var topic = "topic-" + RandomStringUtils.secure().nextAlphabetic(4);
         var numberOfMessages = 10;
 
-        @Cleanup
-        var producer = new KafkaProducer<String, byte[]>(kafkaStandalone.producerProps());
         List<ProducedMessage<byte[]>> messages = new ArrayList<>();
         for (int i = 0; i < numberOfMessages; i++) {
             var value = ("message" + i).getBytes(StandardCharsets.UTF_8);
-            var metadata = producer.send(new ProducerRecord<>(topic, (String) null, value)).get();
-            log.info("send offset: {}", metadata.offset());
-            messages.add(new ProducedMessage<>(value, metadata.offset()));
+            messages.add(new ProducedMessage<>(value, null, value, i));
         }
 
-        var result = encodeEntries(topic, messages.get(0).offset(),
-                messages.get(numberOfMessages - 1).offset() + 1);
+        var result = encodeEntries(topic, messages);
 
         assertEquals(numberOfMessages, result.size());
         for (int i = 0; i < result.size(); i++) {
@@ -144,7 +138,9 @@ public class KafkaDeltaWriterTest {
         var numberOfMessages = 5;
 
         @Cleanup
-        var producer = jsonProducer();
+        var serializer = new KafkaJsonSchemaSerializer<Object>(
+                kafkaStandalone.getSchemaRegistryClient(),
+                Map.of("schema.registry.url", "unused", "auto.register.schemas", true));
         List<ProducedMessage<JsonValue>> messages = new ArrayList<>();
         for (int i = 0; i < numberOfMessages; i++) {
             var nested = new JsonNestedValue();
@@ -156,12 +152,11 @@ public class KafkaDeltaWriterTest {
             value.setTags(Map.of("k" + i, "v" + i));
             value.setNested(nested);
 
-            var metadata = producer.send(new ProducerRecord<>(topic, "key-" + i, value)).get();
-            messages.add(new ProducedMessage<>(value, metadata.offset()));
+            byte[] key = ("key-" + i).getBytes(StandardCharsets.UTF_8);
+            messages.add(new ProducedMessage<>(value, key, serializer.serialize(topic, value), i));
         }
 
-        var result = encodeEntries(topic, messages.get(0).offset(),
-                messages.get(numberOfMessages - 1).offset() + 1);
+        var result = encodeEntries(topic, messages);
 
         assertEquals(numberOfMessages, result.size());
         for (int i = 0; i < result.size(); i++) {
@@ -223,7 +218,8 @@ public class KafkaDeltaWriterTest {
         var numberOfMessages = 5;
 
         @Cleanup
-        var producer = avroProducer();
+        var serializer = new KafkaAvroSerializer(kafkaStandalone.getSchemaRegistryClient());
+        serializer.configure(Map.of(KafkaAvroSerializerConfig.SCHEMA_REGISTRY_URL_CONFIG, "unused"), false);
         List<ProducedMessage<GenericRecord>> messages = new ArrayList<>();
         for (int i = 0; i < numberOfMessages; i++) {
             var nestedSchema = AVRO_VALUE_SCHEMA.getField("nested").schema();
@@ -236,12 +232,11 @@ public class KafkaDeltaWriterTest {
             value.put("tags", Map.of("k" + i, "v" + i));
             value.put("nested", nested);
 
-            var metadata = producer.send(new ProducerRecord<>(topic, "key-" + i, value)).get();
-            messages.add(new ProducedMessage<>(value, metadata.offset()));
+            byte[] key = ("key-" + i).getBytes(StandardCharsets.UTF_8);
+            messages.add(new ProducedMessage<>(value, key, serializer.serialize(topic, value), i));
         }
 
-        var result = encodeEntries(topic, messages.get(0).offset(),
-                messages.get(numberOfMessages - 1).offset() + 1);
+        var result = encodeEntries(topic, messages);
 
         assertEquals(numberOfMessages, result.size());
         for (int i = 0; i < result.size(); i++) {
@@ -260,21 +255,15 @@ public class KafkaDeltaWriterTest {
         }
     }
 
-    private ArrayList<MaterializationRecord<GenericRow>> encodeEntries(String topic, long startOffset, long endOffset)
-        throws Exception {
-        @Cleanup
-        var reader = new KafkaEntryReader(topic, startOffset, endOffset, 1024.0,
-            EntryReaderOptions.DEFAULT, kafkaStandalone.consumerProps());
-
+    private ArrayList<MaterializationRecord<GenericRow>> encodeEntries(
+            String topic, List<? extends ProducedMessage<?>> messages) {
         var schemaService = new KafkaSchemaService(kafkaStandalone.getSchemaRegistryClient(), false);
         var encoder = new KafkaEntryToDeltaRecordEncoder(schemaService);
 
         var result = new ArrayList<MaterializationRecord<GenericRow>>();
-        GenericEntry entry;
-        while ((entry = reader.read()) != null) {
-            var encodeContext = EntryEncoderContext.builder()
-                .entryFormat(EntryFormat.KAFKA)
-                .build();
+        for (ProducedMessage<?> message : messages) {
+            GenericEntry entry = rawEntry(message);
+            var encodeContext = EntryEncoderContext.builder().build();
             encoder.encode(topic, entry, new ResultConsumer<MaterializationRecord<GenericRow>>() {
                 @Override
                 public void onResult(MaterializationRecord<GenericRow> recordLakehouseEntry) {
@@ -290,6 +279,18 @@ public class KafkaDeltaWriterTest {
         return result;
     }
 
+    private static GenericEntry rawEntry(ProducedMessage<?> message) {
+        MemoryRecords records = MemoryRecords.withRecords(
+                0L, Compression.NONE,
+                new SimpleRecord(1_700_000_000_000L, message.key(), message.serializedValue()));
+        ByteBuffer recordsBuffer = records.buffer().duplicate();
+        var payload = Unpooled.buffer(recordsBuffer.remaining());
+        payload.writeBytes(recordsBuffer);
+        var header = new EntryHeader(
+                message.offset(), 1, 1_700_000_000_000L, payload.readableBytes(), message.offset());
+        return new GenericEntry(new Entry(header, payload));
+    }
+
     private Map<String, String> toJavaMap(MapValue mapValue) {
         Map<String, String> result = new HashMap<>();
         ColumnVector keys = mapValue.getKeys();
@@ -300,19 +301,4 @@ public class KafkaDeltaWriterTest {
         return result;
     }
 
-    private KafkaProducer<String, Object> jsonProducer() {
-        Properties props = kafkaStandalone.connProps();
-        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
-        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, KafkaJsonSchemaSerializer.class);
-        props.put(KafkaAvroSerializerConfig.SCHEMA_REGISTRY_URL_CONFIG, kafkaStandalone.getSchemaRegistryUrl());
-        return new KafkaProducer<>(props);
-    }
-
-    private KafkaProducer<String, Object> avroProducer() {
-        Properties props = kafkaStandalone.connProps();
-        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
-        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, KafkaAvroSerializer.class);
-        props.put(KafkaAvroSerializerConfig.SCHEMA_REGISTRY_URL_CONFIG, kafkaStandalone.getSchemaRegistryUrl());
-        return new KafkaProducer<>(props);
-    }
 }

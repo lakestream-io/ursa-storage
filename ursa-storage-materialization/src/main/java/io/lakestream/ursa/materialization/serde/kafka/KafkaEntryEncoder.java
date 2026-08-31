@@ -11,9 +11,7 @@ import io.lakestream.ursa.exception.ExceptionCode;
 import io.lakestream.ursa.exception.ExceptionWithCode;
 import io.lakestream.ursa.exception.MessageSerDeException;
 import io.lakestream.ursa.materialization.serde.EntryEncoderContext;
-import io.lakestream.ursa.materialization.serde.EntryFormat;
 import io.lakestream.ursa.materialization.serde.GenericEntry;
-import io.lakestream.ursa.materialization.serde.KafkaEntry;
 import io.lakestream.ursa.materialization.serde.LakehouseEntryMetadata;
 import io.lakestream.ursa.materialization.serde.MaterializationRecord;
 import io.lakestream.ursa.materialization.serde.ResultConsumer;
@@ -25,11 +23,12 @@ import io.lakestream.ursa.materialization.serde.exception.FatalException;
 import io.lakestream.ursa.materialization.util.KafkaMessage;
 import io.lakestream.ursa.materialization.util.PBRecordReader;
 import io.lakestream.ursa.storage.Entry;
+import io.netty.buffer.ByteBuf;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Optional;
 
-/** Decodes Kafka records from either a raw broker WAL batch or a normalized direct-Kafka entry. */
+/** Decodes Kafka records from a native {@code MemoryRecords} storage entry. */
 public abstract class KafkaEntryEncoder<T> {
 
     protected final KafkaSchemaService schemaService;
@@ -51,7 +50,8 @@ public abstract class KafkaEntryEncoder<T> {
                        TableSchemaService tableSchemaService, EntryEncoderContext context) {
         var entry = genericEntry.entry();
         try {
-            List<KafkaMessage> messages = decodeMessages(entry, context.entryFormat());
+            List<KafkaMessage> messages = KafkaStorageEntryDecoder.decode(
+                    entry.payload().duplicate(), entry.header().offset(), entry.header().numberOfMessages());
             for (KafkaMessage message : messages) {
                 try {
                     encodeMessage(topic, entry, message, consumer, tableSchemaService, context);
@@ -89,10 +89,14 @@ public abstract class KafkaEntryEncoder<T> {
         }
         ProcessResult<T> processResult = processKafkaMessage(
                 topic, message, tableSchemaService, messageContextBuilder.build());
+        EntryHeader sourceHeader = entry.header();
+        EntryHeader messageHeader = new EntryHeader(
+                message.offset(), 1, sourceHeader.writtenTimestamp(),
+                sourceHeader.entrySize(), sourceHeader.cumulativeSize());
         LakehouseEntryMetadata metadata = new LakehouseEntryMetadata();
-        metadata.setEntryHeader(entry.header());
+        metadata.setEntryHeader(messageHeader);
         metadata.setSchemaVersion(processResult.schemaVersion());
-        metadata.setNumberOfMessagesInBatch(entry.header().numberOfMessages());
+        metadata.setNumberOfMessagesInBatch(sourceHeader.numberOfMessages());
         metadata.setLakehouseEntryOffset(message.offset(), 0);
         metadata.setNeedToPersistent(true);
         consumer.onResult(new MaterializationRecord<>(processResult.value(), metadata));
@@ -103,7 +107,7 @@ public abstract class KafkaEntryEncoder<T> {
             KafkaMessage message,
             ResultConsumer<MaterializationRecord<T>> consumer,
             Throwable failure) {
-        var payload = new KafkaEntry(message.key(), message.value()).toByteBuf();
+        ByteBuf payload = KafkaMemoryRecords.encode(message);
         EntryHeader originalHeader = originalEntry.entry().header();
         EntryHeader messageHeader = new EntryHeader(
                 message.offset(), 1, originalHeader.writtenTimestamp(),
@@ -121,15 +125,6 @@ public abstract class KafkaEntryEncoder<T> {
         return failure instanceof ExceptionWithCode exceptionWithCode
                 ? exceptionWithCode
                 : new MessageSerDeException(ExceptionCode.MESSAGE_DESERIALIZE_FROM_SOURCE_ERROR, failure);
-    }
-
-    private static List<KafkaMessage> decodeMessages(Entry entry, EntryFormat entryFormat) {
-        if (entryFormat == EntryFormat.KAFKA) {
-            KafkaEntry kafkaEntry = KafkaEntry.fromByteBuf(entry.payload().duplicate());
-            return List.of(new KafkaMessage(entry.header().offset(), kafkaEntry.key(), kafkaEntry.value()));
-        }
-        return KafkaStorageEntryDecoder.decode(
-                entry.payload().duplicate(), entry.header().offset(), entry.header().numberOfMessages());
     }
 
     protected ProcessResult<T> processKafkaMessage(String topic, KafkaMessage kafkaMessage,

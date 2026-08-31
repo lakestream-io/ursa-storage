@@ -5,19 +5,21 @@
 package io.lakestream.ursa.materialization.serde.kafka;
 
 import io.confluent.kafka.schemaregistry.client.SchemaMetadata;
+import io.lakestream.api.EntryHeader;
 import io.lakestream.ursa.exception.ExceptionWithCode;
 import io.lakestream.ursa.materialization.serde.GenericEntry;
-import io.lakestream.ursa.materialization.serde.KafkaEntry;
 import io.lakestream.ursa.materialization.serde.MaterializationRecord;
 import io.lakestream.ursa.materialization.serde.ResultConsumer;
 import io.lakestream.ursa.materialization.serde.SchemaCache;
 import io.lakestream.ursa.materialization.serde.SchemaKey;
 import io.lakestream.ursa.materialization.serde.SchemaService;
+import io.lakestream.ursa.materialization.util.KafkaMessage;
 import io.lakestream.ursa.storage.Entry;
 import java.nio.ByteBuffer;
 import java.util.Iterator;
+import java.util.List;
 
-/** Encodes materialized rows back into the one-record Kafka storage framing. */
+/** Encodes materialized rows back into one-record native Kafka {@code MemoryRecords} entries. */
 public abstract class KafkaEntryDecoder<T> {
 
     protected final KafkaSchemaService schemaService;
@@ -50,7 +52,13 @@ public abstract class KafkaEntryDecoder<T> {
                 }
                 var metadata = materialized.metadata().orElseThrow(
                         () -> new IllegalArgumentException("Materialization record metadata is required"));
-                Entry entry = new Entry(metadata.getEntryHeader(), new KafkaEntry(null, valueBytes).toByteBuf());
+                EntryHeader sourceHeader = metadata.getEntryHeader();
+                var payload = KafkaMemoryRecords.encode(new KafkaMessage(
+                        0L, sourceHeader.writtenTimestamp(), null, valueBytes, List.of()));
+                EntryHeader entryHeader = new EntryHeader(
+                        sourceHeader.offset(), 1, sourceHeader.writtenTimestamp(),
+                        payload.readableBytes(), sourceHeader.cumulativeSize());
+                Entry entry = new Entry(entryHeader, payload);
                 consumer.onResult(new GenericEntry(entry, materialized.metadata()));
             } catch (Throwable throwable) {
                 consumer.onErrorWithCtx(materialized, throwable);

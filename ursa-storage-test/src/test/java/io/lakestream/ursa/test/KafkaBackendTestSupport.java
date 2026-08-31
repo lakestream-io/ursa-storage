@@ -6,9 +6,12 @@ package io.lakestream.ursa.test;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import io.lakestream.ursa.materialization.serde.KafkaEntry;
+import io.lakestream.ursa.materialization.serde.kafka.KafkaMemoryRecords;
+import io.lakestream.ursa.materialization.serde.kafka.KafkaStorageEntryDecoder;
+import io.lakestream.ursa.materialization.util.KafkaMessage;
 import io.netty.buffer.ByteBuf;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 
 public final class KafkaBackendTestSupport {
 
@@ -18,13 +21,16 @@ public final class KafkaBackendTestSupport {
     private KafkaBackendTestSupport() {
     }
 
-    public static ByteBuf frame() {
-        return new KafkaEntry(KEY, VALUE).toByteBuf();
+    public static ByteBuf payload() {
+        return KafkaMemoryRecords.encode(new KafkaMessage(
+                0L, 1_700_000_000_000L, KEY, VALUE, List.of()));
     }
 
-    public static void assertFrame(ByteBuf buffer) {
-        KafkaEntry entry = KafkaEntry.fromByteBuf(buffer.duplicate());
-        assertThat(entry.key()).isEqualTo(KEY);
-        assertThat(entry.value()).isEqualTo(VALUE);
+    public static void assertPayload(ByteBuf buffer) {
+        List<KafkaMessage> messages = KafkaStorageEntryDecoder.decode(buffer.duplicate(), 0L, 1);
+        assertThat(messages).singleElement().satisfies(message -> {
+            assertThat(message.key()).isEqualTo(KEY);
+            assertThat(message.value()).isEqualTo(VALUE);
+        });
     }
 }

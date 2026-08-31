@@ -52,26 +52,26 @@ class KafkaGcsBackendIntegrationTest {
     }
 
     @Test
-    void roundTripsKafkaFrame() throws Exception {
+    void roundTripsKafkaMemoryRecords() throws Exception {
         var config = new StorageConfig();
         config.setBucket(BUCKET);
-        config.setPrefix("frames");
+        config.setPrefix("records");
         config.setCloudStorageEndpoint(endpoint);
         var properties = new Properties();
         properties.setProperty("disableCredential", "true");
         config.setProperties(properties);
 
         try (var storage = new GCSFileStorage(config, InstrumentProvider.NOOP)) {
-            ByteBuf frame = KafkaBackendTestSupport.frame();
+            ByteBuf payload = KafkaBackendTestSupport.payload();
             try {
-                storage.put(frame, "orders/17");
+                storage.put(payload, "orders/17");
             } finally {
-                frame.release();
+                payload.release();
             }
 
             ByteBuf stored = storage.get("orders/17");
             try {
-                KafkaBackendTestSupport.assertFrame(stored);
+                KafkaBackendTestSupport.assertPayload(stored);
             } finally {
                 stored.release();
             }

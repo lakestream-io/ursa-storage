@@ -18,7 +18,6 @@ import io.lakestream.ursa.lakehouse.utils.TopicNames;
 import io.lakestream.ursa.lakehouse.v2.io.parquet.ParquetFileWriter;
 import io.lakestream.ursa.materialization.serde.EntryEncoder;
 import io.lakestream.ursa.materialization.serde.EntryEncoderContext;
-import io.lakestream.ursa.materialization.serde.EntryFormat;
 import io.lakestream.ursa.materialization.serde.EntrySerdeFactory;
 import io.lakestream.ursa.materialization.serde.GenericEntry;
 import io.lakestream.ursa.materialization.serde.MaterializationRecord;
@@ -37,7 +36,6 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -113,8 +111,7 @@ public abstract class AbstractLakehouseWriter implements LakehouseRecordWriter<G
                     .isPersistKey(configuration.isPersistKey() && configuration.isSchemaEvolutionEnabled())
                     .isUnityCatalog(isUnityCatalog)
                     .missingSchemaVersionTracker(missingSchemaVersionTracker)
-                    .baseSchemaVersion(baseSchemaVersion)
-                    .entryFormat(getEntryFormat());
+                    .baseSchemaVersion(baseSchemaVersion);
 
             genericEntry.metadata().ifPresent(metadata -> {
                 contextBuilder.schemaVersion(metadata.getSchemaVersion());
@@ -334,20 +331,6 @@ public abstract class AbstractLakehouseWriter implements LakehouseRecordWriter<G
                     missingSchemaVersionCount, topic, partition,
                     missingSchemaVersionTracker.getRecordedMessageIds());
         }
-    }
-
-    protected boolean isUrsaEntry() {
-        return getEntryFormat() == EntryFormat.URSA;
-    }
-
-    protected boolean isKafkaEntry() {
-        return getEntryFormat() == EntryFormat.KAFKA;
-    }
-
-    protected EntryFormat getEntryFormat() {
-        var entryFormat = configuration.getProperties()
-            .getProperty("entryFormat", EntryFormat.URSA.name());
-        return EntryFormat.valueOf(entryFormat.toUpperCase(Locale.ROOT));
     }
 
 }

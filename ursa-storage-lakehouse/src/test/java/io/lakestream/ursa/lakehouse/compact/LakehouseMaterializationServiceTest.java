@@ -26,7 +26,7 @@ import io.lakestream.api.materialization.TableIdentifier;
 import io.lakestream.api.materialization.TableMaterializationPolicy;
 import io.lakestream.ursa.compaction.task.CompactStreamTask;
 import io.lakestream.ursa.exception.ExceptionCode;
-import io.lakestream.ursa.lakehouse.LakehouseConfiguration;
+import io.lakestream.ursa.lakehouse.v2.AbstractLakehouseWriter;
 import io.lakestream.ursa.lakehouse.v2.LakehouseFactory;
 import io.lakestream.ursa.materialization.FailureMessageHandler;
 import io.lakestream.ursa.materialization.MaterializationException;
@@ -37,11 +37,11 @@ import io.lakestream.ursa.materialization.MaterializationServiceProvider;
 import io.lakestream.ursa.materialization.MaterializationTask;
 import io.lakestream.ursa.materialization.TableMaterializer;
 import io.lakestream.ursa.materialization.TableMaterializerFactory;
-import io.lakestream.ursa.materialization.serde.EntryFormat;
 import io.lakestream.ursa.materialization.serde.GenericEntry;
 import io.lakestream.ursa.materialization.serde.SchemaEvolutionManager;
 import io.lakestream.ursa.materialization.serde.SchemaService;
 import io.lakestream.ursa.materialization.serde.TableSchemaService;
+import io.lakestream.ursa.materialization.serde.kafka.KafkaSourceMetadata;
 import io.lakestream.ursa.storage.Entry;
 import io.lakestream.ursa.storage.StorageApi;
 import io.netty.buffer.Unpooled;
@@ -49,7 +49,6 @@ import java.io.IOException;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.Map;
-import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
@@ -96,49 +95,19 @@ class LakehouseMaterializationServiceTest {
     }
 
     @Test
-    void buildEntryProcessFactorySelectsUrsaReaderForUrsaSource() throws Exception {
+    void buildEntryProcessFactoryUsesStorageApi() throws Exception {
         StorageApi storageApi = mock(StorageApi.class);
         service.initialize(runtime.withStorageApi(storageApi), config);
-        EntryProcessFactory factory = service.buildEntryProcessFactory(
-                EntryFormat.URSA, new LakehouseConfiguration(new Properties()), new Properties());
+        EntryProcessFactory factory = service.buildEntryProcessFactory();
         assertThat(factory).isInstanceOf(UrsaEntryProcessFactory.class);
     }
 
     @Test
-    void buildEntryProcessFactoryRequiresStorageApiForUrsaSource() {
-        // URSA source with no StorageApi must fail clearly rather than fall through to the Ursa path.
+    void buildEntryProcessFactoryRequiresStorageApi() {
         service.initialize(runtime, config);
-        assertThatThrownBy(() -> service.buildEntryProcessFactory(
-                EntryFormat.URSA, new LakehouseConfiguration(new Properties()), new Properties()))
+        assertThatThrownBy(() -> service.buildEntryProcessFactory())
                 .isInstanceOf(MaterializationException.class)
                 .hasMessageContaining("StorageApi");
-    }
-
-    @Test
-    void buildEntryProcessFactorySelectsKafkaReaderForKafkaSource() throws Exception {
-        service.initialize(runtime, config);
-        Properties props = new Properties();
-        props.setProperty("kafka.consumer.bootstrap.servers", "localhost:9092");
-        EntryProcessFactory factory = service.buildEntryProcessFactory(
-                EntryFormat.KAFKA, new LakehouseConfiguration(props), props);
-        assertThat(factory).isInstanceOf(KafkaEntryProcessFactory.class);
-    }
-
-    @Test
-    void buildEntryProcessFactoryUsesPassedFormatNotServiceRuntimeFormat() throws Exception {
-        // Regression: the reader source is a PER-TASK property (the compaction task's type), not the
-        // service-level runtime format. Even when the service runtime was initialized as URSA, a KAFKA
-        // task must get the Kafka reader — previously a single cached Ursa factory read the Kafka range
-        // off the WAL and failed with NoSuchOffsetException.
-        service.initialize(runtime.withEntryFormat(EntryFormat.URSA)
-                .withStorageApi(mock(StorageApi.class)), config);
-        Properties props = new Properties();
-        props.setProperty("kafka.consumer.bootstrap.servers", "localhost:9092");
-
-        EntryProcessFactory factory = service.buildEntryProcessFactory(
-                EntryFormat.KAFKA, new LakehouseConfiguration(props), props);
-
-        assertThat(factory).isInstanceOf(KafkaEntryProcessFactory.class);
     }
 
     @Test
@@ -218,6 +187,55 @@ class LakehouseMaterializationServiceTest {
     }
 
     @Test
+    void managedOnlyMaterializationUsesLogicalTopicFromActiveStream() throws Exception {
+        service.initialize(runtime, config);
+        StreamIdentifier id = StreamIdentifier.of("default", "orders-topic-id");
+        String sourceTopic = "default/orders-topic-id-partition-0";
+        Map<String, String> taskProperties = Map.of("sbtEnabled", "true");
+        Map<String, String> effectiveProperties = Map.of(
+                "sbtEnabled", "true",
+                KafkaSourceMetadata.TOPIC_NAME_PROPERTY, "orders");
+        CompactStreamTask sourceTask = new CompactStreamTask();
+        sourceTask.setTopic(sourceTopic);
+        sourceTask.setTaskName("orders-managed-task");
+        sourceTask.setStreamId(17L);
+        sourceTask.setStartOffset(0L);
+        sourceTask.setEndOffset(0L);
+        sourceTask.setProperties(taskProperties);
+
+        Stream activeStream = mock(Stream.class);
+        when(activeStream.properties()).thenReturn(Map.of(
+                KafkaSourceMetadata.TOPIC_NAME_PROPERTY, "orders"));
+        service.registerActiveStream(id, activeStream);
+        service.setEntryReaderProvider((topic, streamId, start, end) -> new IEntryReader() {
+            @Override
+            public GenericEntry read() {
+                return null;
+            }
+
+            @Override
+            public void close() {
+            }
+        });
+        AbstractLakehouseWriter managedWriter = mock(AbstractLakehouseWriter.class);
+        LakehouseFactory managedFactory = mock(LakehouseFactory.class);
+        when(managedFactory.getManagedWriter(sourceTopic, effectiveProperties))
+                .thenReturn(java.util.Optional.of(managedWriter));
+        service.setLakehouseFactory(managedFactory);
+        ResolvedMaterialization resolved = new ResolvedMaterialization(
+                new TableCatalog("managed-none", TableCatalogType.NONE, Map.of(), Map.of()),
+                new TableIdentifier("ns", "tbl"),
+                TableMaterializationPolicy.empty());
+
+        service.materialize(new MaterializationTask(
+                id, resolved, sourceTopic, 17L, 0L, 0L, sourceTask));
+
+        verify(managedFactory).getManagedWriter(sourceTopic, effectiveProperties);
+        verify(managedWriter).close();
+        verify(activeStream, never()).close();
+    }
+
+    @Test
     void materializeBeforeInitFails() {
         ResolvedMaterialization resolved = new ResolvedMaterialization(
                 new TableCatalog("my-ch", TableCatalogType.CLICKHOUSE, Map.of(), Map.of()),
@@ -287,16 +305,11 @@ class LakehouseMaterializationServiceTest {
     }
 
     @Test
-    void kafkaMaterializationKeepsCanonicalIdentityButUsesLogicalSourceTopic() throws Exception {
+    void materializationUsesCanonicalStorageTopicAndPreservesTaskProperties() throws Exception {
         service.initialize(runtime, config);
         String canonicalTopic = "default/orders-partition-0-topic-id";
-        String logicalSourceTopic = "orders-partition-0";
         StreamIdentifier canonicalId = StreamIdentifier.of("default", "orders-topic-id");
-        Map<String, String> sourceProperties = Map.of(
-                "entryFormat", EntryFormat.KAFKA.name(),
-                KafkaEntryProcessFactory.SOURCE_TOPIC_PROPERTY, logicalSourceTopic,
-                KafkaEntryProcessFactory.SOURCE_TOPIC_ID_PROPERTY, "iZhG_yJzQmymQLeqSmyE1Q",
-                KafkaEntryProcessFactory.SOURCE_SCHEMA_TOPIC_PROPERTY, "orders");
+        Map<String, String> sourceProperties = Map.of("sdtCatalogName", "orders-catalog");
         CompactStreamTask sourceTask = new CompactStreamTask();
         sourceTask.setTopic(canonicalTopic);
         sourceTask.setTaskName("orders-task");
@@ -327,6 +340,8 @@ class LakehouseMaterializationServiceTest {
         TableMaterializer<GenericEntry> materializer = mock(TableMaterializer.class);
         Stream activeStream = mock(Stream.class);
         when(activeStream.identifier()).thenReturn(canonicalId);
+        when(activeStream.properties()).thenReturn(Map.of(
+                KafkaSourceMetadata.TOPIC_NAME_PROPERTY, "orders"));
         service.registerActiveStream(canonicalId, activeStream);
         AtomicReference<StreamIdentifier> materializerStream = new AtomicReference<>();
         AtomicReference<MaterializationRuntime> materializerRuntime = new AtomicReference<>();
@@ -355,11 +370,14 @@ class LakehouseMaterializationServiceTest {
 
         service.materialize(task);
 
-        assertThat(readerTopic).hasValue(logicalSourceTopic);
+        assertThat(readerTopic).hasValue(canonicalTopic);
         assertThat(materializerStream).hasValue(canonicalId);
-        assertThat(materializerRuntime.get().entryFormat()).isEqualTo(EntryFormat.KAFKA);
-        assertThat(materializerRuntime.get().taskProperties()).isEqualTo(sourceProperties);
-        verify(managedFactory).getManagedWriter(eq(canonicalTopic), any());
+        assertThat(materializerRuntime.get().taskProperties()).containsExactlyInAnyOrderEntriesOf(Map.of(
+                "sdtCatalogName", "orders-catalog",
+                KafkaSourceMetadata.TOPIC_NAME_PROPERTY, "orders"));
+        verify(managedFactory).getManagedWriter(canonicalTopic, Map.of(
+                "sdtCatalogName", "orders-catalog",
+                KafkaSourceMetadata.TOPIC_NAME_PROPERTY, "orders"));
         verify(materializer).commit();
     }
 
@@ -698,9 +716,7 @@ class LakehouseMaterializationServiceTest {
         EntryProcessFactory sourceFactory = mock(EntryProcessFactory.class);
         LakehouseMaterializationService blockingService = new LakehouseMaterializationService() {
             @Override
-            EntryProcessFactory buildEntryProcessFactory(EntryFormat format,
-                                                         LakehouseConfiguration lakehouseConfig,
-                                                         Properties properties) {
+            EntryProcessFactory buildEntryProcessFactory() {
                 factoryBuildStarted.countDown();
                 try {
                     if (!allowFactoryToReturn.await(10, TimeUnit.SECONDS)) {
@@ -724,7 +740,7 @@ class LakehouseMaterializationServiceTest {
                 StreamIdentifier.of("public/default", "factory-close-race"), retainedStream);
         CompletableFuture<EntryProcessFactory> building = CompletableFuture.supplyAsync(() -> {
             try {
-                return blockingService.entryProcessFactoryFor(EntryFormat.KAFKA, new Properties());
+                return blockingService.entryProcessFactory();
             } catch (RuntimeException | Error e) {
                 throw e;
             } catch (Exception e) {

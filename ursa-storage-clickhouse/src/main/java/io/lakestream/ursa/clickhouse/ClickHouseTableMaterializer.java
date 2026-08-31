@@ -15,7 +15,6 @@ import io.lakestream.ursa.materialization.MaterializationException;
 import io.lakestream.ursa.materialization.TableMaterializer;
 import io.lakestream.ursa.materialization.serde.EntryEncoder;
 import io.lakestream.ursa.materialization.serde.EntryEncoderContext;
-import io.lakestream.ursa.materialization.serde.EntryFormat;
 import io.lakestream.ursa.materialization.serde.GenericEntry;
 import io.lakestream.ursa.materialization.serde.MaterializationRecord;
 import io.lakestream.ursa.materialization.serde.MissingSchemaVersionTracker;
@@ -92,8 +91,6 @@ public final class ClickHouseTableMaterializer implements TableMaterializer<Gene
     @Nullable
     private final EntryEncoder<Map<String, Object>> rowEncoder;
     @Nullable
-    private final EntryFormat entryFormat;
-    @Nullable
     private final String sourceTopic;
     private final List<Map<String, Object>> buffer = new ArrayList<>();
     private final AtomicBoolean closed = new AtomicBoolean(false);
@@ -142,7 +139,7 @@ public final class ClickHouseTableMaterializer implements TableMaterializer<Gene
                                 List<String> primaryKey,
                                 int batchSize,
                                 @Nullable ClickHouseTableSchemaService schemaService) {
-        this(connection, tableIdentifier, engine, primaryKey, batchSize, schemaService, null, null, null);
+        this(connection, tableIdentifier, engine, primaryKey, batchSize, schemaService, null, null);
     }
 
     /**
@@ -159,7 +156,6 @@ public final class ClickHouseTableMaterializer implements TableMaterializer<Gene
                                 int batchSize,
                                 @Nullable ClickHouseTableSchemaService schemaService,
                                 @Nullable EntryEncoder<Map<String, Object>> rowEncoder,
-                                @Nullable EntryFormat entryFormat,
                                 @Nullable String sourceTopic) {
         this.connection = Objects.requireNonNull(connection, "connection");
         this.tableIdentifier = Objects.requireNonNull(tableIdentifier, "tableIdentifier");
@@ -172,9 +168,6 @@ public final class ClickHouseTableMaterializer implements TableMaterializer<Gene
         this.supportedEvolutions = EvolutionPolicy.forClickHouse();
         this.schemaService = schemaService;
         this.rowEncoder = rowEncoder;
-        // Legacy direct construction supplies normalized one-record Kafka frames. Runtime factories
-        // always pass the task's explicit source format.
-        this.entryFormat = entryFormat == null ? EntryFormat.KAFKA : entryFormat;
         this.sourceTopic = sourceTopic;
     }
 
@@ -204,7 +197,7 @@ public final class ClickHouseTableMaterializer implements TableMaterializer<Gene
         // Account for the storage-frame bytes before handing the entry to a schema-aware encoder,
         // which owns and releases its input payload.
         totalBytes += estimateBytes(record);
-        // A broker WAL entry may carry multiple Kafka records; the direct-Kafka format carries one.
+        // A storage entry may carry multiple Kafka records.
         for (Map<String, Object> row : decodeRows(record, context)) {
             if (row.isEmpty()) {
                 continue;
@@ -222,7 +215,7 @@ public final class ClickHouseTableMaterializer implements TableMaterializer<Gene
      *
      * <p>When a {@link #rowEncoder} is wired, decoding goes through the framework encoder, which
      * uses the topic's registered schema to decode Kafka records (Avro/JSON/...). Otherwise the JSON
-     * fallback parses the configured raw WAL batch or direct-Kafka format via
+     * fallback parses the native Kafka MemoryRecords payload via
      * {@link EntryUtils#entryToKafkaMessage}.
      */
     private List<Map<String, Object>> decodeRows(GenericEntry entry, MaterializationContext context) {
@@ -231,7 +224,7 @@ public final class ClickHouseTableMaterializer implements TableMaterializer<Gene
         }
         List<Map<String, Object>> rows = new ArrayList<>();
         try {
-            EntryUtils.entryToKafkaMessage(entry.entry(), entryFormat, message -> {
+            EntryUtils.entryToKafkaMessage(entry.entry(), message -> {
                 byte[] data = message.getData();
                 if (data == null || data.length == 0) {
                     return;
@@ -259,7 +252,6 @@ public final class ClickHouseTableMaterializer implements TableMaterializer<Gene
     private List<Map<String, Object>> decodeRowsWithEncoder(GenericEntry entry) {
         List<Map<String, Object>> rows = new ArrayList<>();
         EntryEncoderContext ctx = EntryEncoderContext.builder()
-                .entryFormat(entryFormat)
                 .missingSchemaVersionTracker(new MissingSchemaVersionTracker())
                 .build();
         try {
@@ -343,12 +335,6 @@ public final class ClickHouseTableMaterializer implements TableMaterializer<Gene
     /** Returns the resolved destination table identifier (visible for tests). */
     public TableIdentifier tableIdentifier() {
         return tableIdentifier;
-    }
-
-    /** Returns the source entry format (URSA / KAFKA) used by the decoder (visible for tests). */
-    @Nullable
-    public EntryFormat entryFormat() {
-        return entryFormat;
     }
 
     /**

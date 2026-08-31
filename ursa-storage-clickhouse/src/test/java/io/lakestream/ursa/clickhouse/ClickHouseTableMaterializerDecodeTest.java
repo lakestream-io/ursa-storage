@@ -19,7 +19,6 @@ import io.lakestream.ursa.exception.ExceptionCode;
 import io.lakestream.ursa.materialization.CommitResult;
 import io.lakestream.ursa.materialization.MaterializationContext;
 import io.lakestream.ursa.materialization.MaterializationException;
-import io.lakestream.ursa.materialization.serde.EntryFormat;
 import io.lakestream.ursa.materialization.serde.GenericEntry;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -230,9 +229,8 @@ class ClickHouseTableMaterializerDecodeTest {
                 10,
                 null,
                 null,
-                EntryFormat.URSA,
                 null);
-        GenericEntry entry = FramedEntries.rawUrsaBatch(
+        GenericEntry entry = MemoryRecordsEntries.batch(
                 "{\"id\":1}", "{\"id\":2}", "{\"id\":3}");
 
         materializer.write(entry, unversionedContext);
@@ -254,7 +252,6 @@ class ClickHouseTableMaterializerDecodeTest {
     }
 
     private static GenericEntry jsonEntry(String json) {
-        // Build the direct Kafka entry framing so write() exercises the production decode path.
-        return FramedEntries.of(json);
+        return MemoryRecordsEntries.of(json);
     }
 }
