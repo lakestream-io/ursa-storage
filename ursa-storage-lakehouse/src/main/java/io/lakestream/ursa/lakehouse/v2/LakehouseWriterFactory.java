@@ -13,7 +13,6 @@ import io.lakestream.api.materialization.TableMode;
 import io.lakestream.ursa.compaction.DynamicConfigs;
 import io.lakestream.ursa.lakehouse.LakehouseConfiguration;
 import io.lakestream.ursa.lakehouse.compact.FailureMessage;
-import io.lakestream.ursa.lakehouse.compact.KafkaEntryProcessFactory;
 import io.lakestream.ursa.lakehouse.v2.delta.DeltaExternalDLTTableWriter;
 import io.lakestream.ursa.lakehouse.v2.delta.DeltaExternalTableWriter;
 import io.lakestream.ursa.lakehouse.v2.iceberg.IcebergExternalDLTTableWriter;
@@ -21,15 +20,14 @@ import io.lakestream.ursa.lakehouse.v2.iceberg.IcebergExternalTableWriter;
 import io.lakestream.ursa.lakehouse.v2.iceberg.IcebergManagedTableWriter;
 import io.lakestream.ursa.materialization.MaterializationException;
 import io.lakestream.ursa.materialization.MaterializationRuntime;
-import io.lakestream.ursa.materialization.serde.EntryFormat;
 import io.lakestream.ursa.materialization.serde.EntrySerdeFactory;
 import io.lakestream.ursa.materialization.serde.SchemaService;
+import io.lakestream.ursa.materialization.serde.kafka.KafkaSourceMetadata;
 import io.lakestream.ursa.metrics.InstrumentProvider;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Properties;
-import javax.annotation.Nullable;
 
 /**
  * Package-private helper that wires a {@link TableCatalog} + {@link TableMaterializationPolicy}
@@ -68,7 +66,7 @@ final class LakehouseWriterFactory {
                     "Expected ICEBERG catalog type but got " + catalog.type());
         }
         LakehouseConfiguration config =
-                buildConfiguration(catalog, policy, "iceberg", runtime.entryFormat(), runtime.taskProperties());
+                buildConfiguration(catalog, policy, "iceberg", runtime.taskProperties());
         EntrySerdeFactory serdeFactory = new EntrySerdeFactory((SchemaService) runtime.schemaService());
         InstrumentProvider provider = InstrumentProvider.NOOP;
         String topic = destinationTopic(stream);
@@ -99,7 +97,7 @@ final class LakehouseWriterFactory {
                     "Expected DELTA catalog type but got " + catalog.type());
         }
         LakehouseConfiguration config =
-                buildConfiguration(catalog, policy, "delta", runtime.entryFormat(), runtime.taskProperties());
+                buildConfiguration(catalog, policy, "delta", runtime.taskProperties());
         EntrySerdeFactory serdeFactory = new EntrySerdeFactory((SchemaService) runtime.schemaService());
         String destinationTopic = destinationTopic(stream);
         return new DeltaExternalTableWriter(
@@ -120,7 +118,7 @@ final class LakehouseWriterFactory {
                     "Expected DELTA_UC catalog type but got " + catalog.type());
         }
         LakehouseConfiguration config =
-                buildConfiguration(catalog, policy, "delta", runtime.entryFormat(), runtime.taskProperties());
+                buildConfiguration(catalog, policy, "delta", runtime.taskProperties());
         EntrySerdeFactory serdeFactory = new EntrySerdeFactory((SchemaService) runtime.schemaService());
         String destinationTopic = destinationTopic(stream);
         return new DeltaExternalTableWriter(
@@ -140,12 +138,11 @@ final class LakehouseWriterFactory {
                                                                        TableCatalog catalog,
                                                                        Stream stream,
                                                                        String prefix,
-                                                                       @Nullable EntryFormat entryFormat,
                                                                        Map<String, String> taskProperties) {
         if (effectiveMode(policy) != TableMode.EXTERNAL) {
             return Optional.empty();
         }
-        LakehouseConfiguration config = buildConfiguration(catalog, policy, prefix, entryFormat, taskProperties);
+        LakehouseConfiguration config = buildConfiguration(catalog, policy, prefix, taskProperties);
         String topic = destinationTopic(stream);
         InstrumentProvider provider = InstrumentProvider.NOOP;
         return switch (config.getLakehouseType()) {
@@ -173,19 +170,12 @@ final class LakehouseWriterFactory {
     static LakehouseConfiguration buildConfiguration(TableCatalog catalog,
                                                      TableMaterializationPolicy policy,
                                                      String prefix,
-                                                     @Nullable EntryFormat entryFormat,
                                                      Map<String, String> taskProperties) {
         Objects.requireNonNull(catalog, "catalog");
         Objects.requireNonNull(policy, "policy");
         Objects.requireNonNull(prefix, "prefix");
 
         Properties properties = new Properties();
-        // The source entry format selects the source-aware encoder. When the orchestrator did not
-        // resolve one, leave it unset so the writer
-        // falls back to its historical default.
-        if (entryFormat != null) {
-            properties.setProperty("entryFormat", entryFormat.name());
-        }
         // 1) Bare catalog properties at the top level.
         for (Map.Entry<String, String> e : catalog.properties().entrySet()) {
             properties.setProperty(e.getKey(), e.getValue());
@@ -266,8 +256,8 @@ final class LakehouseWriterFactory {
         return id.fullName();
     }
 
-    static String schemaTopic(Stream stream, Map<String, String> taskProperties) {
-        return KafkaEntryProcessFactory.resolveSchemaTopic(destinationTopic(stream), taskProperties);
+    static String schemaTopic(Stream stream, Map<String, String> streamProperties) {
+        return KafkaSourceMetadata.topicName(destinationTopic(stream), streamProperties);
     }
 
     private static void requireNonNullArgs(TableMaterializationPolicy policy,

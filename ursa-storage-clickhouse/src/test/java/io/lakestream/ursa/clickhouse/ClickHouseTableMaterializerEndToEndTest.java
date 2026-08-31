@@ -461,7 +461,7 @@ class ClickHouseTableMaterializerEndToEndTest {
 
         /** Builds a framed single-message WAL {@link GenericEntry} (the production encoding). */
         static GenericEntry jsonEntry(String json) {
-            return FramedEntries.of(json);
+            return MemoryRecordsEntries.of(json);
         }
 
         /** Returns a {@link MaterializationContext} for an unversioned stream record. */

@@ -15,16 +15,14 @@ import javax.annotation.Nullable;
  *
  * <p>Carries the resolved sink and the source-stream offset range. The
  * {@link MaterializationService} reads the source entries for
- * {@code [startOffset, endOffset)} itself (via the source-aware entry-reader
- * factory, which supports WAL / Kafka), decodes each entry
- * into records, and writes them to the sink — so the orchestrator does not need
- * to read or carry the entries, and the compaction module stays free of
- * integration-package reader types.
+ * {@code [startOffset, endOffset)} from {@code StorageApi}, decodes each entry
+ * into records, and writes them to the sink. The orchestrator does not need to
+ * read or carry entries.
  *
  * @param stream                   the source stream identifier (sink cache key + context identity)
  * @param resolvedMaterialization  the resolved sink (catalog + table + effective policy)
- * @param sourceTopic              the source topic to read from (the original, partition-qualified
- *                                 topic name — distinct from {@code stream.fullName()})
+ * @param sourceTopic              the canonical partition log name to read (distinct from
+ *                                 {@code stream.fullName()})
  * @param streamId                 the numeric stream id the entry reader reads from
  * @param startOffset              inclusive start offset of the range in the source stream
  * @param endOffset                exclusive end offset of the range in the source stream

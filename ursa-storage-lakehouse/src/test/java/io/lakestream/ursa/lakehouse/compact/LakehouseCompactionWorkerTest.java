@@ -16,9 +16,7 @@ import io.lakestream.ursa.compaction.task.CompactStreamTask;
 import io.lakestream.ursa.exception.ExceptionCode;
 import io.lakestream.ursa.lakehouse.v2.LakehouseFactory;
 import io.lakestream.ursa.materialization.MaterializationException;
-import io.lakestream.ursa.materialization.serde.EntryFormat;
 import io.lakestream.ursa.storage.impl.StorageConfig;
-import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -47,29 +45,13 @@ class LakehouseCompactionWorkerTest {
     }
 
     @Test
-    void kafkaTaskUsesLogicalSourceTopicForReadersAndWriters() {
-        String canonicalTaskTopic = "/streams/default/orders-partition-0-iZhG_yJzQmymQLeqSmyE1Q";
-        String logicalSourceTopic = "orders-partition-0";
-
-        assertThat(LakehouseCompactionWorker.sourceTopic(
-                canonicalTaskTopic,
-                Map.of(KafkaEntryProcessFactory.SOURCE_TOPIC_PROPERTY, logicalSourceTopic),
-                EntryFormat.KAFKA)).isEqualTo(logicalSourceTopic);
-        assertThat(LakehouseCompactionWorker.sourceTopic(
-                canonicalTaskTopic,
-                Map.of(KafkaEntryProcessFactory.SOURCE_TOPIC_PROPERTY, logicalSourceTopic),
-                EntryFormat.URSA)).isEqualTo(canonicalTaskTopic);
-    }
-
-    @Test
-    void kafkaIncarnationMismatchRetiresTaskFromRuntimeExceptionCode() throws Exception {
+    void terminalSourceFailureRetiresTaskFromRuntimeExceptionCode() throws Exception {
         CompactStreamTask task = new CompactStreamTask();
         task.setTopic("default/orders-partition-0-topic-id");
         task.setTaskName("orders-incarnation-mismatch");
         task.setStreamId(17L);
         task.setStartOffset(0L);
         task.setEndOffset(10L);
-        task.setProperties(Map.of("entryFormat", EntryFormat.KAFKA.name()));
 
         EntryProcessFactory mismatchedReaderFactory = new EntryProcessFactory() {
             @Override
@@ -77,7 +59,7 @@ class LakehouseCompactionWorkerTest {
                                                   long endOffset, double avgEntrySize,
                                                   EntryReaderOptions options) {
                 throw new MaterializationException(
-                        ExceptionCode.NO_SUCH_LOG, "Kafka topic incarnation mismatch");
+                        ExceptionCode.NO_SUCH_LOG, "Source log no longer exists");
             }
 
             @Override
@@ -88,7 +70,7 @@ class LakehouseCompactionWorkerTest {
         when(taskManager.deleteCompactTask(task)).thenReturn(CompletableFuture.completedFuture(null));
         LakehouseCompactionWorker worker = new LakehouseCompactionWorker(
                 mock(LakehouseFactory.class), mismatchedReaderFactory, taskManager,
-                mock(CompactionMetrics.class), new StorageConfig(), EntryFormat.KAFKA);
+                mock(CompactionMetrics.class), new StorageConfig());
 
         worker.doCompact(task);
 
@@ -103,14 +85,13 @@ class LakehouseCompactionWorkerTest {
         task.setStreamId(17L);
         task.setStartOffset(0L);
         task.setEndOffset(10L);
-        task.setProperties(Map.of("entryFormat", EntryFormat.KAFKA.name()));
         EntryProcessFactory mismatchedReaderFactory = new EntryProcessFactory() {
             @Override
             public IEntryReader createEntryReader(String topic, long streamId, long startOffset,
                                                   long endOffset, double avgEntrySize,
                                                   EntryReaderOptions options) {
                 throw new MaterializationException(
-                        ExceptionCode.NO_SUCH_LOG, "Kafka topic incarnation mismatch");
+                        ExceptionCode.NO_SUCH_LOG, "Source log no longer exists");
             }
 
             @Override
@@ -125,7 +106,7 @@ class LakehouseCompactionWorkerTest {
         });
         LakehouseCompactionWorker worker = new LakehouseCompactionWorker(
                 mock(LakehouseFactory.class), mismatchedReaderFactory, taskManager,
-                mock(CompactionMetrics.class), new StorageConfig(), EntryFormat.KAFKA);
+                mock(CompactionMetrics.class), new StorageConfig());
         AtomicReference<Throwable> failure = new AtomicReference<>();
         Thread runner = new Thread(() -> {
             try {

@@ -21,7 +21,6 @@ import io.lakestream.ursa.materialization.MaterializationContext;
 import io.lakestream.ursa.materialization.MaterializationException;
 import io.lakestream.ursa.materialization.serde.EntryEncoder;
 import io.lakestream.ursa.materialization.serde.EntryEncoderContext;
-import io.lakestream.ursa.materialization.serde.EntryFormat;
 import io.lakestream.ursa.materialization.serde.GenericEntry;
 import io.lakestream.ursa.materialization.serde.MaterializationRecord;
 import io.lakestream.ursa.materialization.serde.ResultConsumer;
@@ -127,9 +126,9 @@ class ClickHouseTableMaterializerTest {
         };
         ClickHouseTableMaterializer materializer = new ClickHouseTableMaterializer(
                 connection, tableIdentifier, ClickHouseTableEngine.MERGE_TREE, List.of(), 100,
-                null, stubEncoder, EntryFormat.KAFKA, "events-0");
+                null, stubEncoder, "events-0");
 
-        materializer.write(FramedEntries.of("ignored-by-stub"), context);
+        materializer.write(MemoryRecordsEntries.of("ignored-by-stub"), context);
         CommitResult result = materializer.commit();
 
         assertThat(result.recordsCommitted()).isEqualTo(2L);
@@ -141,9 +140,9 @@ class ClickHouseTableMaterializerTest {
     void entriesDecodeToOneRowPerKafkaRecord() throws Exception {
         ClickHouseTableMaterializer materializer = newMaterializer(100);
 
-        materializer.write(FramedEntries.of("{\"id\":1}"), context);
-        materializer.write(FramedEntries.of("{\"id\":2}"), context);
-        materializer.write(FramedEntries.of("{\"id\":3}"), context);
+        materializer.write(MemoryRecordsEntries.of("{\"id\":1}"), context);
+        materializer.write(MemoryRecordsEntries.of("{\"id\":2}"), context);
+        materializer.write(MemoryRecordsEntries.of("{\"id\":3}"), context);
 
         CommitResult result = materializer.commit();
         assertThat(result.recordsCommitted()).isEqualTo(3L);
@@ -267,6 +266,6 @@ class ClickHouseTableMaterializerTest {
 
     private static GenericEntry jsonEntry(String json) {
         // Build a framed single-message WAL entry so write() decodes through the batch path.
-        return FramedEntries.of(json);
+        return MemoryRecordsEntries.of(json);
     }
 }

@@ -347,9 +347,8 @@ public class CompactionWorker implements Runnable {
             // method remains responsible for closing the handle on every exit path.
             materializationService.registerActiveStream(id, stream);
             ownershipTransferred = true;
-            // The service reads source entries for the offset range itself (Ursa or Kafka
-            // via the source-aware reader factory) and decodes + writes them. The compaction module does
-            // not read or carry entries, keeping it free of integration-package reader types.
+            // The service reads source entries for the offset range through StorageApi and decodes
+            // and writes them. The compaction module does not read or carry entries.
             MaterializationTask mt = new MaterializationTask(
                     id,
                     resolved.get(),

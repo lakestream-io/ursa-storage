@@ -7,7 +7,6 @@ package io.lakestream.ursa.materialization;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatNullPointerException;
 
-import io.lakestream.ursa.materialization.serde.EntryFormat;
 import io.lakestream.ursa.materialization.serde.SchemaEvolutionManager;
 import io.lakestream.ursa.materialization.serde.SchemaService;
 import java.util.Map;
@@ -93,42 +92,41 @@ class MaterializationRuntimeTest {
         assertThat(runtime.logger()).isSameAs(LOG);
         assertThat(runtime.metrics()).isSameAs(METRICS);
         assertThat(runtime.failureMessageHandler()).isSameAs(HANDLER);
-        // entryFormat defaults to null on the back-compat constructors.
-        assertThat(runtime.entryFormat()).isNull();
+        assertThat(runtime.storageApi()).isNull();
+        assertThat(runtime.taskProperties()).isEmpty();
     }
 
     @Test
-    void withEntryFormatCopiesAllFieldsAndSetsFormat() {
+    void withTaskPropertiesCopiesAllFieldsAndSetsProperties() {
         MaterializationRuntime base = new MaterializationRuntime(
                 SCHEMA_SERVICE, EVOLUTION, EXECUTOR, LOG, METRICS, HANDLER);
 
-        MaterializationRuntime withKafka = base.withEntryFormat(EntryFormat.KAFKA);
+        MaterializationRuntime withProperties = base.withTaskProperties(Map.of("catalog", "lakehouse"));
 
-        assertThat(withKafka.entryFormat()).isEqualTo(EntryFormat.KAFKA);
+        assertThat(withProperties.taskProperties()).containsEntry("catalog", "lakehouse");
         // All other fields are preserved.
-        assertThat(withKafka.schemaService()).isSameAs(SCHEMA_SERVICE);
-        assertThat(withKafka.schemaEvolutionManager()).isSameAs(EVOLUTION);
-        assertThat(withKafka.materializationExecutor()).isSameAs(EXECUTOR);
-        assertThat(withKafka.logger()).isSameAs(LOG);
-        assertThat(withKafka.metrics()).isSameAs(METRICS);
-        assertThat(withKafka.failureMessageHandler()).isSameAs(HANDLER);
+        assertThat(withProperties.schemaService()).isSameAs(SCHEMA_SERVICE);
+        assertThat(withProperties.schemaEvolutionManager()).isSameAs(EVOLUTION);
+        assertThat(withProperties.materializationExecutor()).isSameAs(EXECUTOR);
+        assertThat(withProperties.logger()).isSameAs(LOG);
+        assertThat(withProperties.metrics()).isSameAs(METRICS);
+        assertThat(withProperties.failureMessageHandler()).isSameAs(HANDLER);
         // The original is unchanged (record copy semantics).
-        assertThat(base.entryFormat()).isNull();
-        // withEntryFormat preserves the (null) storageApi.
-        assertThat(withKafka.storageApi()).isNull();
+        assertThat(base.taskProperties()).isEmpty();
+        assertThat(withProperties.storageApi()).isNull();
     }
 
     @Test
-    void withEntryFormatAndStorageApiCompose() {
+    void withStorageApiAndTaskPropertiesCompose() {
         MaterializationRuntime base = new MaterializationRuntime(
                 SCHEMA_SERVICE, EVOLUTION, EXECUTOR, LOG, METRICS, HANDLER);
 
-        MaterializationRuntime composed = base.withEntryFormat(EntryFormat.URSA).withStorageApi(null);
+        MaterializationRuntime composed = base.withStorageApi(null)
+                .withTaskProperties(Map.of("source", "storage"));
 
-        assertThat(composed.entryFormat()).isEqualTo(EntryFormat.URSA);
         assertThat(composed.storageApi()).isNull();
-        // withStorageApi must preserve the previously-set entryFormat.
-        assertThat(base.withStorageApi(null).withEntryFormat(EntryFormat.KAFKA).entryFormat())
-                .isEqualTo(EntryFormat.KAFKA);
+        assertThat(composed.taskProperties()).containsEntry("source", "storage");
+        assertThat(base.withTaskProperties(Map.of("source", "storage"))
+                .withStorageApi(null).taskProperties()).containsEntry("source", "storage");
     }
 }

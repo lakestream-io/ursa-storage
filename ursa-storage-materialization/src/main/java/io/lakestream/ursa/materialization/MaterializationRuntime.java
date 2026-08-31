@@ -5,7 +5,6 @@
 package io.lakestream.ursa.materialization;
 
 import io.lakestream.ursa.compaction.CompactTaskManager;
-import io.lakestream.ursa.materialization.serde.EntryFormat;
 import io.lakestream.ursa.materialization.serde.SchemaEvolutionManager;
 import io.lakestream.ursa.materialization.serde.SchemaService;
 import io.lakestream.ursa.storage.StorageApi;
@@ -34,16 +33,8 @@ import org.slf4j.Logger;
  * @param compactTaskManager       persists the compaction task (status + write results) so the
  *                                 group-commit runner can finalize it; may be {@code null} when a
  *                                 deployment does not run the Lakehouse group-commit pipeline
- * @param entryFormat              the source entry format (URSA / KAFKA) of the stream
- *                                 being materialized; sinks use it to pick the source-aware encoder
- *                                 and the
- *                                 source-aware entry reader. May be {@code null} when the
- *                                 orchestrator has not resolved a source format, in which case
- *                                 sinks fall back to their own default.
  * @param storageApi               the storage engine used to read source entries straight from the
- *                                 WAL for an Ursa source. May be {@code null} for Kafka sources
- *                                 (which read via a Kafka consumer) or in
- *                                 stub setups.
+ *                                 WAL. May be {@code null} in stub setups.
  * @param taskProperties           per-task compaction properties carrying the legacy {@code DynamicConfigs}
  *                                 (sdtEnabled, sdtCatalogName, identifierFields, upsertMode,
  *                                 baseSchemaVersion, …). Sinks merge these onto the resolved policy /
@@ -59,7 +50,6 @@ public record MaterializationRuntime(
         MaterializationMetrics metrics,
         FailureMessageHandler failureMessageHandler,
         @Nullable CompactTaskManager compactTaskManager,
-        @Nullable EntryFormat entryFormat,
         @Nullable StorageApi storageApi,
         Map<String, String> taskProperties) {
 
@@ -74,7 +64,7 @@ public record MaterializationRuntime(
         taskProperties = taskProperties == null ? Map.of() : Map.copyOf(taskProperties);
     }
 
-    /** Back-compat 9-arg constructor (no task properties). */
+    /** Convenience constructor without task properties. */
     public MaterializationRuntime(SchemaService<?> schemaService,
                                   SchemaEvolutionManager schemaEvolutionManager,
                                   Executor materializationExecutor,
@@ -82,13 +72,12 @@ public record MaterializationRuntime(
                                   MaterializationMetrics metrics,
                                   FailureMessageHandler failureMessageHandler,
                                   @Nullable CompactTaskManager compactTaskManager,
-                                  @Nullable EntryFormat entryFormat,
                                   @Nullable StorageApi storageApi) {
         this(schemaService, schemaEvolutionManager, materializationExecutor, logger, metrics,
-                failureMessageHandler, compactTaskManager, entryFormat, storageApi, Map.of());
+                failureMessageHandler, compactTaskManager, storageApi, Map.of());
     }
 
-    /** Back-compat 7-arg constructor for callers that supply neither a source format nor storage. */
+    /** Convenience constructor for callers that do not supply storage. */
     public MaterializationRuntime(SchemaService<?> schemaService,
                                   SchemaEvolutionManager schemaEvolutionManager,
                                   Executor materializationExecutor,
@@ -97,7 +86,7 @@ public record MaterializationRuntime(
                                   FailureMessageHandler failureMessageHandler,
                                   @Nullable CompactTaskManager compactTaskManager) {
         this(schemaService, schemaEvolutionManager, materializationExecutor, logger, metrics,
-                failureMessageHandler, compactTaskManager, null, null, Map.of());
+                failureMessageHandler, compactTaskManager, null, Map.of());
     }
 
     /** Back-compat 6-arg constructor for callers that do not supply a {@link CompactTaskManager}. */
@@ -108,20 +97,13 @@ public record MaterializationRuntime(
                                   MaterializationMetrics metrics,
                                   FailureMessageHandler failureMessageHandler) {
         this(schemaService, schemaEvolutionManager, materializationExecutor, logger, metrics,
-                failureMessageHandler, null, null, null, Map.of());
-    }
-
-    /** Returns a copy of this runtime with the supplied source {@link EntryFormat}. */
-    public MaterializationRuntime withEntryFormat(@Nullable EntryFormat newEntryFormat) {
-        return new MaterializationRuntime(schemaService, schemaEvolutionManager, materializationExecutor,
-                logger, metrics, failureMessageHandler, compactTaskManager, newEntryFormat, storageApi,
-                taskProperties);
+                failureMessageHandler, null, null, Map.of());
     }
 
     /** Returns a copy of this runtime with the supplied {@link StorageApi}. */
     public MaterializationRuntime withStorageApi(@Nullable StorageApi newStorageApi) {
         return new MaterializationRuntime(schemaService, schemaEvolutionManager, materializationExecutor,
-                logger, metrics, failureMessageHandler, compactTaskManager, entryFormat, newStorageApi,
+                logger, metrics, failureMessageHandler, compactTaskManager, newStorageApi,
                 taskProperties);
     }
 
@@ -131,7 +113,7 @@ public record MaterializationRuntime(
      */
     public MaterializationRuntime withTaskProperties(@Nullable Map<String, String> newTaskProperties) {
         return new MaterializationRuntime(schemaService, schemaEvolutionManager, materializationExecutor,
-                logger, metrics, failureMessageHandler, compactTaskManager, entryFormat, storageApi,
+                logger, metrics, failureMessageHandler, compactTaskManager, storageApi,
                 newTaskProperties);
     }
 }

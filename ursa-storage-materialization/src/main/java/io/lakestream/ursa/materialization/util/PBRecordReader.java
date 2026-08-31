@@ -8,10 +8,7 @@ import com.google.protobuf.Descriptors;
 import com.google.protobuf.DynamicMessage;
 import io.confluent.kafka.schemaregistry.protobuf.MessageIndexes;
 import io.confluent.kafka.schemaregistry.protobuf.ProtobufSchema;
-import io.lakestream.ursa.materialization.serde.KafkaEntry;
-import io.lakestream.ursa.storage.Entry;
 import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -124,29 +121,6 @@ public class PBRecordReader {
                 .orElse(schema);
         }
         return schema;
-    }
-
-    public static Schema convertSchemaInfoToAvro(byte[] schemaBytes, Entry entry) {
-        var pbSchema = new ProtobufSchema(new String(schemaBytes, StandardCharsets.UTF_8));
-
-        if (entry != null) {
-            List<Integer> messageIndexes;
-            try {
-                byte[] value = KafkaEntry.fromByteBuf(entry.payload().duplicate()).value();
-                messageIndexes = parseMessageIndexes(value);
-            } catch (Exception e) {
-                throw new RuntimeException("Failed to extract message indexes", e);
-            }
-            pbSchema = pbSchema.copy(pbSchema.toMessageName(new MessageIndexes(messageIndexes)));
-        }
-        return makeMapEntriesNullable(ProtobufDataExtend.get().getSchema(pbSchema.toDescriptor()));
-    }
-
-    private static List<Integer> parseMessageIndexes(byte[] data) {
-        var msg = ByteBuffer.wrap(data);
-        msg.get();
-        msg.getInt();
-        return MessageIndexes.readFrom(msg).indexes();
     }
 
     public static Schema makeMapEntriesNullable(Schema schema) {

@@ -12,8 +12,6 @@ An alphabetical reference of terms used in Ursa documentation and codebase.
 
 **Entry**: A batch of multiple events or messages grouped together for efficient processing and atomic storage.
 
-**Entry Format**: The format for serializing entries within WAL Objects, including metadata and offsets.
-
 **Event**: An individual record or message representing a single unit of data in a stream.
 
 **External Table**: A lakehouse table managed outside Ursa, where data is not indexed by the Stream Offset Index.

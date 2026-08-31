@@ -111,7 +111,6 @@ class KafkaLakehouseReaderTest {
             Path storageRoot, EntryHeader header, byte[] payloadBytes) throws Exception {
         Properties properties = new Properties();
         properties.setProperty("storagePath", storageRoot.toString());
-        properties.setProperty("entryFormat", "KAFKA");
         properties.setProperty("entrySerDeType", "KAFKA_BATCHED_RAW_PARQUET");
         LakehouseConfiguration configuration = new LakehouseConfiguration(properties);
         EntrySerdeFactory serdeFactory = new EntrySerdeFactory(null);

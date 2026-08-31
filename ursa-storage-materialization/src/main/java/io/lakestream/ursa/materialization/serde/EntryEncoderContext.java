@@ -24,7 +24,6 @@ import org.apache.iceberg.variants.Variants;
 @Slf4j
 @Builder(toBuilder = true)
 public record EntryEncoderContext(
-    EntryFormat entryFormat,
     boolean isVariantEnabled,
     boolean isPersistExtraMetadata,
     boolean isPersistKey,
@@ -40,7 +39,6 @@ public record EntryEncoderContext(
     Optional<Long> baseSchemaVersion) {
 
     public EntryEncoderContext {
-        entryFormat = entryFormat == null ? EntryFormat.URSA : entryFormat;
         properties = properties == null ? Map.of() : Map.copyOf(properties);
         protobufMessageName = protobufMessageName == null ? Optional.empty() : protobufMessageName;
         baseSchemaVersion = baseSchemaVersion == null ? Optional.empty() : baseSchemaVersion;

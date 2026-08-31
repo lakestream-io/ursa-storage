@@ -18,7 +18,6 @@ import io.lakestream.ursa.materialization.MaterializationRuntime;
 import io.lakestream.ursa.materialization.MaterializationService;
 import io.lakestream.ursa.materialization.MaterializationServiceConfig;
 import io.lakestream.ursa.materialization.MaterializationServiceProvider;
-import io.lakestream.ursa.materialization.serde.EntryFormat;
 import io.lakestream.ursa.materialization.serde.SchemaEvolutionManager;
 import io.lakestream.ursa.materialization.serde.SchemaService;
 import io.lakestream.ursa.metrics.InstrumentProvider;
@@ -44,7 +43,6 @@ import java.lang.reflect.Method;
 import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
@@ -342,23 +340,7 @@ public class CompactionScheduler {
                 bridgeMetrics(metrics),
                 FailureMessageHandler.noop(),
                 compactTaskManager,
-                resolveSourceEntryFormat(config),
                 storageApi);
-    }
-
-    /**
-     * Resolves the source entry format from the materialization-layer configuration.
-     */
-    private static EntryFormat resolveSourceEntryFormat(StorageConfig config) {
-        String dataSource = config.getProperties().getProperty(
-                "entryFormat",
-                config.getProperties().getProperty("dataSourceForCompaction", EntryFormat.URSA.name()));
-        try {
-            return EntryFormat.valueOf(dataSource.trim().toUpperCase(Locale.ROOT));
-        } catch (IllegalArgumentException e) {
-            throw new IllegalArgumentException(
-                    "Unsupported entry format '" + dataSource + "'; expected URSA or KAFKA", e);
-        }
     }
 
     /** No-op {@link SchemaService} returned when bindings can't supply one. */

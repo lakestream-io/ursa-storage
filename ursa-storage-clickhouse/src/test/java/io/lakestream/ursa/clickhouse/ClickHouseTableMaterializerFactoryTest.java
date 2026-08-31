@@ -24,10 +24,10 @@ import io.lakestream.ursa.materialization.MaterializationMetrics;
 import io.lakestream.ursa.materialization.MaterializationRuntime;
 import io.lakestream.ursa.materialization.TableMaterializer;
 import io.lakestream.ursa.materialization.TableMaterializerFactory;
-import io.lakestream.ursa.materialization.serde.EntryFormat;
 import io.lakestream.ursa.materialization.serde.SchemaEvolutionManager;
 import io.lakestream.ursa.materialization.serde.SchemaService;
 import io.lakestream.ursa.materialization.serde.kafka.KafkaSchemaService;
+import io.lakestream.ursa.materialization.serde.kafka.KafkaSourceMetadata;
 import java.sql.Connection;
 import java.sql.Driver;
 import java.sql.DriverManager;
@@ -171,36 +171,11 @@ class ClickHouseTableMaterializerFactoryTest {
     }
 
     @Test
-    void createUsesTaskEntryFormatNotSchemaServiceFlavour() {
-        // The source task type remains observable even though stored records use the same direct
-        // Kafka framing. Ursa still uses the Kafka/Confluent wire schema, so the row encoder is
-        // KAFKA_CLICKHOUSE while the task type remains URSA.
-        TableCatalog catalog = new TableCatalog(
-                "ch",
-                TableCatalogType.CLICKHOUSE,
-                Map.of("dsn", "jdbc:ursa-test:clickhouse://localhost:8123/analytics"),
-                Map.of());
-        TableMaterializationPolicy policy = withTableId("analytics", "events");
-
-        MaterializationRuntime rt = runtimeWith(mock(KafkaSchemaService.class))
-                .withEntryFormat(EntryFormat.URSA);
-
-        TableMaterializer<?> materializer = new ClickHouseTableMaterializerFactory()
-                .create(policy, catalog, fakeStream("public/test_v7", "events"), rt);
-
-        ClickHouseTableMaterializer ch = (ClickHouseTableMaterializer) materializer;
-        assertThat(ch.entryFormat()).isEqualTo(EntryFormat.URSA);
-    }
-
-    @Test
     void recreatedKafkaStreamsUseLogicalTopicOnlyForSchemaLookup() {
         Stream oldStream = fakeStream("default", "orders-old-topic-id");
         Stream newStream = fakeStream("default", "orders-new-topic-id");
         MaterializationRuntime kafkaRuntime = runtimeWith(mock(KafkaSchemaService.class))
-                .withEntryFormat(EntryFormat.KAFKA)
-                .withTaskProperties(Map.of(
-                        "sourceTopic", "orders-partition-3",
-                        "sourceSchemaTopic", "orders"));
+                .withTaskProperties(Map.of(KafkaSourceMetadata.TOPIC_NAME_PROPERTY, "orders"));
 
         assertThat(oldStream.identifier().fullName()).isNotEqualTo(newStream.identifier().fullName());
         assertThat(ClickHouseTableMaterializerFactory.sourceTopic(oldStream, kafkaRuntime))
@@ -210,31 +185,28 @@ class ClickHouseTableMaterializerFactoryTest {
     }
 
     @Test
-    void legacyKafkaTaskDerivesLogicalSchemaTopicFromPhysicalPartition() {
-        Stream stream = fakeStream("default", "orders-topic-id-partition-3");
-        MaterializationRuntime kafkaRuntime = runtimeWith(mock(KafkaSchemaService.class))
-                .withEntryFormat(EntryFormat.KAFKA)
-                .withTaskProperties(Map.of("sourceTopic", "orders-partition-3"));
+    void storagePartitionFallbackDerivesLogicalSchemaTopic() {
+        Stream stream = fakeStream("default", "orders-partition-3");
+        MaterializationRuntime kafkaRuntime = runtimeWith(mock(KafkaSchemaService.class));
 
         assertThat(ClickHouseTableMaterializerFactory.sourceTopic(stream, kafkaRuntime))
                 .isEqualTo("orders");
     }
 
     @Test
-    void jsonFallbackUsesTaskEntryFormatWithoutKafkaSchemaService() {
+    void jsonFallbackDoesNotRequireKafkaSchemaService() {
         TableCatalog catalog = new TableCatalog(
                 "ch",
                 TableCatalogType.CLICKHOUSE,
                 Map.of("dsn", "jdbc:ursa-test:clickhouse://localhost:8123/analytics"),
                 Map.of());
         TableMaterializationPolicy policy = withTableId("analytics", "events");
-        MaterializationRuntime rt = runtime().withEntryFormat(EntryFormat.URSA);
+        MaterializationRuntime rt = runtime();
 
         TableMaterializer<?> materializer = new ClickHouseTableMaterializerFactory()
                 .create(policy, catalog, fakeStream("public/test_v7", "events"), rt);
 
-        assertThat(((ClickHouseTableMaterializer) materializer).entryFormat())
-                .isEqualTo(EntryFormat.URSA);
+        assertThat(materializer).isInstanceOf(ClickHouseTableMaterializer.class);
     }
 
     @Test

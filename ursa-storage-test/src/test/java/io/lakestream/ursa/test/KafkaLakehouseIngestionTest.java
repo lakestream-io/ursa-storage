@@ -15,7 +15,6 @@ import io.lakestream.ursa.lakehouse.utils.LakehouseFieldNames;
 import io.lakestream.ursa.lakehouse.v2.serde.delta.KafkaEntryToDeltaRecordEncoder;
 import io.lakestream.ursa.lakehouse.v2.serde.iceberg.KafkaEntryToIcebergRecordEncoder;
 import io.lakestream.ursa.materialization.serde.EntryEncoderContext;
-import io.lakestream.ursa.materialization.serde.EntryFormat;
 import io.lakestream.ursa.materialization.serde.GenericEntry;
 import io.lakestream.ursa.materialization.serde.MaterializationRecord;
 import io.lakestream.ursa.materialization.serde.ResultConsumer;
@@ -109,7 +108,7 @@ class KafkaLakehouseIngestionTest {
         var encoder = new KafkaEntryToDeltaRecordEncoder(new KafkaSchemaService(registry, false));
 
         encoder.encode(topic, entry, resultConsumer(result), null,
-            EntryEncoderContext.builder().entryFormat(EntryFormat.URSA).build());
+            EntryEncoderContext.builder().build());
 
         GenericRow row = result.get().record();
         assertThat(row.getLong(row.getSchema().indexOf("id"))).isEqualTo(84L);
@@ -135,7 +134,6 @@ class KafkaLakehouseIngestionTest {
         var result = new AtomicReference<MaterializationRecord<Record>>();
         var encoder = new KafkaEntryToIcebergRecordEncoder(schemaService);
         var context = EntryEncoderContext.builder()
-            .entryFormat(EntryFormat.URSA)
             .isPersistKey(true)
             .build();
 

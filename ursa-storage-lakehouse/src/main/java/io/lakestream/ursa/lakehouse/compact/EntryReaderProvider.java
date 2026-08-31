@@ -5,9 +5,8 @@
 package io.lakestream.ursa.lakehouse.compact;
 
 /**
- * Seam that supplies an {@link IEntryReader} for a stream's offset range. Lets
- * {@link LakehouseMaterializationService} read source entries through the configured source reader via the
- * production {@link EntryProcessFactory} while staying unit-testable with a stub reader.
+ * Test seam that supplies an {@link IEntryReader} for a stream's offset range. Production reads use
+ * the StorageApi-backed {@link EntryProcessFactory}; tests may inject a stub reader.
  */
 interface EntryReaderProvider {
 

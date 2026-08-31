@@ -33,9 +33,9 @@ import io.lakestream.ursa.materialization.MaterializationServiceConfig;
 import io.lakestream.ursa.materialization.MaterializationTask;
 import io.lakestream.ursa.materialization.TableMaterializer;
 import io.lakestream.ursa.materialization.TableMaterializerFactory;
-import io.lakestream.ursa.materialization.serde.EntryFormat;
 import io.lakestream.ursa.materialization.serde.GenericEntry;
 import io.lakestream.ursa.materialization.serde.LakehouseEntryMetadata;
+import io.lakestream.ursa.materialization.serde.kafka.KafkaSourceMetadata;
 import io.lakestream.ursa.metrics.InstrumentProvider;
 import io.lakestream.ursa.storage.StorageApi;
 import java.util.ArrayList;
@@ -44,7 +44,6 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -109,19 +108,10 @@ public class LakehouseMaterializationService implements MaterializationService {
             });
     private volatile boolean closed;
 
-    /**
-     * Supplies entry readers (Ursa WAL or Kafka). Built lazily from config on first use;
-     * package-private setter lets tests inject a stub reader so the read loop is unit-testable.
-     */
+    /** Supplies Ursa WAL readers; tests may inject a stub reader for the read loop. */
     private volatile EntryReaderProvider entryReaderProvider;
-    /**
-     * Source-aware entry-reader factories, cached per {@link EntryFormat}. The source is a per-task
-     * {@code entryFormat} property (URSA / KAFKA), and
-     * partitions of different types can be compacted concurrently by the shared service, so a single
-     * cached factory would read a Kafka task off the WAL (or vice versa) and fail with
-     * {@code NoSuchOffsetException}. Keyed by format so each source gets the right reader.
-     */
-    private final Map<EntryFormat, EntryProcessFactory> entryProcessFactories = new ConcurrentHashMap<>();
+    /** Lazily-created factory for reading native entries through {@link StorageApi}. */
+    private volatile EntryProcessFactory entryProcessFactory;
     /**
      * Lazily-built factory for the SBT (managed) writer. The managed {@code LakehouseWriter}
      * compacts the same WAL entries into topic-grouped parquet "Compacted Objects" — the stream's own
@@ -211,16 +201,10 @@ public class LakehouseMaterializationService implements MaterializationService {
             task.startOffset(), task.endOffset(), task.stream().fullName(), catalog.name(), catalogType,
             resolved.tableIdentifier().namespace(), resolved.tableIdentifier().name());
 
-        // Thread the source entry format (URSA / KAFKA) from the originating compaction task
-        // into the runtime so the sink picks the source-aware encoder. Also carry the
-        // task's properties (legacy DynamicConfigs: sdtCatalogName, identifierFields, upsertMode,
-        // baseSchemaVersion, …) so the sink stays compatible with task-property-driven materialization.
-        final EntryFormat entryFormat = entryFormatOf(task);
+        // Carry the task's properties (legacy DynamicConfigs: sdtCatalogName, identifierFields,
+        // upsertMode, baseSchemaVersion, …) so the sink stays compatible with
+        // task-property-driven materialization. Source entries always come from Ursa StorageApi.
         final Map<String, String> sourceTaskProperties = sourceTaskProperties(task);
-        final String sourceReadTopic = KafkaEntryProcessFactory.resolveSourceTopic(
-                task.sourceTopic(), entryFormat, sourceTaskProperties);
-        final MaterializationRuntime writerRuntime = runtime.withEntryFormat(entryFormat)
-                .withTaskProperties(sourceTaskProperties);
         // A TableMaterializer is single-use (commit()/close() are terminal), so build a fresh one per
         // task via the factory — never cache it. A partitioned topic's partitions are compacted by
         // separate worker threads concurrently but share one stream identity (namespace+name, no
@@ -236,16 +220,23 @@ public class LakehouseMaterializationService implements MaterializationService {
         ActiveStreamLease streamLease = null;
         boolean committed = false;
         try {
-            if (externalSink) {
-                // Hold a lease for the entire materialization. Replacing or invalidating the
-                // registered handle retires it immediately, but cannot close it under an in-flight
-                // materializer.
+            if (externalSink || task.sourceTask() != null) {
                 streamLease = acquireActiveStream(task.stream());
                 if (streamLease == null) {
                     throw new MaterializationException(ExceptionCode.INTERNAL_ERROR,
                             "No active Stream handle registered for " + task.stream().fullName()
                                     + "; call registerActiveStream() before materialize()");
                 }
+            }
+            Map<String, String> effectiveWriterProperties = streamLease == null
+                    ? sourceTaskProperties
+                    : writerProperties(sourceTaskProperties, streamLease.stream());
+            if (externalSink) {
+                // Hold a lease for the entire materialization. Replacing or invalidating the
+                // registered handle retires it immediately, but cannot close it under an in-flight
+                // materializer.
+                MaterializationRuntime writerRuntime = runtime.withTaskProperties(
+                        effectiveWriterProperties);
                 TableMaterializer<?> materializer = factory.create(
                         resolved.effectivePolicy(), catalog, streamLease.stream(), writerRuntime);
                 materializers.add(materializer);
@@ -254,15 +245,15 @@ public class LakehouseMaterializationService implements MaterializationService {
                 // opening a reader or writing data.
                 ensureOpen();
             }
-            buildManagedMaterializer(task, task.sourceTopic(), entryFormat).ifPresent(materializers::add);
+            buildManagedMaterializer(task, task.sourceTopic(), effectiveWriterProperties)
+                    .ifPresent(materializers::add);
             ensureOpen();
             if (materializers.isEmpty()) {
                 throw new MaterializationException(ExceptionCode.INTERNAL_ERROR,
                         "No materializer available for stream " + task.stream().fullName()
                                 + " (managed-only catalog but the managed writer was disabled or skipped)");
             }
-            CommitResult result = writeAndCommit(materializers, task, sourceReadTopic, sourceTaskProperties,
-                    entryFormat);
+            CommitResult result = writeAndCommit(materializers, task, task.sourceTopic());
             committed = true;
             runtime.metrics().recordWritten(catalog.name(), catalogType, task.stream());
             log.info("Committed task {} in MaterializationService for stream {}: {}",
@@ -299,8 +290,8 @@ public class LakehouseMaterializationService implements MaterializationService {
     }
 
     /**
-     * Reads the source entries for the task's offset range ONCE (via the
-     * source-aware reader factory) and fans each raw {@link GenericEntry} out to every supplied
+     * Reads the source entries for the task's offset range ONCE through {@link StorageApi} and fans
+     * each raw {@link GenericEntry} out to every supplied
      * {@link TableMaterializer}, then commits them all. Every destination — the SDT sink and the SBT
      * managed Compacted-Object writer alike — is just a materializer, so a single task can sink to
      * multiple destinations from one read pass. Does NOT complete the compaction task; the caller
@@ -310,14 +301,13 @@ public class LakehouseMaterializationService implements MaterializationService {
      */
     @SuppressWarnings({"unchecked", "rawtypes"})
     private CommitResult writeAndCommit(List<TableMaterializer<?>> materializers, MaterializationTask task,
-                                        String sourceTopic, Map<String, String> sourceTaskProperties,
-                                        EntryFormat entryFormat) {
+                                        String sourceTopic) {
         ensureOpen();
         long offset = task.startOffset();
         IEntryReader reader;
         try {
-            reader = openEntryReader(entryFormat,
-                    sourceTopic, task.streamId(), task.startOffset(), task.endOffset(), sourceTaskProperties);
+            reader = openEntryReader(
+                    sourceTopic, task.streamId(), task.startOffset(), task.endOffset());
         } catch (ExceptionWithCode e) {
             throw new MaterializationException(e.getExceptionCode(),
                     "Failed to open entry reader for " + sourceTopic
@@ -406,9 +396,10 @@ public class LakehouseMaterializationService implements MaterializationService {
      * MANAGED mode the SDT materializer itself is the managed writer); {@code getManagedWriter}
      * additionally returns empty when {@code sbtEnabled} is false or {@code skipManagedWriter} is set.
      */
-    private Optional<TableMaterializer<?>> buildManagedMaterializer(MaterializationTask task,
-                                                                     String sourceTopic,
-                                                                     EntryFormat entryFormat) {
+    private Optional<TableMaterializer<?>> buildManagedMaterializer(
+            MaterializationTask task,
+            String sourceTopic,
+            Map<String, String> effectiveWriterProperties) {
         ensureOpen();
         CompactStreamTask sourceTask = task.sourceTask();
         if (sourceTask == null) {
@@ -421,14 +412,10 @@ public class LakehouseMaterializationService implements MaterializationService {
         }
         LakehouseConfiguration lakehouseConfig = new LakehouseConfiguration(properties);
         LakehouseFactory factory = lakehouseFactory(lakehouseConfig);
-        var propertiesForWriter = new HashMap<String, String>();
-        if (sourceTask.getProperties() != null) {
-            propertiesForWriter.putAll(sourceTask.getProperties());
-        }
-        propertiesForWriter.put("entryFormat", entryFormat.name());
         EvolutionPolicy evolutionPolicy = evolutionPolicyFor(
                 task.resolvedMaterialization().catalog().type());
-        Optional<TableMaterializer<?>> materializer = factory.getManagedWriter(sourceTopic, propertiesForWriter)
+        Optional<TableMaterializer<?>> materializer = factory.getManagedWriter(
+                        sourceTopic, effectiveWriterProperties)
                 // The managed writer is an AbstractLakehouseWriter; wrap it as
                 // a materializer with no DLT.
                 .map(writer -> new LakehouseTableMaterializer(
@@ -572,7 +559,7 @@ public class LakehouseMaterializationService implements MaterializationService {
                 config.additionalProperties().getOrDefault("managedTableSchemaEvolutionEnabled", "false"));
     }
 
-    /** Test seam: inject a stub {@link EntryReaderProvider} so the read loop runs without a broker. */
+    /** Test seam: inject a stub {@link EntryReaderProvider} so the read loop runs without storage. */
     synchronized void setEntryReaderProvider(EntryReaderProvider provider) {
         ensureOpen();
         this.entryReaderProvider = provider;
@@ -584,26 +571,6 @@ public class LakehouseMaterializationService implements MaterializationService {
         this.lakehouseFactory = factory;
     }
 
-    /**
-     * The source {@link EntryFormat} for a task (URSA / KAFKA). This is a per-task property: the reader source must
-     * match the task that produced the range. Falls back to the runtime format when a task carries no
-     * source task (unit tests that drive {@code materialize()} directly).
-     */
-    private EntryFormat entryFormatOf(MaterializationTask task) {
-        if (task.sourceTask() != null && task.sourceTask().getProperties() != null) {
-            String configured = task.sourceTask().getProperties().get("entryFormat");
-            if (configured != null && !configured.isBlank()) {
-                try {
-                    return EntryFormat.valueOf(configured.trim().toUpperCase(Locale.ROOT));
-                } catch (IllegalArgumentException e) {
-                    throw new MaterializationException(ExceptionCode.SOURCE_CLIENT_ERROR,
-                            "Unsupported entry format '" + configured + "'; expected URSA or KAFKA", e);
-                }
-            }
-        }
-        return runtime == null || runtime.entryFormat() == null ? EntryFormat.URSA : runtime.entryFormat();
-    }
-
     private static Map<String, String> sourceTaskProperties(MaterializationTask task) {
         if (task.sourceTask() == null || task.sourceTask().getProperties() == null) {
             return Map.of();
@@ -611,14 +578,24 @@ public class LakehouseMaterializationService implements MaterializationService {
         return task.sourceTask().getProperties();
     }
 
-    /**
-     * Opens a reader over {@code [start, end)} for the given per-task source {@code format}. A
-     * test-injected {@link EntryReaderProvider} (format-agnostic stub) takes precedence; otherwise the
-     * cached, source-aware {@link EntryProcessFactory} for {@code format} is used.
-     */
-    private IEntryReader openEntryReader(EntryFormat format, String topic, long streamId,
-                                         long start, long end,
-                                         Map<String, String> sourceTaskProperties) throws Exception {
+    private static Map<String, String> writerProperties(
+            Map<String, String> taskProperties,
+            Stream stream) {
+        Map<String, String> streamProperties = stream.properties();
+        if (streamProperties == null || streamProperties.isEmpty()) {
+            return taskProperties;
+        }
+        Map<String, String> merged = new HashMap<>(streamProperties);
+        merged.putAll(taskProperties);
+        String logicalKafkaTopic = streamProperties.get(KafkaSourceMetadata.TOPIC_NAME_PROPERTY);
+        if (logicalKafkaTopic != null) {
+            merged.put(KafkaSourceMetadata.TOPIC_NAME_PROPERTY, logicalKafkaTopic);
+        }
+        return Map.copyOf(merged);
+    }
+
+    /** Opens a reader over {@code [start, end)} from Ursa storage. */
+    private IEntryReader openEntryReader(String topic, long streamId, long start, long end) throws Exception {
         ensureOpen();
         EntryReaderProvider injected = this.entryReaderProvider;
         if (injected != null) {
@@ -632,14 +609,10 @@ public class LakehouseMaterializationService implements MaterializationService {
                 properties.getProperty("skipMarkerMessages", "false"));
         EntryReaderOptions options = new EntryReaderOptions(skipMarkerMessages);
         // Start with a conservative average entry-size estimate.
-        EntryProcessFactory factory = entryProcessFactoryFor(format, properties);
+        EntryProcessFactory factory = entryProcessFactory();
         ensureOpen();
-        if (sourceTaskProperties == null) {
-            return ensureReaderOpenedBeforeShutdown(
-                    factory.createEntryReader(topic, streamId, start, end, 1024.0, options));
-        }
-        return ensureReaderOpenedBeforeShutdown(factory.createEntryReader(
-                topic, streamId, start, end, 1024.0, options, sourceTaskProperties));
+        return ensureReaderOpenedBeforeShutdown(
+                factory.createEntryReader(topic, streamId, start, end, 1024.0, options));
     }
 
     private IEntryReader ensureReaderOpenedBeforeShutdown(IEntryReader reader) throws Exception {
@@ -656,24 +629,17 @@ public class LakehouseMaterializationService implements MaterializationService {
         }
     }
 
-    /**
-     * Returns the {@link EntryProcessFactory} for {@code format}, building and caching it on first use.
-     * A {@code null} format maps to {@link EntryFormat#URSA} (the storage-native default, and a valid map
-     * key since {@code ConcurrentHashMap} forbids null keys).
-     */
-    synchronized EntryProcessFactory entryProcessFactoryFor(EntryFormat format, Properties properties)
-            throws Exception {
+    /** Returns the lazily-created Ursa {@link EntryProcessFactory}. */
+    synchronized EntryProcessFactory entryProcessFactory() throws Exception {
         ensureOpen();
-        EntryFormat key = format == null ? EntryFormat.URSA : format;
-        EntryProcessFactory existing = entryProcessFactories.get(key);
+        EntryProcessFactory existing = entryProcessFactory;
         if (existing != null) {
             return existing;
         }
-        LakehouseConfiguration lakehouseConfig = new LakehouseConfiguration(properties);
-        EntryProcessFactory factory = buildEntryProcessFactory(key, lakehouseConfig, properties);
+        EntryProcessFactory factory = buildEntryProcessFactory();
         try {
             ensureOpen();
-            entryProcessFactories.put(key, factory);
+            entryProcessFactory = factory;
             return factory;
         } catch (RuntimeException | Error closedFailure) {
             try {
@@ -685,28 +651,16 @@ public class LakehouseMaterializationService implements MaterializationService {
         }
     }
 
-    /**
-     * Builds the source-aware {@link EntryProcessFactory} for {@code format}, mirroring the legacy
-     * {@code LakehouseCompactionServiceImpl}: an Ursa source reads straight off the WAL via
-     * {@link StorageApi}, while a Kafka source reads via a Kafka consumer.
-     */
-    EntryProcessFactory buildEntryProcessFactory(EntryFormat format, LakehouseConfiguration lakehouseConfig,
-                                                 Properties properties) throws Exception {
+    /** Builds the StorageApi-backed entry reader factory. */
+    EntryProcessFactory buildEntryProcessFactory() {
         ensureOpen();
-        if (format == EntryFormat.URSA) {
-            StorageApi storageApi = runtime.storageApi();
-            if (storageApi == null) {
-                throw new MaterializationException(ExceptionCode.INTERNAL_ERROR,
-                        "Ursa source requires a StorageApi in the MaterializationRuntime to read WAL entries");
-            }
-            // Metrics are not yet wired into the materialization read path (T10 uses noop throughout).
-            return new UrsaEntryProcessFactory(storageApi, CompactionMetrics.NOOP);
+        StorageApi storageApi = runtime.storageApi();
+        if (storageApi == null) {
+            throw new MaterializationException(ExceptionCode.INTERNAL_ERROR,
+                    "Materialization requires a StorageApi to read WAL entries");
         }
-        if (format == EntryFormat.KAFKA) {
-            return new KafkaEntryProcessFactory(lakehouseConfig);
-        }
-        throw new MaterializationException(ExceptionCode.INTERNAL_ERROR,
-                "Unsupported materialization entry format: " + format);
+        // Metrics are not yet wired into the materialization read path (T10 uses noop throughout).
+        return new UrsaEntryProcessFactory(storageApi, CompactionMetrics.NOOP);
     }
 
     /**
@@ -753,19 +707,19 @@ public class LakehouseMaterializationService implements MaterializationService {
         }
         streamsToClose.forEach(RetainedStream::tryClose);
         retryRetiredStreams();
-        List<EntryProcessFactory> sourceFactories;
+        EntryProcessFactory sourceFactory;
         LakehouseFactory managedFactory;
         synchronized (this) {
-            sourceFactories = new ArrayList<>(entryProcessFactories.values());
-            entryProcessFactories.clear();
+            sourceFactory = entryProcessFactory;
+            entryProcessFactory = null;
             managedFactory = lakehouseFactory;
             lakehouseFactory = null;
             entryReaderProvider = null;
             factories.clear();
         }
-        for (EntryProcessFactory factory : sourceFactories) {
+        if (sourceFactory != null) {
             try {
-                factory.close();
+                sourceFactory.close();
             } catch (Exception e) {
                 log.warn("Failed to close entry process factory during shutdown", e);
             }

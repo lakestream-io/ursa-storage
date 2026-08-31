@@ -17,9 +17,8 @@ import io.lakestream.api.materialization.TableConf;
 import io.lakestream.api.materialization.TableMaterializationPolicy;
 import io.lakestream.api.materialization.TableMode;
 import io.lakestream.ursa.lakehouse.LakehouseConfiguration;
-import io.lakestream.ursa.lakehouse.compact.KafkaEntryProcessFactory;
-import io.lakestream.ursa.materialization.serde.EntryFormat;
 import io.lakestream.ursa.materialization.serde.kafka.KafkaSchemaService;
+import io.lakestream.ursa.materialization.serde.kafka.KafkaSourceMetadata;
 import java.util.Map;
 import java.util.Optional;
 import org.junit.jupiter.api.Tag;
@@ -29,37 +28,11 @@ import org.junit.jupiter.api.Test;
 class LakehouseWriterFactoryTest {
 
     @Test
-    void recreatedKafkaTopicsKeepDistinctDestinationsButShareLogicalSchemaTopic() {
-        Stream oldStream = mock(Stream.class);
-        Stream newStream = mock(Stream.class);
-        when(oldStream.identifier()).thenReturn(StreamIdentifier.of("default", "orders-old-topic-id"));
-        when(newStream.identifier()).thenReturn(StreamIdentifier.of("default", "orders-new-topic-id"));
-        Map<String, String> taskProperties = Map.of(
-                KafkaEntryProcessFactory.SOURCE_TOPIC_PROPERTY, "orders-partition-3",
-                KafkaEntryProcessFactory.SOURCE_SCHEMA_TOPIC_PROPERTY, "orders");
-
-        assertThat(LakehouseWriterFactory.destinationTopic(oldStream))
-                .isEqualTo("default/orders-old-topic-id");
-        assertThat(LakehouseWriterFactory.destinationTopic(newStream))
-                .isEqualTo("default/orders-new-topic-id");
-        String oldSchemaTopic = LakehouseWriterFactory.schemaTopic(oldStream, taskProperties);
-        String newSchemaTopic = LakehouseWriterFactory.schemaTopic(newStream, taskProperties);
-        assertThat(oldSchemaTopic).isEqualTo("orders");
-        assertThat(newSchemaTopic).isEqualTo("orders");
-
-        KafkaSchemaService schemaService = new KafkaSchemaService(mock(SchemaRegistryClient.class), false);
-        assertThat(schemaService.getSubject(oldSchemaTopic)).isEqualTo("orders-value");
-        assertThat(schemaService.getSubject(newSchemaTopic)).isEqualTo("orders-value");
-    }
-
-    @Test
-    void legacyPartitionTaskDerivesUnpartitionedSchemaSubject() {
+    void partitionedStorageStreamDerivesUnpartitionedSchemaSubject() {
         Stream stream = mock(Stream.class);
         when(stream.identifier()).thenReturn(StreamIdentifier.of("default", "orders-partition-3"));
-        Map<String, String> legacyProperties = Map.of(
-                KafkaEntryProcessFactory.SOURCE_TOPIC_PROPERTY, "orders-partition-3");
 
-        String schemaTopic = LakehouseWriterFactory.schemaTopic(stream, legacyProperties);
+        String schemaTopic = LakehouseWriterFactory.schemaTopic(stream, Map.of());
 
         assertThat(schemaTopic).isEqualTo("orders");
         KafkaSchemaService schemaService = new KafkaSchemaService(mock(SchemaRegistryClient.class), false);
@@ -67,7 +40,19 @@ class LakehouseWriterFactoryTest {
     }
 
     @Test
-    void externalDeltaDltCanBeDisabledForKafkaFailureRetryPolicy() {
+    void uuidQualifiedStorageStreamUsesRegisteredKafkaTopicForSchemaLookup() {
+        Stream stream = mock(Stream.class);
+        when(stream.identifier()).thenReturn(StreamIdentifier.of(
+                "default", "orders-topic-id-65WMNfybQpCDVulYOxMCTw"));
+
+        String schemaTopic = LakehouseWriterFactory.schemaTopic(
+                stream, Map.of(KafkaSourceMetadata.TOPIC_NAME_PROPERTY, "orders"));
+
+        assertThat(schemaTopic).isEqualTo("orders");
+    }
+
+    @Test
+    void externalDeltaDltCanBeDisabledByTaskPolicy() {
         TableCatalog catalog = new TableCatalog(
                 "delta-catalog",
                 TableCatalogType.DELTA,
@@ -81,7 +66,6 @@ class LakehouseWriterFactoryTest {
                 catalog,
                 stream,
                 "delta",
-                EntryFormat.KAFKA,
                 Map.of(LakehouseConfiguration.DELTA_DLT_ENABLED, "false"));
 
         assertThat(dltWriter).isEmpty();

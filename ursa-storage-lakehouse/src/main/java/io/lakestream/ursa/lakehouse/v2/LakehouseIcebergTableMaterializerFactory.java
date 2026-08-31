@@ -50,7 +50,7 @@ public final class LakehouseIcebergTableMaterializerFactory implements TableMate
                 LakehouseWriterFactory.iceberg(policy, resolvedCatalog, stream, runtime);
         Optional<LakehouseRecordWriter<FailureMessage>> dltWriter =
                 LakehouseWriterFactory.externalDltWriter(policy, resolvedCatalog, stream, "iceberg",
-                        runtime.entryFormat(), runtime.taskProperties());
+                        runtime.taskProperties());
         dltWriter.ifPresent(dlt -> writer.registerFailureMessageHandler(DLTFailureMessageHandler.of(dlt)));
         return new LakehouseTableMaterializer(writer, EvolutionPolicy.forIceberg(), dltWriter.orElse(null));
     }
