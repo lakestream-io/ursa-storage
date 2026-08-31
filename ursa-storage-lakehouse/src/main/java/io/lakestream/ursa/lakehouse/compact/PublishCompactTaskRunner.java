@@ -17,6 +17,7 @@ import io.lakestream.ursa.compaction.CompactTaskManager;
 import io.lakestream.ursa.compaction.CompactionManager;
 import io.lakestream.ursa.compaction.DynamicConfigs;
 import io.lakestream.ursa.compaction.PublicationFencedException;
+import io.lakestream.ursa.compaction.PublicationRecoveryException;
 import io.lakestream.ursa.compaction.metrics.CompactionMetrics;
 import io.lakestream.ursa.compaction.task.PreparedCompactStreamTask;
 import io.lakestream.ursa.lakehouse.utils.TopicNames;
@@ -34,15 +35,19 @@ import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.LongSupplier;
 import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
 
@@ -60,13 +65,17 @@ import lombok.extern.slf4j.Slf4j;
 public final class PublishCompactTaskRunner implements Runnable, StartStopRunner {
 
     static final String ENTRY_FORMAT_PROPERTY = "entryFormat";
+    static final long MIN_PUBLICATION_RECOVERY_BACKOFF_MILLIS = TimeUnit.SECONDS.toMillis(30);
+    static final long MIN_PUBLICATION_TASK_TIMEOUT_MILLIS = TimeUnit.SECONDS.toMillis(30);
     private static final int MAX_FAIR_PUBLICATION_QUANTUM = 100;
     private static final AttributeKey<String> TOPIC_ATTRIBUTE = AttributeKey.stringKey("topic");
 
     private final StreamCatalog streamCatalog;
     private final CompactionManager compactionManager;
     private final ExecutorService scanExecutor;
-    private final ScheduledExecutorService publishExecutor;
+    private final ScheduledExecutorService publicationControlExecutor;
+    private final ExecutorService publicationWorkerExecutor;
+    private final PublicationCoordinator publicationCoordinator;
     private final long scanIntervalMillis;
     private final int checkMessageStepLength;
     private final int maxTasksPerPublisherPerScan;
@@ -76,9 +85,13 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
     private final Set<String> excludedNamespaces;
     private final Set<String> excludedStreams;
     private final CompactionMetrics compactionMetrics;
+    private final LongSupplier currentTimeMillis;
+    private final long publicationRecoveryBackoffMillis;
+    private final long publicationTaskTimeoutMillis;
     private final Map<String, PartitionPublisher> publishers = new ConcurrentHashMap<>();
     private final Map<String, Long> tailWaitStartedAtMillis = new ConcurrentHashMap<>();
     private final Map<String, Long> unavailablePublicationLeases = new ConcurrentHashMap<>();
+    private final Map<String, PublicationQuarantine> publicationQuarantines = new ConcurrentHashMap<>();
     private final AtomicBoolean pendingLeaseReleaseRetryScheduled = new AtomicBoolean();
 
     private volatile boolean stopped;
@@ -86,35 +99,97 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
     private volatile boolean publicationLeaseUnavailable;
     private volatile Future<?> scanFuture;
     private volatile ScheduledFuture<?> nextScanFuture;
+    // Guarded by this. Invalidates publication sessions acquired outside the monitor when a fatal
+    // scan reset happens before they can be installed in publishers.
+    private long publisherEpoch;
 
     public PublishCompactTaskRunner(StreamCatalog streamCatalog,
                                     CompactTaskManager compactTaskManager,
                                     ExecutorService scanExecutor,
-                                    ScheduledExecutorService publishExecutor,
+                                    ScheduledExecutorService publicationControlExecutor,
+                                    ExecutorService publicationWorkerExecutor,
                                     StorageConfig storageConfig,
                                     CompactionMetrics compactionMetrics) {
         this(streamCatalog,
                 new CompactionManager(compactTaskManager, compactionMetrics),
                 scanExecutor,
-                publishExecutor,
+                publicationControlExecutor,
+                publicationWorkerExecutor,
                 storageConfig,
-                compactionMetrics);
+                compactionMetrics,
+                new PublicationCoordinator(storageConfig.getPublishThreadNum()));
     }
 
     PublishCompactTaskRunner(StreamCatalog streamCatalog,
                              CompactionManager compactionManager,
                              ExecutorService scanExecutor,
-                             ScheduledExecutorService publishExecutor,
+                             ScheduledExecutorService publicationControlExecutor,
+                             ExecutorService publicationWorkerExecutor,
                              StorageConfig storageConfig,
-                             CompactionMetrics compactionMetrics) {
+                             CompactionMetrics compactionMetrics,
+                             PublicationCoordinator publicationCoordinator) {
+        this(streamCatalog,
+                compactionManager,
+                scanExecutor,
+                publicationControlExecutor,
+                publicationWorkerExecutor,
+                storageConfig,
+                compactionMetrics,
+                publicationCoordinator,
+                System::currentTimeMillis);
+    }
+
+    PublishCompactTaskRunner(StreamCatalog streamCatalog,
+                             CompactionManager compactionManager,
+                             ExecutorService scanExecutor,
+                             ScheduledExecutorService publicationControlExecutor,
+                             ExecutorService publicationWorkerExecutor,
+                             StorageConfig storageConfig,
+                             CompactionMetrics compactionMetrics,
+                             PublicationCoordinator publicationCoordinator,
+                             LongSupplier currentTimeMillis) {
+        this(streamCatalog,
+                compactionManager,
+                scanExecutor,
+                publicationControlExecutor,
+                publicationWorkerExecutor,
+                storageConfig,
+                compactionMetrics,
+                publicationCoordinator,
+                currentTimeMillis,
+                defaultPublicationTaskTimeoutMillis(storageConfig));
+    }
+
+    PublishCompactTaskRunner(StreamCatalog streamCatalog,
+                             CompactionManager compactionManager,
+                             ExecutorService scanExecutor,
+                             ScheduledExecutorService publicationControlExecutor,
+                             ExecutorService publicationWorkerExecutor,
+                             StorageConfig storageConfig,
+                             CompactionMetrics compactionMetrics,
+                             PublicationCoordinator publicationCoordinator,
+                             LongSupplier currentTimeMillis,
+                             long publicationTaskTimeoutMillis) {
         this.streamCatalog = Objects.requireNonNull(streamCatalog, "streamCatalog");
         this.compactionManager = Objects.requireNonNull(compactionManager, "compactionManager");
         this.scanExecutor = Objects.requireNonNull(scanExecutor, "scanExecutor");
-        this.publishExecutor = Objects.requireNonNull(publishExecutor, "publishExecutor");
+        this.publicationControlExecutor =
+                Objects.requireNonNull(publicationControlExecutor, "publicationControlExecutor");
+        this.publicationWorkerExecutor =
+                Objects.requireNonNull(publicationWorkerExecutor, "publicationWorkerExecutor");
+        this.publicationCoordinator =
+                Objects.requireNonNull(publicationCoordinator, "publicationCoordinator");
         this.baseProperties = Objects.requireNonNull(storageConfig, "storageConfig").getProperties();
         this.compactionMetrics = Objects.requireNonNull(compactionMetrics, "compactionMetrics");
+        this.currentTimeMillis = Objects.requireNonNull(currentTimeMillis, "currentTimeMillis");
         this.scanIntervalMillis = TimeUnit.SECONDS.toMillis(
                 Math.max(1L, storageConfig.getRefreshLocalTaskIntervalInSeconds()));
+        this.publicationRecoveryBackoffMillis = Math.max(
+                MIN_PUBLICATION_RECOVERY_BACKOFF_MILLIS, scanIntervalMillis);
+        if (publicationTaskTimeoutMillis <= 0) {
+            throw new IllegalArgumentException("publicationTaskTimeoutMillis must be positive");
+        }
+        this.publicationTaskTimeoutMillis = publicationTaskTimeoutMillis;
         this.checkMessageStepLength = Math.max(1, storageConfig.getCheckCompactMessageStepLength());
         this.maxTasksPerPublisherPerScan = Math.max(1,
                 Math.min(MAX_FAIR_PUBLICATION_QUANTUM, storageConfig.getPublishThreadPendingTasks()));
@@ -128,6 +203,13 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
                 .collect(Collectors.toUnmodifiableSet());
     }
 
+    private static long defaultPublicationTaskTimeoutMillis(StorageConfig storageConfig) {
+        return Math.max(
+                MIN_PUBLICATION_TASK_TIMEOUT_MILLIS,
+                TimeUnit.SECONDS.toMillis(Math.max(
+                        1L, storageConfig.getRefreshLocalTaskIntervalInSeconds())));
+    }
+
     private static Optional<String> parseExcludedStream(String configuredName) {
         try {
             return Optional.of(TopicNames.partitionedTopicName(configuredName));
@@ -139,40 +221,147 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
 
     @Override
     public void start() {
+        RuntimeException submissionFailure = null;
+        Error fatalSubmissionFailure = null;
         synchronized (this) {
             if (stopped || (scanFuture != null && !scanFuture.isDone())) {
                 return;
             }
-            scanFuture = scanExecutor.submit(this);
+            try {
+                scanFuture = scanExecutor.submit(this);
+            } catch (RuntimeException failure) {
+                submissionFailure = failure;
+            } catch (Error failure) {
+                fatalSubmissionFailure = failure;
+            }
+        }
+        if (fatalSubmissionFailure != null) {
+            superviseRunnerFailure(
+                    fatalSubmissionFailure, "submit the next compaction publication scan");
+            throw fatalSubmissionFailure;
+        }
+        if (submissionFailure != null) {
+            superviseRunnerFailure(
+                    submissionFailure, "submit the next compaction publication scan");
+            throw submissionFailure;
         }
     }
 
     @Override
     public void run() {
-        boolean scheduleNextScan = true;
         try {
-            scanCatalogOnce();
-            while (!stopped && backlogRemaining) {
-                drainPublisherBacklogOnce();
-            }
-        } catch (Exception error) {
-            recordActivePublisherCount();
-            if (!stopped) {
-                log.warn("Failed to discover streams and publish compaction tasks", error);
-                compactionMetrics.getPublishTaskFailedCount().increment();
-            }
-        } catch (Error fatal) {
-            scheduleNextScan = false;
-            throw fatal;
-        } finally {
-            synchronized (this) {
-                if (!stopped && scheduleNextScan) {
-                    long nextDelayMillis = publicationLeaseUnavailable
-                            ? Math.min(1000L, scanIntervalMillis) : scanIntervalMillis;
-                    nextScanFuture = publishExecutor.schedule(
-                            this::start, nextDelayMillis, TimeUnit.MILLISECONDS);
+            try {
+                scanCatalogOnce();
+                while (!stopped && backlogRemaining) {
+                    drainPublisherBacklogOnce();
+                }
+            } catch (Exception error) {
+                recordActivePublisherCount();
+                if (!stopped) {
+                    log.warn("Failed to discover streams and publish compaction tasks", error);
+                    compactionMetrics.getPublishTaskFailedCount().increment();
                 }
             }
+        } catch (Error fatal) {
+            superviseRunnerFailure(fatal, "run the compaction publication scan");
+            throw fatal;
+        } finally {
+            scheduleNextScan();
+        }
+    }
+
+    private void scheduleNextScan() {
+        RuntimeException schedulingFailure = null;
+        Error fatalSchedulingFailure = null;
+        synchronized (this) {
+            if (stopped) {
+                return;
+            }
+            long nextDelayMillis = publicationLeaseUnavailable
+                    ? Math.min(1000L, scanIntervalMillis) : scanIntervalMillis;
+            try {
+                nextScanFuture = publicationControlExecutor.schedule(
+                        this::start, nextDelayMillis, TimeUnit.MILLISECONDS);
+            } catch (RuntimeException failure) {
+                schedulingFailure = failure;
+            } catch (Error failure) {
+                fatalSchedulingFailure = failure;
+            }
+        }
+        if (fatalSchedulingFailure != null) {
+            superviseRunnerFailure(
+                    fatalSchedulingFailure, "schedule the next compaction publication scan");
+            throw fatalSchedulingFailure;
+        }
+        if (schedulingFailure != null) {
+            superviseRunnerFailure(
+                    schedulingFailure, "schedule the next compaction publication scan");
+            throw schedulingFailure;
+        }
+    }
+
+    /**
+     * Fences and releases every local publisher before a scan submission, execution, or scheduling
+     * failure escapes.
+     *
+     * <p>{@link ExecutorService#submit(Runnable)} captures failures in its returned future, so a
+     * rethrow alone is not supervision: without this cleanup, the runner could silently stop while
+     * retaining all of its publication leases. Releasing the leases lets a peer take over even when
+     * the local control loop cannot schedule another scan.
+     */
+    private void superviseRunnerFailure(Throwable failure, String operation) {
+        Map<String, PartitionPublisher> sessions;
+        synchronized (this) {
+            sessions = fenceLocalPublishers();
+        }
+        closeFencedPublishers(sessions, failure);
+        recordRunnerFailureBestEffort(failure, operation);
+    }
+
+    /** Caller must hold this runner's monitor. */
+    private Map<String, PartitionPublisher> fenceLocalPublishers() {
+        publisherEpoch++;
+        Map<String, PartitionPublisher> sessions = Map.copyOf(publishers);
+        sessions.values().forEach(PartitionPublisher::fence);
+        publishers.clear();
+        tailWaitStartedAtMillis.clear();
+        unavailablePublicationLeases.clear();
+        backlogRemaining = false;
+        return sessions;
+    }
+
+    private void closeFencedPublishers(
+            Map<String, PartitionPublisher> sessions, Throwable failure) {
+        for (PartitionPublisher publisher : sessions.values()) {
+            try {
+                tryClosePublisher(publisher);
+            } catch (Exception | Error closeFailure) {
+                if (closeFailure != failure) {
+                    failure.addSuppressed(closeFailure);
+                }
+                // tryClosePublisher already retained the exact lease and scheduled both manager-
+                // level and session-level release retries. Continue so one bad release cannot keep
+                // any other publisher owned by this runner alive.
+            }
+        }
+    }
+
+    private void recordRunnerFailureBestEffort(Throwable failure, String operation) {
+        try {
+            log.error("Failed to {}; all local publishers were fenced and their leases were released",
+                    operation, failure);
+        } catch (Exception | Error observabilityFailure) {
+            addSuppressed(failure, observabilityFailure);
+        }
+        try {
+            compactionMetrics.getPublishTaskFailedCount().increment();
+        } catch (Exception | Error observabilityFailure) {
+            addSuppressed(failure, observabilityFailure);
+        }
+        try {
+            recordActivePublisherCount();
+        } catch (Exception | Error observabilityFailure) {
+            addSuppressed(failure, observabilityFailure);
         }
     }
 
@@ -183,6 +372,7 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
         retryPendingLeaseReleases();
         Map<String, PartitionIdentity> discovered = discoverPartitions();
         unavailablePublicationLeases.keySet().retainAll(discovered.keySet());
+        clearObsoletePublicationQuarantines(discovered);
         if (stopped) {
             return;
         }
@@ -220,70 +410,319 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
     }
 
     private void publishDiscovered(Iterable<PartitionIdentity> discovered) throws Exception {
-        List<Future<?>> publicationFutures = new ArrayList<>();
+        long scanPublisherEpoch = currentPublisherEpoch();
+        List<PublicationRequest> requests = new ArrayList<>();
         for (PartitionIdentity identity : discovered) {
             if (stopped) {
                 break;
             }
-            try {
-                publicationFutures.add(publishExecutor.submit(() -> publishIdentity(identity)));
-            } catch (RejectedExecutionException rejected) {
-                if (!stopped) {
-                    recordPartitionFailure(identity.taskTopic(), "schedule task publication", rejected);
-                }
+            if (publicationBackoffActive(identity)) {
+                continue;
             }
+            requests.add(new PublicationRequest(
+                    identity,
+                    scanPublisherEpoch,
+                    attempt -> publishIdentity(identity, scanPublisherEpoch, attempt)));
         }
-        awaitPublication(publicationFutures, "catalog scan");
+        publishInWindows(requests, "catalog scan");
     }
 
     private void publishExisting(List<PartitionPublisher> existing) throws Exception {
-        List<Future<?>> publicationFutures = new ArrayList<>();
+        long scanPublisherEpoch = currentPublisherEpoch();
+        List<PublicationRequest> requests = new ArrayList<>();
         for (PartitionPublisher publisher : existing) {
             if (stopped) {
                 break;
             }
-            try {
-                publicationFutures.add(publishExecutor.submit(() -> publishAvailable(publisher)));
-            } catch (RejectedExecutionException rejected) {
-                if (!stopped) {
-                    recordPartitionFailure(
-                            publisher.identity().taskTopic(), "schedule backlog publication", rejected);
-                }
-            }
+            requests.add(new PublicationRequest(
+                    publisher.identity(),
+                    scanPublisherEpoch,
+                    attempt -> publishAvailable(publisher, scanPublisherEpoch, attempt)));
         }
-        awaitPublication(publicationFutures, "publisher backlog");
+        publishInWindows(requests, "publisher backlog");
     }
 
-    private void publishIdentity(PartitionIdentity identity) {
+    private void publishInWindows(List<PublicationRequest> requests, String scope) throws Exception {
+        int nextRequest = 0;
+        while (!stopped && nextRequest < requests.size()) {
+            BlockingQueue<PublicationCompletion> completions = new LinkedBlockingQueue<>();
+            List<PublicationAttempt> batch = new ArrayList<>();
+            boolean waitForCapacity = false;
+            while (!stopped && nextRequest < requests.size()) {
+                PublicationRequest request = requests.get(nextRequest);
+                if (publicationBackoffActive(request.identity())) {
+                    nextRequest++;
+                    continue;
+                }
+                PublicationAttempt attempt = new PublicationAttempt(
+                        request.identity(), request.publisherEpoch(), scope, completions);
+                RegistrationStatus registration = publicationCoordinator.tryRegister(attempt);
+                if (registration == RegistrationStatus.DUPLICATE) {
+                    nextRequest++;
+                    continue;
+                }
+                if (registration != RegistrationStatus.REGISTERED) {
+                    waitForCapacity = registration == RegistrationStatus.WINDOW_FULL;
+                    break;
+                }
+                nextRequest++;
+                try {
+                    Future<?> workerFuture = publicationWorkerExecutor.submit(
+                            () -> executePublicationAttempt(attempt, request.action()));
+                    setPublicationWorkerFuture(attempt, workerFuture);
+                    batch.add(attempt);
+                } catch (Throwable schedulingFailure) {
+                    publicationCoordinator.submissionFailed(attempt);
+                    if (schedulingFailure instanceof Error fatal) {
+                        detachPublicationObservers(batch);
+                        throw fatal;
+                    }
+                    if (!stopped) {
+                        recordPartitionFailure(
+                                request.identity().taskTopic(),
+                                "schedule task publication",
+                                schedulingFailure);
+                    }
+                }
+            }
+            if (batch.isEmpty()) {
+                if (waitForCapacity || publicationCoordinator.isStickyLimitReached()) {
+                    return;
+                }
+                continue;
+            }
+            awaitPublication(completions, batch);
+        }
+    }
+
+    private void executePublicationAttempt(
+            PublicationAttempt attempt, PublicationAction publicationAction) {
+        Throwable failure = null;
         try {
+            if (startPublicationDeadline(attempt)) {
+                publicationAction.run(attempt);
+            }
+        } catch (RuntimeException | Error error) {
+            failure = error;
+        } finally {
+            finishPublicationAttempt(attempt, failure);
+        }
+    }
+
+    private boolean startPublicationDeadline(PublicationAttempt attempt) {
+        ScheduledFuture<?> timeoutFuture = publicationControlExecutor.schedule(
+                () -> timeoutPublicationAttempt(attempt),
+                publicationTaskTimeoutMillis,
+                TimeUnit.MILLISECONDS);
+        synchronized (attempt) {
+            attempt.timeoutFuture = timeoutFuture;
+            if (attempt.workerFinished || attempt.timedOut) {
+                timeoutFuture.cancel(false);
+            }
+            return !attempt.workerFinished && !attempt.timedOut;
+        }
+    }
+
+    private void setPublicationWorkerFuture(PublicationAttempt attempt, Future<?> workerFuture) {
+        boolean cancel;
+        synchronized (attempt) {
+            attempt.workerFuture = workerFuture;
+            cancel = attempt.timedOut;
+        }
+        if (cancel) {
+            workerFuture.cancel(true);
+        }
+    }
+
+    private void publishIdentity(
+            PartitionIdentity identity,
+            long scanPublisherEpoch,
+            PublicationAttempt attempt) {
+        try {
+            if (!isCurrentPublisherEpoch(scanPublisherEpoch)
+                    || !isPublicationAttemptActive(attempt)
+                    || publicationBackoffActive(identity)) {
+                return;
+            }
             PartitionPublisher publisher = publishers.get(identity.taskTopic());
             if (publisher == null) {
-                publisher = openPublisher(identity);
+                publisher = openPublisher(identity, scanPublisherEpoch, attempt);
                 if (publisher == null) {
                     return;
                 }
             }
-            publishAvailable(publisher);
+            publishAvailable(publisher, scanPublisherEpoch, attempt);
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
+        } catch (PublicationRecoveryException recoveryFailure) {
+            if (isCurrentPublisherEpoch(scanPublisherEpoch)) {
+                PublicationQuarantine quarantine = enterPublicationQuarantine(identity);
+                recordPublicationQuarantineBestEffort(quarantine, recoveryFailure);
+            }
         } catch (Exception error) {
-            recordPartitionFailure(identity.taskTopic(), "open task publisher", error);
+            if (isCurrentPublisherEpoch(scanPublisherEpoch)) {
+                recordPartitionFailure(identity.taskTopic(), "open task publisher", error);
+            }
         }
     }
 
-    private void awaitPublication(List<Future<?>> publicationFutures, String scope) throws Exception {
-        for (Future<?> publicationFuture : publicationFutures) {
-            try {
-                publicationFuture.get();
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-                throw interrupted;
-            } catch (ExecutionException error) {
-                if (error.getCause() instanceof Error fatal) {
+    private void awaitPublication(
+            BlockingQueue<PublicationCompletion> completedPublications,
+            List<PublicationAttempt> publicationAttempts) throws Exception {
+        try {
+            for (int completed = 0; completed < publicationAttempts.size(); completed++) {
+                PublicationCompletion completion = completedPublications.take();
+                if (completion.timedOut() || completion.failure() == null) {
+                    continue;
+                }
+                Throwable cause = unwrapCompletionFailure(completion.failure());
+                if (cause instanceof Error fatal) {
                     throw fatal;
                 }
-                recordPartitionFailure(scope, "complete task publication", error.getCause());
+                recordPartitionFailure(
+                        completion.attempt().identity.taskTopic(),
+                        "complete task publication",
+                        cause);
             }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            detachPublicationObservers(publicationAttempts);
+            throw interrupted;
+        } catch (RuntimeException | Error failure) {
+            detachPublicationObservers(publicationAttempts);
+            throw failure;
+        }
+    }
+
+    private void timeoutPublicationAttempt(PublicationAttempt attempt) {
+        boolean reachedStickyLimit;
+        synchronized (attempt) {
+            if (attempt.workerFinished || attempt.timedOut) {
+                return;
+            }
+            attempt.timedOut = true;
+            reachedStickyLimit = publicationCoordinator.timedOut(attempt);
+        }
+        RuntimeException timeout = new RuntimeException(
+                "Timed out after " + publicationTaskTimeoutMillis
+                        + "ms while running " + attempt.scope + " publication of "
+                        + attempt.identity.taskTopic());
+        try {
+            quarantineTimedOutPublication(attempt.identity, timeout);
+        } finally {
+            attempt.completions.offer(new PublicationCompletion(attempt, null, true));
+            Future<?> workerFuture;
+            synchronized (attempt) {
+                workerFuture = attempt.workerFuture;
+            }
+            if (workerFuture != null) {
+                workerFuture.cancel(true);
+            }
+            if (reachedStickyLimit) {
+                recordStickyPublicationLimitBestEffort(timeout);
+            }
+        }
+    }
+
+    private void quarantineTimedOutPublication(
+            PartitionIdentity identity, RuntimeException timeout) {
+        PublicationQuarantine quarantine;
+        PartitionPublisher timedOutPublisher = null;
+        synchronized (this) {
+            quarantine = enterPublicationQuarantine(identity);
+            PartitionPublisher current = publishers.get(identity.taskTopic());
+            if (current != null
+                    && current.identity().logId().id() == identity.logId().id()
+                    && publishers.remove(identity.taskTopic(), current)) {
+                current.fence();
+                timedOutPublisher = current;
+                tailWaitStartedAtMillis.remove(identity.taskTopic());
+            }
+        }
+        try {
+            if (timedOutPublisher != null) {
+                tryClosePublisher(timedOutPublisher);
+            }
+        } finally {
+            recordPublicationTimeoutBestEffort(quarantine, timeout);
+        }
+    }
+
+    private void finishPublicationAttempt(PublicationAttempt attempt, Throwable failure) {
+        boolean timedOut;
+        boolean observerDetached;
+        ScheduledFuture<?> timeoutFuture;
+        synchronized (attempt) {
+            if (attempt.workerFinished) {
+                return;
+            }
+            attempt.workerFinished = true;
+            timedOut = attempt.timedOut;
+            observerDetached = attempt.observerDetached;
+            timeoutFuture = attempt.timeoutFuture;
+            publicationCoordinator.finished(attempt, timedOut);
+        }
+        if (timeoutFuture != null) {
+            timeoutFuture.cancel(false);
+        }
+        if (!timedOut && !observerDetached) {
+            attempt.completions.offer(new PublicationCompletion(attempt, failure, false));
+        } else if (failure instanceof Error fatal) {
+            if (!superviseLateFatalPublicationIfCurrent(attempt.publisherEpoch, fatal)) {
+                recordLateFatalPublicationBestEffort(attempt.identity, fatal);
+            }
+        }
+    }
+
+    private boolean superviseLateFatalPublicationIfCurrent(
+            long expectedPublisherEpoch, Error fatal) {
+        Map<String, PartitionPublisher> sessions;
+        synchronized (this) {
+            if (stopped || publisherEpoch != expectedPublisherEpoch) {
+                return false;
+            }
+            sessions = fenceLocalPublishers();
+        }
+        closeFencedPublishers(sessions, fatal);
+        recordRunnerFailureBestEffort(
+                fatal, "complete a detached compaction publication in the current publisher epoch");
+        return true;
+    }
+
+    private void recordLateFatalPublicationBestEffort(
+            PartitionIdentity identity, Error fatal) {
+        try {
+            log.error("A detached or timed-out compaction publication for {} (physical log {}) "
+                            + "failed fatally after its publisher epoch was fenced",
+                    identity.taskTopic(), identity.logId().id(), fatal);
+        } catch (Exception | Error observabilityFailure) {
+            addSuppressed(fatal, observabilityFailure);
+        }
+        try {
+            compactionMetrics.getPublishTaskFailedCount().increment();
+        } catch (Exception | Error observabilityFailure) {
+            addSuppressed(fatal, observabilityFailure);
+        }
+    }
+
+    private static void detachPublicationObservers(List<PublicationAttempt> publicationAttempts) {
+        for (PublicationAttempt attempt : publicationAttempts) {
+            Future<?> workerFuture = null;
+            synchronized (attempt) {
+                if (!attempt.workerFinished && !attempt.timedOut) {
+                    attempt.observerDetached = true;
+                    workerFuture = attempt.workerFuture;
+                }
+            }
+            if (workerFuture != null) {
+                workerFuture.cancel(true);
+            }
+        }
+    }
+
+    private static boolean isPublicationAttemptActive(PublicationAttempt attempt) {
+        synchronized (attempt) {
+            return !attempt.workerFinished && !attempt.timedOut;
         }
     }
 
@@ -338,7 +777,14 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
         return discovered;
     }
 
-    private PartitionPublisher openPublisher(PartitionIdentity identity) throws Exception {
+    private PartitionPublisher openPublisher(
+            PartitionIdentity identity,
+            long scanPublisherEpoch,
+            PublicationAttempt attempt) throws Exception {
+        if (!isCurrentPublisherEpoch(scanPublisherEpoch)
+                || !isPublicationAttemptActive(attempt)) {
+            return null;
+        }
         Optional<CompactionManager.PublicationSession> session;
         try {
             session = compactionManager.tryOpenPublicationSession(
@@ -348,6 +794,10 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
             throw error;
         }
         if (session.isEmpty()) {
+            if (!isCurrentPublisherEpoch(scanPublisherEpoch)
+                    || !isPublicationAttemptActive(attempt)) {
+                return null;
+            }
             publicationLeaseUnavailable = true;
             Long previousUnavailableStream = unavailablePublicationLeases.put(
                     identity.taskTopic(), identity.logId().id());
@@ -366,24 +816,32 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
         PartitionPublisher candidate = new PartitionPublisher(identity, session.orElseThrow());
         PartitionPublisher selected = null;
         synchronized (this) {
-            if (!stopped) {
+            if (!stopped
+                    && publisherEpoch == scanPublisherEpoch
+                    && !publicationBackoffActive(identity)
+                    && isPublicationAttemptActive(attempt)) {
                 PartitionPublisher raced = publishers.putIfAbsent(identity.taskTopic(), candidate);
                 selected = raced == null ? candidate : raced;
             }
         }
         if (selected != candidate) {
-            // stop() and session installation share the same monitor. If leadership was lost while
-            // the remote lease was being acquired, this closes the late session instead of letting
-            // it escape the stop-time fencing snapshot.
+            // stop(), fatal reset and session installation share the same monitor. If the scan
+            // generation changed while the remote lease was being acquired, close the late session
+            // instead of letting it escape the fencing snapshot.
             closePublisher(candidate);
         }
         return selected;
     }
 
-    private void publishAvailable(PartitionPublisher publisher) {
+    private void publishAvailable(
+            PartitionPublisher publisher,
+            long scanPublisherEpoch,
+            PublicationAttempt attempt) {
         try {
             for (int published = 0; published < maxTasksPerPublisherPerScan; published++) {
-                if (stopped || publishers.get(publisher.identity().taskTopic()) != publisher
+                if (!isCurrentPublisherEpoch(scanPublisherEpoch)
+                        || !isPublicationAttemptActive(attempt)
+                        || publishers.get(publisher.identity().taskTopic()) != publisher
                         || publishNext(publisher) != CompactionManager.PublicationResult.PUBLISHED) {
                     return;
                 }
@@ -391,8 +849,142 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
             backlogRemaining = true;
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
+        } catch (PublicationRecoveryException recoveryFailure) {
+            if (!isCurrentPublisherEpoch(scanPublisherEpoch)) {
+                return;
+            }
+            PublicationQuarantine quarantine = enterPublicationQuarantine(publisher.identity());
+            try {
+                if (publishers.remove(publisher.identity().taskTopic(), publisher)) {
+                    tailWaitStartedAtMillis.remove(publisher.identity().taskTopic());
+                    closePublisher(publisher);
+                }
+            } finally {
+                recordPublicationQuarantineBestEffort(quarantine, recoveryFailure);
+            }
         } catch (Exception error) {
-            recordPartitionFailure(publisher.identity().taskTopic(), "publish compaction task", error);
+            if (isCurrentPublisherEpoch(scanPublisherEpoch)) {
+                recordPartitionFailure(publisher.identity().taskTopic(), "publish compaction task", error);
+            }
+        }
+    }
+
+    private synchronized long currentPublisherEpoch() {
+        return publisherEpoch;
+    }
+
+    private synchronized boolean isCurrentPublisherEpoch(long expectedPublisherEpoch) {
+        return !stopped && publisherEpoch == expectedPublisherEpoch;
+    }
+
+    private PublicationQuarantine enterPublicationQuarantine(PartitionIdentity identity) {
+        long now = currentTimeMillis.getAsLong();
+        AtomicBoolean enteredQuarantine = new AtomicBoolean();
+        PublicationQuarantine quarantine = publicationQuarantines.compute(
+                identity.taskTopic(), (ignored, previous) -> {
+                    if (previous != null
+                            && previous.identity().logId().id() == identity.logId().id()
+                            && previous.retryAfterMillis() > now) {
+                        return previous;
+                    }
+                    enteredQuarantine.set(true);
+                    return new PublicationQuarantine(
+                            identity, saturatedAdd(now, publicationRecoveryBackoffMillis));
+                });
+        return enteredQuarantine.get() ? quarantine : null;
+    }
+
+    private void recordPublicationQuarantineBestEffort(
+            PublicationQuarantine quarantine, RuntimeException error) {
+        if (quarantine == null) {
+            return;
+        }
+        PartitionIdentity identity = quarantine.identity();
+        try {
+            log.error("Quarantining compaction publication {} for physical log {} until {} because its "
+                            + "durable publication metadata cannot be recovered safely; publication "
+                            + "will retry after the backoff",
+                    identity.taskTopic(), identity.logId().id(), quarantine.retryAfterMillis(), error);
+        } catch (Exception | Error observabilityFailure) {
+            addSuppressed(error, observabilityFailure);
+        }
+        try {
+            compactionMetrics.getPublishTaskFailedCount().increment();
+        } catch (Exception | Error observabilityFailure) {
+            addSuppressed(error, observabilityFailure);
+        }
+    }
+
+    private void recordPublicationTimeoutBestEffort(
+            PublicationQuarantine quarantine, RuntimeException timeout) {
+        if (quarantine == null) {
+            return;
+        }
+        PartitionIdentity identity = quarantine.identity();
+        try {
+            log.error("Quarantining compaction publication {} for physical log {} until {} because "
+                            + "the started publication exceeded its deadline; the local publisher "
+                            + "was fenced and publication will retry after the backoff",
+                    identity.taskTopic(), identity.logId().id(), quarantine.retryAfterMillis(), timeout);
+        } catch (Exception | Error observabilityFailure) {
+            addSuppressed(timeout, observabilityFailure);
+        }
+        try {
+            compactionMetrics.getPublishTaskFailedCount().increment();
+        } catch (Exception | Error observabilityFailure) {
+            addSuppressed(timeout, observabilityFailure);
+        }
+    }
+
+    private void recordStickyPublicationLimitBestEffort(RuntimeException timeout) {
+        try {
+            log.error("Compaction publication reached the sticky timed-out attempt limit {} "
+                            + "(normal parallelism {}); new publication will remain suspended until "
+                            + "at least one non-terminating callable returns",
+                    publicationCoordinator.maxStickyAttempts(),
+                    publicationCoordinator.normalParallelism(),
+                    timeout);
+        } catch (Exception | Error observabilityFailure) {
+            addSuppressed(timeout, observabilityFailure);
+        }
+        try {
+            compactionMetrics.getPublishTaskFailedCount().increment();
+        } catch (Exception | Error observabilityFailure) {
+            addSuppressed(timeout, observabilityFailure);
+        }
+    }
+
+    private boolean publicationBackoffActive(PartitionIdentity identity) {
+        while (true) {
+            PublicationQuarantine quarantine = publicationQuarantines.get(identity.taskTopic());
+            if (quarantine == null) {
+                return false;
+            }
+            if (quarantine.identity().logId().id() != identity.logId().id()
+                    || currentTimeMillis.getAsLong() >= quarantine.retryAfterMillis()) {
+                if (publicationQuarantines.remove(identity.taskTopic(), quarantine)) {
+                    return false;
+                }
+                continue;
+            }
+            return true;
+        }
+    }
+
+    private void clearObsoletePublicationQuarantines(
+            Map<String, PartitionIdentity> discovered) {
+        publicationQuarantines.entrySet().removeIf(entry -> {
+            PartitionIdentity current = discovered.get(entry.getKey());
+            return current == null
+                    || current.logId().id() != entry.getValue().identity().logId().id();
+        });
+    }
+
+    private static long saturatedAdd(long value, long increment) {
+        try {
+            return Math.addExact(value, increment);
+        } catch (ArithmeticException overflow) {
+            return Long.MAX_VALUE;
         }
     }
 
@@ -506,8 +1098,10 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
 
         long selectedSize = Math.subtractExact(selected.cumulativeSize(), startCumulativeSize);
         if (selectedSize < 0) {
-            throw new IllegalStateException(
-                    "Selected compaction range ends before the persisted cumulative-size cursor");
+            throw new PublicationRecoveryException(
+                    "Persisted cumulative-size cursor for " + taskTopic + " is "
+                            + startCumulativeSize + " bytes, beyond the selected log range at "
+                            + selected.cumulativeSize() + " bytes");
         }
         if (selectedSize == 0) {
             tailWaitStartedAtMillis.remove(taskTopic);
@@ -571,6 +1165,7 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
                 return;
             }
             stopped = true;
+            publisherEpoch++;
             if (nextScanFuture != null) {
                 nextScanFuture.cancel(false);
             }
@@ -583,6 +1178,7 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
             publishers.clear();
             tailWaitStartedAtMillis.clear();
             unavailablePublicationLeases.clear();
+            publicationQuarantines.clear();
         }
         sessions.values().forEach(this::closePublisherAfterStop);
         schedulePendingLeaseReleaseRetry();
@@ -590,13 +1186,9 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
     }
 
     private void closePublisherAfterStop(PartitionPublisher publisher) {
-        try {
-            publishExecutor.execute(() -> tryClosePublisher(publisher));
-        } catch (RejectedExecutionException rejected) {
-            log.warn("Failed to schedule publication-session close for {}; closing inline",
-                    publisher.identity().taskTopic(), rejected);
-            tryClosePublisher(publisher);
-        }
+        // Initiation is non-blocking. Starting every release inline prevents a busy or stopped
+        // single-thread publish executor from serializing unrelated lease cleanup.
+        tryClosePublisher(publisher);
     }
 
     private void closePublisher(PartitionPublisher publisher) {
@@ -606,19 +1198,28 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
 
     private void tryClosePublisher(PartitionPublisher publisher) {
         try {
-            publisher.session().close();
-            publisher.closeRetryScheduled().set(false);
+            publisher.session().fenceAndReleaseLeaseAsync().whenComplete((ignored, failure) -> {
+                if (failure == null) {
+                    publisher.closeRetryScheduled().set(false);
+                    return;
+                }
+                handleCloseFailure(publisher, unwrapCompletionFailure(failure));
+            });
         } catch (Exception | Error error) {
-            if (error instanceof InterruptedException) {
-                Thread.currentThread().interrupt();
-            }
-            log.warn("Failed to close compaction publication session for {}",
-                    publisher.identity().taskTopic(), error);
+            handleCloseFailure(publisher, error);
+        }
+    }
+
+    private void handleCloseFailure(PartitionPublisher publisher, Throwable error) {
+        try {
             schedulePendingLeaseReleaseRetry();
+        } catch (Exception | Error retryFailure) {
+            addSuppressed(error, retryFailure);
+        }
+        try {
             scheduleCloseRetry(publisher);
-            if (error instanceof Error fatal) {
-                throw fatal;
-            }
+        } catch (Exception | Error retryFailure) {
+            addSuppressed(error, retryFailure);
         }
     }
 
@@ -627,7 +1228,7 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
             return;
         }
         try {
-            publishExecutor.schedule(() -> {
+            publicationControlExecutor.schedule(() -> {
                 publisher.closeRetryScheduled().set(false);
                 tryClosePublisher(publisher);
             }, Math.min(1000L, scanIntervalMillis), TimeUnit.MILLISECONDS);
@@ -642,15 +1243,23 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
         if (!compactionManager.hasPendingPublicationLeaseReleases()) {
             return;
         }
-        try {
-            compactionManager.retryPendingPublicationLeaseReleases();
-        } catch (Exception error) {
-            if (error instanceof InterruptedException) {
-                Thread.currentThread().interrupt();
-            }
-            log.warn("Failed to release an unsettled compaction publication lease", error);
-            schedulePendingLeaseReleaseRetry();
+        compactionManager.retryPendingPublicationLeaseReleasesAsync();
+        schedulePendingLeaseReleaseRetry();
+    }
+
+    private static void addSuppressed(Throwable primary, Throwable secondary) {
+        if (primary != secondary) {
+            primary.addSuppressed(secondary);
         }
+    }
+
+    private static Throwable unwrapCompletionFailure(Throwable failure) {
+        Throwable cause = failure;
+        while ((cause instanceof CompletionException || cause instanceof ExecutionException)
+                && cause.getCause() != null) {
+            cause = cause.getCause();
+        }
+        return cause;
     }
 
     private void schedulePendingLeaseReleaseRetry() {
@@ -659,7 +1268,7 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
             return;
         }
         try {
-            publishExecutor.schedule(() -> {
+            publicationControlExecutor.schedule(() -> {
                 pendingLeaseReleaseRetryScheduled.set(false);
                 retryPendingLeaseReleases();
                 if (compactionManager.hasPendingPublicationLeaseReleases()) {
@@ -683,6 +1292,10 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
                 .map(PartitionPublisher::identity)
                 .filter(identity -> identity.stream().namespace().equals(namespace))
                 .forEach(identity -> discovered.putIfAbsent(identity.taskTopic(), identity));
+        publicationQuarantines.values().stream()
+                .map(PublicationQuarantine::identity)
+                .filter(identity -> identity.stream().namespace().equals(namespace))
+                .forEach(identity -> discovered.putIfAbsent(identity.taskTopic(), identity));
     }
 
     private void retainExistingStream(
@@ -691,10 +1304,151 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
                 .map(PartitionPublisher::identity)
                 .filter(identity -> identity.stream().equals(stream))
                 .forEach(identity -> discovered.putIfAbsent(identity.taskTopic(), identity));
+        publicationQuarantines.values().stream()
+                .map(PublicationQuarantine::identity)
+                .filter(identity -> identity.stream().equals(stream))
+                .forEach(identity -> discovered.putIfAbsent(identity.taskTopic(), identity));
     }
 
     int sessionCount() {
         return publishers.size();
+    }
+
+    @FunctionalInterface
+    private interface PublicationAction {
+        void run(PublicationAttempt attempt);
+    }
+
+    private enum RegistrationStatus {
+        REGISTERED,
+        DUPLICATE,
+        WINDOW_FULL,
+        STICKY_LIMIT
+    }
+
+    private record PublicationRequest(
+            PartitionIdentity identity,
+            long publisherEpoch,
+            PublicationAction action) {
+    }
+
+    private record PublicationCompletion(
+            PublicationAttempt attempt,
+            Throwable failure,
+            boolean timedOut) {
+    }
+
+    private record PublicationKey(String taskTopic, long streamId) {
+    }
+
+    private static final class PublicationAttempt {
+        private final PartitionIdentity identity;
+        private final PublicationKey key;
+        private final long publisherEpoch;
+        private final String scope;
+        private final BlockingQueue<PublicationCompletion> completions;
+        private Future<?> workerFuture;
+        private ScheduledFuture<?> timeoutFuture;
+        private boolean timedOut;
+        private boolean workerFinished;
+        private boolean observerDetached;
+
+        private PublicationAttempt(
+                PartitionIdentity identity,
+                long publisherEpoch,
+                String scope,
+                BlockingQueue<PublicationCompletion> completions) {
+            this.identity = identity;
+            this.key = new PublicationKey(identity.taskTopic(), identity.logId().id());
+            this.publisherEpoch = publisherEpoch;
+            this.scope = scope;
+            this.completions = completions;
+        }
+    }
+
+    /**
+     * Shares admission and sticky in-flight ownership across publisher runner recreation.
+     *
+     * <p>Normal publication is limited to the configured parallelism. A started attempt that
+     * exceeds its deadline becomes sticky until its callable really returns, but releases its
+     * normal slot so a healthy identity can make progress. At most two full worker windows may be
+     * sticky; reaching that explicit bound stops new publication without blocking control tasks.
+     */
+    static final class PublicationCoordinator {
+        private final int normalParallelism;
+        private final int maxStickyAttempts;
+        private final Map<PublicationKey, PublicationAttempt> inFlight = new HashMap<>();
+        private int activeAttempts;
+        private int stickyAttempts;
+        private boolean stickyLimitReported;
+
+        PublicationCoordinator(int configuredParallelism) {
+            normalParallelism = Math.max(1, configuredParallelism);
+            maxStickyAttempts = (int) Math.min(
+                    Integer.MAX_VALUE, Math.multiplyExact((long) normalParallelism, 2L));
+        }
+
+        synchronized RegistrationStatus tryRegister(PublicationAttempt attempt) {
+            if (inFlight.containsKey(attempt.key)) {
+                return RegistrationStatus.DUPLICATE;
+            }
+            if (activeAttempts >= normalParallelism) {
+                return RegistrationStatus.WINDOW_FULL;
+            }
+            if (activeAttempts + stickyAttempts >= maxStickyAttempts) {
+                return stickyAttempts >= maxStickyAttempts
+                        ? RegistrationStatus.STICKY_LIMIT
+                        : RegistrationStatus.WINDOW_FULL;
+            }
+            inFlight.put(attempt.key, attempt);
+            activeAttempts++;
+            return RegistrationStatus.REGISTERED;
+        }
+
+        synchronized void submissionFailed(PublicationAttempt attempt) {
+            if (inFlight.remove(attempt.key, attempt)) {
+                activeAttempts--;
+            }
+        }
+
+        synchronized boolean timedOut(PublicationAttempt attempt) {
+            if (inFlight.get(attempt.key) != attempt) {
+                return false;
+            }
+            activeAttempts--;
+            stickyAttempts++;
+            if (stickyAttempts >= maxStickyAttempts && !stickyLimitReported) {
+                stickyLimitReported = true;
+                return true;
+            }
+            return false;
+        }
+
+        synchronized void finished(PublicationAttempt attempt, boolean timedOut) {
+            if (!inFlight.remove(attempt.key, attempt)) {
+                return;
+            }
+            if (timedOut) {
+                stickyAttempts--;
+                if (stickyAttempts < maxStickyAttempts) {
+                    stickyLimitReported = false;
+                }
+            } else {
+                activeAttempts--;
+            }
+        }
+
+        synchronized boolean isStickyLimitReached() {
+            return stickyAttempts >= maxStickyAttempts;
+        }
+
+        int normalParallelism() {
+            return normalParallelism;
+        }
+
+        int maxStickyAttempts() {
+            return maxStickyAttempts;
+        }
     }
 
     private record PartitionIdentity(StreamIdentifier stream, int partition, LogId logId) {
@@ -713,6 +1467,9 @@ public final class PublishCompactTaskRunner implements Runnable, StartStopRunner
     }
 
     private record TaskSnapshot(PreparedCompactStreamTask task, long latestOffset, long publishedOffset) {
+    }
+
+    private record PublicationQuarantine(PartitionIdentity identity, long retryAfterMillis) {
     }
 
     private static final class PartitionPublisher {

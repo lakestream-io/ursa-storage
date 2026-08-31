@@ -36,6 +36,7 @@ public class CompactionMetrics {
     private final Counter failedCompactTaskCount;
     private final Counter publishTaskFailedCount;
     private final Counter publicationLeaseUnavailableCount;
+    private final Counter commitDrainTimeoutCount;
     private final Counter tableCorruptedCount;
 
     // Gauge
@@ -101,6 +102,11 @@ public class CompactionMetrics {
                 "ursa.storage.compact.publication.lease.unavailable.count",
                 Unit.Sessions,
                 "Compaction task publication lease contention transitions",
+                Attributes.empty());
+        this.commitDrainTimeoutCount = provider.newCounter(
+                "ursa.storage.compact.commit.drain.timeout.count",
+                Unit.None,
+                "Compaction process fail-stop events caused by lakehouse commits that did not drain",
                 Attributes.empty());
         this.tableCorruptedCount = provider.newCounter("ursa.storage.compact.table.corrupted.count",
                 Unit.Messages, "Compacted table corrupted count", Attributes.empty());

@@ -13,17 +13,26 @@ import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
 import io.oxia.client.api.exceptions.KeyAlreadyExistsException;
 import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
 public class CompactionManager {
+
+    static final long DEFAULT_PUBLICATION_LEASE_RELEASE_TIMEOUT_MILLIS =
+            TimeUnit.SECONDS.toMillis(30);
 
     public enum PublicationResult {
         NO_TASK,
@@ -39,31 +48,61 @@ public class CompactionManager {
     public record PublicationCursor(long streamId, long offset, long cumulativeSize) {
 
         public PublicationCursor {
-            if (streamId < 0) {
-                throw new IllegalArgumentException("streamId must be non-negative");
-            }
-            if (offset < -1) {
-                throw new IllegalArgumentException("offset must be at least -1");
-            }
-            if (cumulativeSize < 0) {
-                throw new IllegalArgumentException("cumulativeSize must be non-negative");
-            }
+            validatePublicationCursorCoordinates(streamId, offset, cumulativeSize);
+        }
+    }
+
+    private static void validatePublicationCursorCoordinates(
+            long streamId, long offset, long cumulativeSize) {
+        if (streamId < 0) {
+            throw new IllegalArgumentException("streamId must be non-negative");
+        }
+        if (offset < -1) {
+            throw new IllegalArgumentException("offset must be at least -1");
+        }
+        if (cumulativeSize < 0) {
+            throw new IllegalArgumentException("cumulativeSize must be non-negative");
+        }
+        if (offset == -1 && cumulativeSize != 0) {
+            throw new IllegalArgumentException(
+                    "cumulativeSize must be 0 when offset is -1");
+        }
+        if (offset >= 0 && cumulativeSize == 0) {
+            throw new IllegalArgumentException(
+                    "cumulativeSize must be positive when offset is non-negative");
         }
     }
 
     private final CompactTaskManager taskManager;
     private final CompactionMetrics metrics;
+    private final long publicationLeaseReleaseTimeoutMillis;
     private final Set<CompactTaskManager.PublicationLease> pendingPublicationLeaseReleases =
             ConcurrentHashMap.newKeySet();
+    // Guarded by this CompactionManager instance. At most one tracked remote delete is active for
+    // an exact lease until its bounded attempt expires, preventing every scan from accumulating a
+    // duplicate Oxia request while still allowing a permanently stalled request to be retried.
+    private final Map<CompactTaskManager.PublicationLease, CompletableFuture<Void>>
+            publicationLeaseReleaseAttempts = new HashMap<>();
 
     public CompactionManager(CompactTaskManager taskManager) {
-        this.taskManager = taskManager;
-        this.metrics = CompactionMetrics.NOOP;
+        this(taskManager, CompactionMetrics.NOOP);
     }
 
     public CompactionManager(CompactTaskManager taskManager, CompactionMetrics compactionMetrics) {
+        this(taskManager, compactionMetrics, DEFAULT_PUBLICATION_LEASE_RELEASE_TIMEOUT_MILLIS);
+    }
+
+    CompactionManager(
+            CompactTaskManager taskManager,
+            CompactionMetrics compactionMetrics,
+            long publicationLeaseReleaseTimeoutMillis) {
         this.taskManager = taskManager;
         this.metrics = compactionMetrics;
+        if (publicationLeaseReleaseTimeoutMillis <= 0) {
+            throw new IllegalArgumentException(
+                    "publicationLeaseReleaseTimeoutMillis must be positive");
+        }
+        this.publicationLeaseReleaseTimeoutMillis = publicationLeaseReleaseTimeoutMillis;
     }
 
     /**
@@ -75,28 +114,69 @@ public class CompactionManager {
      */
     public Optional<PublicationSession> tryOpenPublicationSession(String topicName, long streamId)
             throws Exception {
-        retryPendingPublicationLeaseRelease(topicName);
+        if (retryPendingPublicationLeaseReleaseAsync(topicName)) {
+            return Optional.empty();
+        }
         Optional<CompactTaskManager.PublicationLease> lease =
                 taskManager.tryAcquirePublicationLease(topicName, streamId);
         if (lease.isEmpty()) {
             return Optional.empty();
         }
         try {
-            CompactTaskManager.PublishedOffsetClaim cursor =
-                    taskManager.claimPublishedOffset(lease.get());
-            return Optional.of(new PublicationSession(lease.get(), cursor));
+            CompactTaskManager.PublicationLease acquiredLease = lease.get();
+            try {
+                taskManager.repairLegacyPublishedOffset(acquiredLease);
+            } catch (IOException malformedCursor) {
+                throw new PublicationRecoveryException(
+                        "Published-offset recovery metadata for " + topicName
+                                + " cannot be decoded safely",
+                        malformedCursor);
+            }
+            CompactTaskManager.PublishedOffsetClaim cursor;
+            try {
+                cursor = taskManager.claimPublishedOffset(acquiredLease);
+            } catch (IOException malformedCursor) {
+                throw new PublicationRecoveryException(
+                        "Published-offset cursor for " + topicName
+                                + " cannot be decoded safely",
+                        malformedCursor);
+            }
+            validateClaimedCursor(acquiredLease, cursor);
+            return Optional.of(new PublicationSession(acquiredLease, cursor));
         } catch (Throwable error) {
             CompactTaskManager.PublicationLease acquiredLease = lease.get();
-            pendingPublicationLeaseReleases.add(acquiredLease);
-            try {
-                retryPendingPublicationLeaseRelease(topicName);
-            } catch (Throwable releaseError) {
-                if (releaseError instanceof InterruptedException) {
-                    Thread.currentThread().interrupt();
+            beginPublicationLeaseReleaseAsync(acquiredLease).whenComplete((ignored, releaseError) -> {
+                Throwable cause = unwrapCompletionFailure(releaseError);
+                if (cause != null && cause != error) {
+                    error.addSuppressed(cause);
                 }
-                error.addSuppressed(releaseError);
-            }
+            });
             throw error;
+        }
+    }
+
+    private static void validateClaimedCursor(
+            CompactTaskManager.PublicationLease lease,
+            CompactTaskManager.PublishedOffsetClaim cursor) {
+        CompactedOffset offset = cursor.offset();
+        if (offset.getId() != lease.streamId()) {
+            throw new PublicationFencedException(
+                    "Published-offset cursor for " + lease.name() + " belongs to stream "
+                            + offset.getId() + " instead of leased stream " + lease.streamId());
+        }
+        if (offset.getOffset() >= 0 && offset.getCumulativeSize() == 0) {
+            throw new LegacyPublishedOffsetException(
+                    lease.name(), lease.streamId(), offset.getOffset(),
+                    "the task-manager claim returned an unrepaired cursor");
+        }
+        try {
+            validatePublicationCursorCoordinates(
+                    offset.getId(), offset.getOffset(), offset.getCumulativeSize());
+        } catch (IllegalArgumentException invalidCoordinates) {
+            throw new PublicationRecoveryException(
+                    "Published-offset cursor for " + lease.name()
+                            + " has invalid durable coordinates",
+                    invalidCoordinates);
         }
     }
 
@@ -111,7 +191,7 @@ public class CompactionManager {
         Throwable firstFailure = null;
         for (CompactTaskManager.PublicationLease pending : pendingPublicationLeaseReleases) {
             try {
-                settlePendingPublicationLeaseRelease(pending);
+                awaitPublicationLeaseRelease(retryPublicationLeaseReleaseAsync(pending));
             } catch (Throwable error) {
                 if (error instanceof InterruptedException) {
                     Thread.currentThread().interrupt();
@@ -134,31 +214,152 @@ public class CompactionManager {
         }
     }
 
+    /** Initiates every pending release without waiting for any remote metadata-store request. */
+    public void retryPendingPublicationLeaseReleasesAsync() {
+        for (CompactTaskManager.PublicationLease pending : pendingPublicationLeaseReleases) {
+            retryPublicationLeaseReleaseAsync(pending);
+        }
+    }
+
     /** Returns whether an acquired lease still needs a confirmed release. */
     public boolean hasPendingPublicationLeaseReleases() {
         return !pendingPublicationLeaseReleases.isEmpty();
     }
 
-    private void retryPendingPublicationLeaseRelease(String topicName) throws Exception {
+    private boolean retryPendingPublicationLeaseReleaseAsync(String topicName) {
+        boolean pendingReleaseFound = false;
         for (CompactTaskManager.PublicationLease pending : pendingPublicationLeaseReleases) {
             if (!topicName.equals(pending.name())) {
                 continue;
             }
-            settlePendingPublicationLeaseRelease(pending);
+            pendingReleaseFound = true;
+            retryPublicationLeaseReleaseAsync(pending);
+        }
+        return pendingReleaseFound;
+    }
+
+    private synchronized CompletableFuture<Void> beginPublicationLeaseReleaseAsync(
+            CompactTaskManager.PublicationLease lease) {
+        return publicationLeaseReleaseAsync(lease, false);
+    }
+
+    /**
+     * Continues an unsettled release, or confirms atomically that another retry already settled it.
+     *
+     * <p>The pending check must share the manager monitor with the in-flight lookup. Otherwise a
+     * successful manager-level retry can remove both entries between a session's pending check and
+     * its call to begin a release, causing that session to issue a redundant conditional delete.
+     */
+    private synchronized CompletableFuture<Void> retryPublicationLeaseReleaseAsync(
+            CompactTaskManager.PublicationLease lease) {
+        return publicationLeaseReleaseAsync(lease, true);
+    }
+
+    /** Caller must hold this {@link CompactionManager}'s monitor. */
+    private CompletableFuture<Void> publicationLeaseReleaseAsync(
+            CompactTaskManager.PublicationLease lease, boolean retryOnly) {
+        CompletableFuture<Void> inFlight = publicationLeaseReleaseAttempts.get(lease);
+        if (inFlight != null) {
+            return inFlight;
+        }
+        if (retryOnly && !pendingPublicationLeaseReleases.contains(lease)) {
+            return CompletableFuture.completedFuture(null);
+        }
+        pendingPublicationLeaseReleases.add(lease);
+        CompletableFuture<Boolean> remoteRelease;
+        try {
+            remoteRelease = taskManager.releasePublicationLeaseAsync(lease);
+            if (remoteRelease == null) {
+                throw new IllegalStateException(
+                        "Task manager returned null while releasing publication lease "
+                                + lease.name());
+            }
+        } catch (Exception | Error failure) {
+            remoteRelease = CompletableFuture.failedFuture(failure);
+        }
+        CompletableFuture<Void> attempt = new CompletableFuture<>();
+        publicationLeaseReleaseAttempts.put(lease, attempt);
+        CompletableFuture<Boolean> sourceRelease = remoteRelease;
+        remoteRelease.thenApply(released -> released)
+                .orTimeout(publicationLeaseReleaseTimeoutMillis, TimeUnit.MILLISECONDS)
+                .whenComplete((ignored, failure) -> {
+                    Throwable cause = unwrapCompletionFailure(failure);
+                    if (cause instanceof TimeoutException) {
+                        sourceRelease.cancel(false);
+                    }
+                    completePublicationLeaseRelease(lease, attempt, cause);
+                });
+        return attempt;
+    }
+
+    private void completePublicationLeaseRelease(
+            CompactTaskManager.PublicationLease lease,
+            CompletableFuture<Void> attempt,
+            Throwable failure) {
+        Throwable cause = unwrapCompletionFailure(failure);
+        synchronized (this) {
+            if (cause == null) {
+                pendingPublicationLeaseReleases.remove(lease);
+            }
+            publicationLeaseReleaseAttempts.remove(lease, attempt);
+        }
+        if (cause == null) {
+            attempt.complete(null);
+        } else {
+            recordPublicationLeaseReleaseFailureBestEffort(lease, cause);
+            attempt.completeExceptionally(cause);
         }
     }
 
-    private void settlePendingPublicationLeaseRelease(
-            CompactTaskManager.PublicationLease pending) throws Exception {
+    private void recordPublicationLeaseReleaseFailureBestEffort(
+            CompactTaskManager.PublicationLease lease, Throwable failure) {
         try {
-            // Both true (released by this call) and false (already absent or superseded) settle the
-            // exact lease. Only an exception leaves the handle pending for a later retry.
-            taskManager.releasePublicationLease(pending);
-            pendingPublicationLeaseReleases.remove(pending);
+            log.warn("Failed to release compaction publication lease for {} and stream {}; "
+                            + "the exact lease remains pending for retry",
+                    lease.name(), lease.streamId(), failure);
+        } catch (Exception | Error observabilityFailure) {
+            if (failure != observabilityFailure) {
+                failure.addSuppressed(observabilityFailure);
+            }
+        }
+        try {
+            metrics.getPublishTaskFailedCount().increment();
+        } catch (Exception | Error observabilityFailure) {
+            if (failure != observabilityFailure) {
+                failure.addSuppressed(observabilityFailure);
+            }
+        }
+    }
+
+    private static void awaitPublicationLeaseRelease(CompletableFuture<Void> release)
+            throws Exception {
+        try {
+            release.get();
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             throw interrupted;
+        } catch (ExecutionException failure) {
+            Throwable cause = unwrapCompletionFailure(failure.getCause());
+            if (cause instanceof InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw interrupted;
+            }
+            if (cause instanceof Exception exception) {
+                throw exception;
+            }
+            if (cause instanceof Error error) {
+                throw error;
+            }
+            throw new RuntimeException(cause);
         }
+    }
+
+    private static Throwable unwrapCompletionFailure(Throwable failure) {
+        Throwable cause = failure;
+        while (cause instanceof CompletionException && cause.getCause() != null) {
+            cause = cause.getCause();
+        }
+        return cause;
     }
 
     /**
@@ -175,6 +376,10 @@ public class CompactionManager {
         private volatile boolean closed;
         private volatile boolean fenced;
         private volatile boolean leaseReleaseSettled;
+        private boolean leaseReleaseAttempted;
+        // Guarded by this PublicationSession instance. Remote release completes independently of
+        // the lifecycle lock so one stalled Oxia request cannot block cleanup of other sessions.
+        private CompletableFuture<Void> leaseReleaseInFlight;
 
         private PublicationSession(
                 CompactTaskManager.PublicationLease lease,
@@ -248,6 +453,23 @@ public class CompactionManager {
             fenced = true;
         }
 
+        /**
+         * Fences this publisher and immediately starts releasing its remote lease, even while an
+         * in-flight publication still holds the lifecycle read lock.
+         *
+         * <p>This is the supervisor path for a timed-out or fatally failed publication. Waiting for
+         * the read lock here would let an interrupt-ignoring callable retain the Oxia lease forever
+         * and prevent a healthy peer from taking over. The local {@code closed}/{@code fenced}
+         * checks stop that callable at its next stage boundary; prepared-task revisions and the
+         * published-cursor CAS fence any single metadata operation that was already in flight when
+         * the lease was released.
+         */
+        public CompletableFuture<Void> fenceAndReleaseLeaseAsync() {
+            fence();
+            closed = true;
+            return beginLeaseReleaseAsync();
+        }
+
         private void ensureCurrentLease() throws ExecutionException, InterruptedException {
             if (closed || fenced) {
                 throw fencedException();
@@ -267,8 +489,15 @@ public class CompactionManager {
         }
 
         private void recoverPreparedTask() throws Exception {
-            Optional<CompactTaskManager.PreparedTaskClaim> prepared =
-                    taskManager.getPreparedTaskClaim(lease.name());
+            Optional<CompactTaskManager.PreparedTaskClaim> prepared;
+            try {
+                prepared = taskManager.getPreparedTaskClaim(lease.name());
+            } catch (IOException malformedTask) {
+                throw new PublicationRecoveryException(
+                        "Prepared publication metadata for " + lease.name()
+                                + " cannot be decoded safely",
+                        malformedTask);
+            }
             ensureCurrentLease();
             if (prepared.isEmpty()) {
                 return;
@@ -283,16 +512,32 @@ public class CompactionManager {
                 return;
             }
 
-            long targetOffset = OffsetRange.lastIncludedOffset(task.getStartOffset(), task.getEndOffset());
+            long targetOffset;
+            try {
+                targetOffset = OffsetRange.lastIncludedOffset(
+                        task.getStartOffset(), task.getEndOffset());
+            } catch (RuntimeException invalidRange) {
+                throw recoveryFailure(task, "has an invalid offset range", invalidRange);
+            }
             PublicationCursor currentCursor = publicationCursor();
             long currentOffset = currentCursor.offset();
             if (currentOffset == task.getStartOffset() - 1) {
-                validateNextTask(task, currentCursor);
+                try {
+                    validateNextTask(task, currentCursor);
+                } catch (RuntimeException invalidTask) {
+                    throw recoveryFailure(
+                            task, "does not advance the persisted cursor consistently", invalidTask);
+                }
                 publishPreparedTask(claim);
                 return;
             }
             if (currentOffset == targetOffset) {
-                validateRecoveredCommittedTask(task, currentCursor);
+                try {
+                    validateRecoveredCommittedTask(task, currentCursor);
+                } catch (RuntimeException invalidTask) {
+                    throw recoveryFailure(
+                            task, "does not match the already-committed cursor", invalidTask);
+                }
                 makeTaskVisible(task, claim);
                 return;
             }
@@ -303,9 +548,22 @@ public class CompactionManager {
                 ensureCurrentLease();
                 return;
             }
-            throw new IllegalStateException("Prepared task " + task.getTaskName() + " has range ["
-                    + task.getStartOffset() + ", " + task.getEndOffset() + ") but cursor for "
-                    + lease.name() + " is " + currentOffset);
+            throw recoveryFailure(task, "has range [" + task.getStartOffset() + ", "
+                    + task.getEndOffset() + ") but the persisted cursor is " + currentOffset);
+        }
+
+        private PublicationRecoveryException recoveryFailure(
+                PreparedCompactStreamTask task, String reason) {
+            return recoveryFailure(task, reason, null);
+        }
+
+        private PublicationRecoveryException recoveryFailure(
+                PreparedCompactStreamTask task, String reason, Throwable cause) {
+            String message = "Prepared task " + task.getTaskName() + " for " + lease.name()
+                    + " cannot be recovered safely because it " + reason;
+            return cause == null
+                    ? new PublicationRecoveryException(message)
+                    : new PublicationRecoveryException(message, cause);
         }
 
         private PublicationCursor publicationCursor() {
@@ -313,6 +571,12 @@ public class CompactionManager {
             if (publishedOffset.getId() != lease.streamId()) {
                 fence();
                 throw fencedException();
+            }
+            if (publishedOffset.getOffset() >= 0
+                    && publishedOffset.getCumulativeSize() == 0) {
+                throw new LegacyPublishedOffsetException(
+                        lease.name(), lease.streamId(), publishedOffset.getOffset(),
+                        "the active publication session observed an unrepaired cursor");
             }
             return new PublicationCursor(
                     publishedOffset.getId(),
@@ -385,6 +649,15 @@ public class CompactionManager {
             if (task.getStreamId() != lease.streamId()) {
                 throw new IllegalArgumentException("Prepared task stream does not match the publication session");
             }
+            if (task.getStatus() != PreparedCompactStreamTask.INIT
+                    && task.getStatus() != PreparedCompactStreamTask.PUSHED_TASK) {
+                throw new IllegalArgumentException("Prepared task has an unknown publication status");
+            }
+            String taskName = task.getTaskName();
+            if (taskName == null || taskName.isBlank() || taskName.indexOf('/') >= 0) {
+                throw new IllegalArgumentException(
+                        "Prepared task name must be a non-blank single key segment");
+            }
         }
 
         @Override
@@ -392,31 +665,117 @@ public class CompactionManager {
             // Fencing is deliberately outside the write lock so an ownership-loss callback can
             // synchronously stop further publication before close waits for in-flight work.
             fence();
+            CompletableFuture<Void> release;
             lifecycleLock.writeLock().lock();
             try {
-                if (leaseReleaseSettled) {
-                    return;
-                }
                 closed = true;
-                // A false CAS result means this exact lease is already gone or superseded, which
-                // is a settled release. An exception is different: keep the release retryable on
-                // a subsequent close() or manager-level retry while the local session remains
-                // permanently fenced.
-                try {
-                    taskManager.releasePublicationLease(lease);
-                } catch (Exception | Error releaseFailure) {
-                    pendingPublicationLeaseReleases.add(lease);
-                    if (releaseFailure instanceof InterruptedException) {
-                        Thread.currentThread().interrupt();
-                    }
-                    throw releaseFailure;
-                }
-                pendingPublicationLeaseReleases.remove(lease);
-                leaseReleaseSettled = true;
+                release = beginLeaseReleaseAsync();
+            } finally {
+                lifecycleLock.writeLock().unlock();
+            }
+            awaitLeaseRelease(release);
+        }
+
+        /**
+         * Attempts to release this session without waiting for an in-flight publication.
+         *
+         * <p>The session is fenced even when the lifecycle lock is currently held by
+         * {@link #publishNext(PublicationTaskFactory)}. A {@code false} result means that the
+         * caller must retry after the in-flight stage observes the fence and returns. This lets a
+         * supervisor release unrelated publication leases without one stuck publisher blocking
+         * the entire cleanup pass.
+         */
+        public boolean tryClose() throws Exception {
+            Optional<CompletableFuture<Void>> release = tryCloseAsync();
+            if (release.isEmpty()) {
+                return false;
+            }
+            awaitLeaseRelease(release.orElseThrow());
+            return true;
+        }
+
+        /**
+         * Starts a non-blocking lease release when no publication currently holds the lifecycle
+         * read lock.
+         *
+         * @return an empty result while publication is in flight, otherwise the independently
+         *         completing release attempt
+         */
+        public Optional<CompletableFuture<Void>> tryCloseAsync() {
+            fence();
+            if (!lifecycleLock.writeLock().tryLock()) {
+                return Optional.empty();
+            }
+            try {
+                closed = true;
+                return Optional.of(beginLeaseReleaseAsync());
             } finally {
                 lifecycleLock.writeLock().unlock();
             }
         }
+
+        private synchronized CompletableFuture<Void> beginLeaseReleaseAsync() {
+            if (leaseReleaseSettled) {
+                return CompletableFuture.completedFuture(null);
+            }
+            if (leaseReleaseInFlight != null) {
+                return leaseReleaseInFlight;
+            }
+            // A false CAS result means this exact lease is already gone or superseded, which
+            // is a settled release. An exception is different: keep the release retryable on
+            // a subsequent close() or manager-level retry while the local session remains
+            // permanently fenced.
+            CompletableFuture<Void> remoteRelease = leaseReleaseAttempted
+                    ? CompactionManager.this.retryPublicationLeaseReleaseAsync(lease)
+                    : CompactionManager.this.beginPublicationLeaseReleaseAsync(lease);
+            leaseReleaseAttempted = true;
+            CompletableFuture<Void> releaseAttempt = new CompletableFuture<>();
+            leaseReleaseInFlight = releaseAttempt;
+            remoteRelease.whenComplete(
+                    (ignored, failure) -> completeLeaseRelease(releaseAttempt, failure));
+            return releaseAttempt;
+        }
+
+        private void completeLeaseRelease(
+                CompletableFuture<Void> releaseAttempt, Throwable failure) {
+            Throwable cause = unwrapCompletionFailure(failure);
+            synchronized (this) {
+                if (cause == null) {
+                    leaseReleaseSettled = true;
+                }
+                if (leaseReleaseInFlight == releaseAttempt) {
+                    leaseReleaseInFlight = null;
+                }
+            }
+            if (cause == null) {
+                releaseAttempt.complete(null);
+            } else {
+                releaseAttempt.completeExceptionally(cause);
+            }
+        }
+
+        private void awaitLeaseRelease(CompletableFuture<Void> release) throws Exception {
+            try {
+                release.get();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw interrupted;
+            } catch (ExecutionException failure) {
+                Throwable cause = unwrapCompletionFailure(failure.getCause());
+                if (cause instanceof InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw interrupted;
+                }
+                if (cause instanceof Exception exception) {
+                    throw exception;
+                }
+                if (cause instanceof Error error) {
+                    throw error;
+                }
+                throw new RuntimeException(cause);
+            }
+        }
+
     }
 
     public void recoverPreparedTasks(String topicName) throws Exception {

@@ -8,6 +8,7 @@ import io.lakestream.ursa.compaction.task.CompactOffsetSerde;
 import io.lakestream.ursa.compaction.task.CompactStreamTask;
 import io.lakestream.ursa.compaction.task.CompactStreamTaskSerde;
 import io.lakestream.ursa.compaction.task.CompactedOffset;
+import io.lakestream.ursa.compaction.task.OffsetRange;
 import io.lakestream.ursa.compaction.task.PackagedCompactStreamTask;
 import io.lakestream.ursa.compaction.task.PreparedCompactStreamTask;
 import io.lakestream.ursa.compaction.task.PreparedCompactStreamTaskSerde;
@@ -488,28 +489,31 @@ public class OxiaCompactTaskManager implements CompactTaskManager {
     @Override
     public CompactedOffset getPublishedOffset(long streamId)
             throws ExecutionException, InterruptedException, IOException {
-        GetResult getResult = oxiaClient.get(publishedOffsetKey(streamId),
+        String key = publishedOffsetKey(streamId);
+        GetResult getResult = oxiaClient.get(key,
                 Set.of(GetOption.PartitionKey(String.valueOf(streamId)))).get();
         if (getResult == null) {
             return null;
         }
-        return CompactOffsetSerde.INSTANCE.deserialize(getResult.value());
+        return deserializePublishedOffset(getResult.value(), key);
     }
 
     @Override
     public CompactedOffset getPublishedOffset(String name)
         throws ExecutionException, InterruptedException, IOException {
-        GetResult getResult = oxiaClient.get(publishedOffsetKey(name),
+        String key = publishedOffsetKey(name);
+        GetResult getResult = oxiaClient.get(key,
             Set.of(GetOption.PartitionKey(name))).get();
         if (getResult == null) {
             return null;
         }
-        return CompactOffsetSerde.INSTANCE.deserialize(getResult.value());
+        return deserializePublishedOffset(getResult.value(), key);
     }
 
     @Override
     public void updatePublishedOffset(long streamId, long offset, long cumulativeSize)
             throws IOException, ExecutionException, InterruptedException {
+        validatePublishedOffset(offset, cumulativeSize);
         CompactedOffset compactedOffset = new CompactedOffset(streamId, offset, cumulativeSize);
         byte[] data = CompactOffsetSerde.INSTANCE.serialize(compactedOffset);
         String key = publishedOffsetKey(streamId);
@@ -521,7 +525,7 @@ public class OxiaCompactTaskManager implements CompactTaskManager {
     public void updatePublishedOffset(
             String name, long streamId, long offset, long cumulativeSize)
         throws IOException, ExecutionException, InterruptedException {
-        validateNamedPublishedOffset(offset, cumulativeSize);
+        validatePublishedOffset(offset, cumulativeSize);
         CompactedOffset compactedOffset = new CompactedOffset(streamId, offset, cumulativeSize);
         byte[] data = CompactOffsetSerde.INSTANCE.serialize(compactedOffset);
         String key = publishedOffsetKey(name);
@@ -530,7 +534,7 @@ public class OxiaCompactTaskManager implements CompactTaskManager {
                 key, streamId, offset, cumulativeSize);
     }
 
-    private static void validateNamedPublishedOffset(long offset, long cumulativeSize) {
+    private static void validatePublishedOffset(long offset, long cumulativeSize) {
         if (offset < -1) {
             throw new IllegalArgumentException("Published offset must be at least -1");
         }
@@ -540,6 +544,10 @@ public class OxiaCompactTaskManager implements CompactTaskManager {
         if (offset == -1 && cumulativeSize != 0) {
             throw new IllegalArgumentException(
                     "Published cumulative size must be 0 when the published offset is -1");
+        }
+        if (offset >= 0 && cumulativeSize == 0) {
+            throw new IllegalArgumentException(
+                    "Published cumulative size must be positive when the published offset is non-negative");
         }
     }
 
@@ -576,16 +584,82 @@ public class OxiaCompactTaskManager implements CompactTaskManager {
     @Override
     public boolean releasePublicationLease(PublicationLease lease)
             throws ExecutionException, InterruptedException {
+        return releasePublicationLeaseAsync(lease).get();
+    }
+
+    @Override
+    public CompletableFuture<Boolean> releasePublicationLeaseAsync(PublicationLease lease) {
+        CompletableFuture<Boolean> delete = oxiaClient.delete(publicationLeaseKey(lease.name()),
+                Set.of(DeleteOption.PartitionKey(lease.name()),
+                        DeleteOption.IfVersionIdEquals(lease.revision())));
+        CompletableFuture<Boolean> release = new CompletableFuture<>();
+        delete.whenComplete((deleted, failure) -> {
+                    Throwable cause = failure instanceof CompletionException
+                            ? failure.getCause() : failure;
+                    if (cause == null) {
+                        release.complete(deleted);
+                    } else if (cause instanceof UnexpectedVersionIdException) {
+                        release.complete(false);
+                    } else {
+                        release.completeExceptionally(cause);
+                    }
+                });
+        release.whenComplete((ignored, failure) -> {
+            if (release.isCancelled()) {
+                delete.cancel(false);
+            }
+        });
+        return release;
+    }
+
+    @Override
+    public boolean repairLegacyPublishedOffset(PublicationLease lease)
+            throws IOException, ExecutionException, InterruptedException {
+        String cursorKey = publishedOffsetKey(lease.name());
+        ensureCurrentPublicationLease(lease);
+        GetResult cursorResult = oxiaClient.get(cursorKey,
+                Set.of(GetOption.PartitionKey(lease.name()))).get();
+        ensureCurrentPublicationLease(lease);
+        if (cursorResult == null) {
+            return false;
+        }
+
+        CompactedOffset legacy = deserializePublishedOffset(cursorResult.value(), cursorKey);
+        if (legacy.getId() != lease.streamId() || !isLegacyPublishedOffset(legacy)) {
+            return false;
+        }
+
+        GetResult preparedResult = oxiaClient.get(buildPreparedTaskKey(lease.name()),
+                Set.of(GetOption.PartitionKey(lease.name()))).get();
+        ensureCurrentPublicationLease(lease);
+        if (preparedResult == null) {
+            throw legacyPublishedOffset(lease, legacy,
+                    "no durable prepared task exists from which to prove the missing value");
+        }
+
+        PreparedCompactStreamTask preparedTask = deserializePreparedTask(
+                preparedResult.value(), buildPreparedTaskKey(lease.name()));
+        long cumulativeSize = deriveLegacyCumulativeSize(lease, legacy, preparedTask);
+        CompactedOffset repaired = new CompactedOffset(
+                lease.streamId(), legacy.getOffset(), cumulativeSize);
+        validatePublishedOffset(repaired.getOffset(), repaired.getCumulativeSize());
         try {
-            return oxiaClient.delete(publicationLeaseKey(lease.name()),
-                    Set.of(DeleteOption.PartitionKey(lease.name()),
-                            DeleteOption.IfVersionIdEquals(lease.revision()))).get();
+            oxiaClient.put(cursorKey, CompactOffsetSerde.INSTANCE.serialize(repaired), Set.of(
+                    PutOption.PartitionKey(lease.name()),
+                    PutOption.IfVersionIdEquals(cursorResult.version().versionId()))).get();
         } catch (ExecutionException error) {
-            if (error.getCause() instanceof UnexpectedVersionIdException) {
-                return false;
+            if (error.getCause() instanceof KeyAlreadyExistsException
+                    || error.getCause() instanceof UnexpectedVersionIdException) {
+                throw fenced(lease, error.getCause());
             }
             throw error;
         }
+        ensureCurrentPublicationLease(lease);
+        log.warn("Repaired legacy published-offset cursor for {} stream {} at offset {} "
+                        + "with cumulative size {} from prepared task {}",
+                lease.name(), lease.streamId(), legacy.getOffset(), cumulativeSize,
+                preparedTask.getTaskName());
+        return true;
     }
 
     @Override
@@ -600,7 +674,10 @@ public class OxiaCompactTaskManager implements CompactTaskManager {
             throw fenced(lease, null);
         }
         CompactedOffset currentOffset = current == null
-                ? null : CompactOffsetSerde.INSTANCE.deserialize(current.value());
+                ? null : deserializePublishedOffset(current.value(), key);
+        if (currentOffset != null && currentOffset.getId() == lease.streamId()) {
+            validateStoredPublishedOffset(lease, currentOffset);
+        }
         CompactedOffset claimedOffset = currentOffset != null && currentOffset.getId() == lease.streamId()
                 ? currentOffset : new CompactedOffset(lease.streamId(), -1L, 0L);
         Set<PutOption> options = current == null
@@ -628,6 +705,8 @@ public class OxiaCompactTaskManager implements CompactTaskManager {
         if (expected.offset().getId() != lease.streamId() || updated.getId() != lease.streamId()) {
             throw new IllegalArgumentException("The published-offset cursor must belong to the leased stream");
         }
+        validateStoredPublishedOffset(lease, expected.offset());
+        validatePublishedOffset(updated.getOffset(), updated.getCumulativeSize());
         if (updated.getOffset() < expected.offset().getOffset()) {
             throw new IllegalArgumentException("The published-offset cursor cannot move backwards");
         }
@@ -649,6 +728,107 @@ public class OxiaCompactTaskManager implements CompactTaskManager {
         }
     }
 
+    private void ensureCurrentPublicationLease(PublicationLease lease)
+            throws ExecutionException, InterruptedException {
+        if (!validatePublicationLease(lease)) {
+            throw fenced(lease, null);
+        }
+    }
+
+    private static boolean isLegacyPublishedOffset(CompactedOffset offset) {
+        return offset.getOffset() >= 0 && offset.getCumulativeSize() == 0;
+    }
+
+    private static void validateStoredPublishedOffset(
+            PublicationLease lease, CompactedOffset offset) {
+        if (isLegacyPublishedOffset(offset)) {
+            throw legacyPublishedOffset(lease, offset,
+                    "no safe automatic repair was completed before the cursor claim");
+        }
+        try {
+            validatePublishedOffset(offset.getOffset(), offset.getCumulativeSize());
+        } catch (IllegalArgumentException error) {
+            throw new PublicationRecoveryException(
+                    "Stored published-offset cursor for " + lease.name() + " is invalid", error);
+        }
+    }
+
+    private static long deriveLegacyCumulativeSize(
+            PublicationLease lease,
+            CompactedOffset legacy,
+            PreparedCompactStreamTask preparedTask) {
+        try {
+            if (preparedTask.getStreamId() != lease.streamId()) {
+                throw legacyPublishedOffset(lease, legacy,
+                        "the durable prepared task belongs to stream "
+                                + preparedTask.getStreamId());
+            }
+            if (!lease.name().equals(preparedTask.getTopic())) {
+                throw legacyPublishedOffset(lease, legacy,
+                        "the durable prepared task belongs to publication "
+                                + preparedTask.getTopic());
+            }
+            if (preparedTask.getStatus() != PreparedCompactStreamTask.INIT
+                    && preparedTask.getStatus() != PreparedCompactStreamTask.PUSHED_TASK) {
+                throw legacyPublishedOffset(lease, legacy,
+                        "the durable prepared task has unknown status "
+                                + preparedTask.getStatus());
+            }
+            if (preparedTask.getTotalSize() <= 0
+                    || preparedTask.getCumulativeSize() < preparedTask.getTotalSize()) {
+                throw legacyPublishedOffset(lease, legacy,
+                        "the durable prepared task has invalid byte-size coordinates");
+            }
+
+            long taskLastOffset = OffsetRange.lastIncludedOffset(
+                    preparedTask.getStartOffset(), preparedTask.getEndOffset());
+            if (legacy.getOffset() == taskLastOffset) {
+                return requirePositiveRepairedCumulativeSize(
+                        lease, legacy, preparedTask.getCumulativeSize());
+            }
+
+            long offsetBeforeTask = Math.subtractExact(preparedTask.getStartOffset(), 1L);
+            if (legacy.getOffset() == offsetBeforeTask) {
+                long cumulativeSizeBeforeTask = Math.subtractExact(
+                        preparedTask.getCumulativeSize(), preparedTask.getTotalSize());
+                return requirePositiveRepairedCumulativeSize(
+                        lease, legacy, cumulativeSizeBeforeTask);
+            }
+            throw legacyPublishedOffset(lease, legacy,
+                    "the cursor is neither immediately before nor at the end of the durable "
+                            + "prepared task range");
+        } catch (LegacyPublishedOffsetException error) {
+            throw error;
+        } catch (RuntimeException error) {
+            throw legacyPublishedOffset(lease, legacy,
+                    "the durable prepared task has invalid offset or size coordinates", error);
+        }
+    }
+
+    private static long requirePositiveRepairedCumulativeSize(
+            PublicationLease lease, CompactedOffset legacy, long cumulativeSize) {
+        if (cumulativeSize <= 0) {
+            throw legacyPublishedOffset(lease, legacy,
+                    "the durable prepared task does not prove a positive cumulative byte size");
+        }
+        return cumulativeSize;
+    }
+
+    private static LegacyPublishedOffsetException legacyPublishedOffset(
+            PublicationLease lease, CompactedOffset legacy, String reason) {
+        return new LegacyPublishedOffsetException(
+                lease.name(), legacy.getId(), legacy.getOffset(), reason);
+    }
+
+    private static LegacyPublishedOffsetException legacyPublishedOffset(
+            PublicationLease lease,
+            CompactedOffset legacy,
+            String reason,
+            Throwable cause) {
+        return new LegacyPublishedOffsetException(
+                lease.name(), legacy.getId(), legacy.getOffset(), reason, cause);
+    }
+
     @Override
     public Optional<PreparedTaskClaim> getPreparedTaskClaim(String name)
             throws IOException, ExecutionException, InterruptedException {
@@ -658,7 +838,7 @@ public class OxiaCompactTaskManager implements CompactTaskManager {
             return Optional.empty();
         }
         return Optional.of(new PreparedTaskClaim(
-                PreparedCompactStreamTaskSerde.INSTANCE.deserialize(result.value()),
+                deserializePreparedTask(result.value(), key),
                 result.version().versionId()));
     }
 
@@ -698,6 +878,39 @@ public class OxiaCompactTaskManager implements CompactTaskManager {
 
     private static String publishedOffsetKey(long streamId) {
         return String.format("compact-offset-%020d", streamId);
+    }
+
+    private static CompactedOffset deserializePublishedOffset(byte[] content, String key) {
+        try {
+            CompactedOffset offset = CompactOffsetSerde.INSTANCE.deserialize(content);
+            if (offset == null) {
+                throw new PublicationRecoveryException(
+                        "Published-offset cursor " + key + " decoded to null");
+            }
+            return offset;
+        } catch (PublicationRecoveryException error) {
+            throw error;
+        } catch (IOException | RuntimeException error) {
+            throw new PublicationRecoveryException(
+                    "Published-offset cursor " + key + " cannot be decoded safely", error);
+        }
+    }
+
+    private static PreparedCompactStreamTask deserializePreparedTask(byte[] content, String key) {
+        try {
+            PreparedCompactStreamTask task =
+                    PreparedCompactStreamTaskSerde.INSTANCE.deserialize(content);
+            if (task == null) {
+                throw new PublicationRecoveryException(
+                        "Prepared publication task " + key + " decoded to null");
+            }
+            return task;
+        } catch (PublicationRecoveryException error) {
+            throw error;
+        } catch (IOException | RuntimeException error) {
+            throw new PublicationRecoveryException(
+                    "Prepared publication task " + key + " cannot be decoded safely", error);
+        }
     }
 
     private static String publishedOffsetKey(String name) {

@@ -20,14 +20,19 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
 
@@ -36,7 +41,11 @@ public class CompactedTaskRunner implements Runnable, StartStopRunner {
 
     private volatile boolean isCancel = false;
     private volatile boolean firstRound = true;
+    private final Object stateLock = new Object();
     private final CommitTaskProvider commitTaskProvider;
+    // Registration and snapshots are coordinated by stateLock. Futures are never cancelled, so a
+    // completed future proves that its commit runnable has actually returned.
+    private final Set<CompletableFuture<Void>> inFlightCommits = ConcurrentHashMap.newKeySet();
     private Future<?> commitFileFuture;
     private final ExecutorService compactedTaskExecutor;
     private final ExecutorService commitParquetFileExecutor;
@@ -47,6 +56,9 @@ public class CompactedTaskRunner implements Runnable, StartStopRunner {
     // Leadership gate: commits only proceed while this returns true. A demoted leader stops committing promptly
     // instead of draining in-flight work while the new leader commits the same tasks. In-memory check, no Oxia load.
     private final BooleanSupplier isLeader;
+    private final Consumer<Throwable> fatalErrorHandler;
+    private final Object fatalStopLock = new Object();
+    private IllegalStateException fatalStopFailure;
     private final boolean replayDLQTasks;
     private final int commitTimeoutInSeconds;
     private final int commitIntervalInSeconds;
@@ -63,7 +75,7 @@ public class CompactedTaskRunner implements Runnable, StartStopRunner {
                                CompactionMetrics compactionMetrics) {
         // Default to always-leader for manual/admin and test usage that is not leadership-gated.
         this(storageApi, commitTaskProvider, compactTaskManager, compactedTaskExecutor,
-            commitParquetFileExecutor, storageConfig, compactionMetrics, () -> true);
+            commitParquetFileExecutor, storageConfig, compactionMetrics, () -> true, failure -> { });
     }
 
     public CompactedTaskRunner(StorageApi storageApi,
@@ -74,10 +86,29 @@ public class CompactedTaskRunner implements Runnable, StartStopRunner {
                                StorageConfig storageConfig,
                                CompactionMetrics compactionMetrics,
                                BooleanSupplier isLeader) {
+        this(storageApi, commitTaskProvider, compactTaskManager, compactedTaskExecutor,
+            commitParquetFileExecutor, storageConfig, compactionMetrics, isLeader, failure -> { });
+    }
+
+    CompactedTaskRunner(StorageApi storageApi,
+                        CommitTaskProvider commitTaskProvider,
+                        CompactTaskManager compactTaskManager,
+                        ExecutorService compactedTaskExecutor,
+                        ExecutorService commitParquetFileExecutor,
+                        StorageConfig storageConfig,
+                        CompactionMetrics compactionMetrics,
+                        BooleanSupplier isLeader,
+                        Consumer<Throwable> fatalErrorHandler) {
         this.isLeader = isLeader;
+        this.fatalErrorHandler = Objects.requireNonNull(fatalErrorHandler, "fatalErrorHandler");
         this.storageApi = storageApi;
         this.commitTaskProvider = commitTaskProvider;
         this.compactTaskManager = compactTaskManager;
+        if (compactedTaskExecutor != null
+                && compactedTaskExecutor == commitParquetFileExecutor) {
+            throw new IllegalArgumentException(
+                    "Compacted-task orchestration and lakehouse commit work require separate executors");
+        }
         this.compactedTaskExecutor = compactedTaskExecutor;
         this.commitParquetFileExecutor = commitParquetFileExecutor;
         this.storageConfig = storageConfig;
@@ -85,11 +116,24 @@ public class CompactedTaskRunner implements Runnable, StartStopRunner {
         this.replayDLQTasks = storageConfig.isReplayDLQTasksEnabled();
         this.commitTimeoutInSeconds = Integer.parseInt(
             storageConfig.getProperties().getProperty("commitTimeoutInSeconds", "1800"));
+        if (commitTimeoutInSeconds <= 0) {
+            throw new IllegalArgumentException("commitTimeoutInSeconds must be greater than zero");
+        }
         this.commitIntervalInSeconds = storageConfig.getMaxCommitIntervalInSeconds();
         this.bannedTopics = storageConfig.getBlackTopicOfCompact()
             .stream()
-            .map(t -> TopicName.get(t).getPartitionedTopicName())
+            .map(CompactedTaskRunner::parseBannedTopic)
+            .flatMap(Optional::stream)
             .collect(Collectors.toSet());
+    }
+
+    static Optional<String> parseBannedTopic(String configuredName) {
+        try {
+            return Optional.of(TopicName.get(configuredName).getPartitionedTopicName());
+        } catch (RuntimeException invalidName) {
+            log.warn("Ignoring invalid blackTopicOfCompact entry '{}'", configuredName, invalidName);
+            return Optional.empty();
+        }
     }
 
     @Override
@@ -116,13 +160,10 @@ public class CompactedTaskRunner implements Runnable, StartStopRunner {
                     continue;
                 }
                 var topicTasks = entry.getValue();
-                var future = CompletableFuture.runAsync(() -> {
-                    try {
-                        runTask(partitionedTopic, topicTasks);
-                    } catch (ExceptionWithCode e) {
-                        throw new CompletionException(e);
-                    }
-                }, commitParquetFileExecutor);
+                CompletableFuture<Void> future = dispatchCommit(partitionedTopic, topicTasks);
+                if (future == null) {
+                    break;
+                }
                 commitResults.add(future);
             }
 
@@ -133,8 +174,26 @@ public class CompactedTaskRunner implements Runnable, StartStopRunner {
             try {
                 CompletableFuture.allOf(commitResults.toArray(new CompletableFuture[0]))
                     .get(commitTimeoutInSeconds, TimeUnit.SECONDS);
+            } catch (TimeoutException timeout) {
+                failStopForUndrainedCommits(commitResults, "scheduled commit round", timeout);
+            } catch (InterruptedException interrupted) {
+                log.info("Compacted task orchestration interrupted while waiting for commits to drain");
+                boolean drained = awaitCommitsWithinDeadline(
+                        commitResults, commitTimeoutInSeconds, TimeUnit.SECONDS);
+                Thread.currentThread().interrupt();
+                if (!drained) {
+                    failStopForUndrainedCommits(
+                            commitResults, "interrupted commit round", interrupted);
+                }
+            } catch (ExecutionException failure) {
+                log.error("Error committing compacted tasks", failure.getCause());
             } catch (Throwable e) {
                 log.error("Error committing compacted tasks", e);
+                if (!awaitCommitsWithinDeadline(
+                        commitResults, commitTimeoutInSeconds, TimeUnit.SECONDS)) {
+                    failStopForUndrainedCommits(
+                            commitResults, "failed commit round", e);
+                }
             } finally {
                 int totalCommitRuns = commitResults.size();
                 long successfulCommits = commitResults.stream()
@@ -166,6 +225,102 @@ public class CompactedTaskRunner implements Runnable, StartStopRunner {
             }
             start();
         }
+    }
+
+    private CompletableFuture<Void> dispatchCommit(
+            String partitionedTopic, List<CompactStreamTask> topicTasks) {
+        synchronized (stateLock) {
+            if (shouldStop()) {
+                return null;
+            }
+            CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                try {
+                    runTask(partitionedTopic, topicTasks);
+                } catch (ExceptionWithCode e) {
+                    throw new CompletionException(e);
+                }
+            }, commitParquetFileExecutor);
+            inFlightCommits.add(future);
+            future.whenComplete((ignored, failure) -> inFlightCommits.remove(future));
+            return future;
+        }
+    }
+
+    private static boolean awaitCommitsWithinDeadline(
+            List<CompletableFuture<Void>> commits, long timeout, TimeUnit unit) {
+        if (commits.isEmpty()) {
+            return true;
+        }
+        CompletableFuture<Void> completion = CompletableFuture.allOf(
+                commits.toArray(new CompletableFuture[0]));
+        long timeoutNanos = Math.max(0L, unit.toNanos(timeout));
+        long deadline = System.nanoTime() + timeoutNanos;
+        boolean interrupted = false;
+        try {
+            while (true) {
+                if (completion.isDone()) {
+                    return true;
+                }
+                long remainingNanos = deadline - System.nanoTime();
+                if (remainingNanos <= 0) {
+                    return false;
+                }
+                try {
+                    completion.get(remainingNanos, TimeUnit.NANOSECONDS);
+                    return true;
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                } catch (ExecutionException e) {
+                    // allOf only completes exceptionally after every child is terminal.
+                    return true;
+                } catch (TimeoutException e) {
+                    return false;
+                }
+            }
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private void failStopForUndrainedCommits(
+            List<CompletableFuture<Void>> commits, String operation, Throwable cause) {
+        synchronized (stateLock) {
+            isCancel = true;
+        }
+        long unfinishedCommits = commits.stream().filter(future -> !future.isDone()).count();
+        IllegalStateException detectedFailure = new IllegalStateException(
+                String.format("%d lakehouse commit(s) did not drain within %d seconds during %s; "
+                                + "the compaction process must fail-stop before its leader lease is released",
+                        unfinishedCommits, commitTimeoutInSeconds, operation),
+                cause);
+        IllegalStateException failure;
+        synchronized (fatalStopLock) {
+            if (fatalStopFailure == null) {
+                fatalStopFailure = detectedFailure;
+                try {
+                    log.error("Unsafe compaction leader handoff prevented; fail-stopping the process",
+                            fatalStopFailure);
+                } catch (Throwable observabilityFailure) {
+                    fatalStopFailure.addSuppressed(observabilityFailure);
+                }
+                try {
+                    compactionMetrics.getCommitDrainTimeoutCount().increment();
+                } catch (Throwable observabilityFailure) {
+                    fatalStopFailure.addSuppressed(observabilityFailure);
+                }
+                try {
+                    fatalErrorHandler.accept(fatalStopFailure);
+                } catch (Throwable handlerFailure) {
+                    if (handlerFailure != fatalStopFailure) {
+                        fatalStopFailure.addSuppressed(handlerFailure);
+                    }
+                }
+            }
+            failure = fatalStopFailure;
+        }
+        throw failure;
     }
 
     public void runTask(String partitionedTopicName, List<CompactStreamTask> tasks) throws ExceptionWithCode {
@@ -252,18 +407,33 @@ public class CompactedTaskRunner implements Runnable, StartStopRunner {
 
     @Override
     public void start() {
-        if (!isCancel && compactedTaskExecutor != null) {
-            commitFileFuture = compactedTaskExecutor.submit(this);
+        synchronized (stateLock) {
+            if (!isCancel && compactedTaskExecutor != null) {
+                commitFileFuture = compactedTaskExecutor.submit(this);
+            }
         }
     }
 
     @Override
     public void stop() {
-        isCancel = true;
-        if (commitFileFuture != null) {
+        Future<?> outerFuture;
+        List<CompletableFuture<Void>> commits;
+        synchronized (stateLock) {
+            isCancel = true;
+            outerFuture = commitFileFuture;
+            commits = List.copyOf(inFlightCommits);
+        }
+        if (outerFuture != null) {
             // Interrupt so the orchestrator does not stay blocked in allOf().get(commitTimeoutInSeconds) after
-            // demotion. The dispatched commit tasks cooperatively bail via shouldStop() before each commit.
-            commitFileFuture.cancel(true);
+            // demotion. Child futures are deliberately not cancelled: cancellation may mark a
+            // Future done while its lakehouse commit is still running, which is not a safe handoff.
+            outerFuture.cancel(true);
+        }
+        if (!awaitCommitsWithinDeadline(commits, commitTimeoutInSeconds, TimeUnit.SECONDS)) {
+            failStopForUndrainedCommits(
+                    commits,
+                    "leader demotion",
+                    new TimeoutException("Timed out draining lakehouse commits during leader demotion"));
         }
     }
 

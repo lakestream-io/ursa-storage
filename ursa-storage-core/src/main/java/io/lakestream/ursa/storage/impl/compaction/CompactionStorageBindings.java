@@ -5,6 +5,7 @@
 package io.lakestream.ursa.storage.impl.compaction;
 
 import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 
 /**
  * Sink-neutral factory for the long-running compaction runners and storage
@@ -40,6 +41,19 @@ public interface CompactionStorageBindings extends AutoCloseable {
      *                 Pass {@code () -> true} for manual/admin commits that are not leadership-gated.
      */
     StartStopRunner createCompactedTaskRunner(BooleanSupplier isLeader);
+
+    /**
+     * Builds the commit runner with a process-level fatal-error supervisor.
+     *
+     * <p>The default preserves source and binary compatibility for integrations whose commit
+     * implementation has no non-interruptible external side effects. Implementations that can
+     * leave an in-flight commit running after their lifecycle deadline should override this method
+     * and invoke {@code fatalErrorHandler} rather than allowing an unsafe leader handoff.
+     */
+    default StartStopRunner createCompactedTaskRunner(
+            BooleanSupplier isLeader, Consumer<Throwable> fatalErrorHandler) {
+        return createCompactedTaskRunner(isLeader);
+    }
 
     /**
      * Builds the periodic cleaner that finds compacted data eligible for

@@ -112,8 +112,18 @@ public class CompactionWorker implements Runnable {
                 TimeUnit.SECONDS.toMillis(config.getRefreshLocalTaskIntervalInSeconds());
         this.blackTopicOfCompact = config.getBlackTopicOfCompact()
                 .stream()
-                .map(CompactionWorker::partitionedStreamName)
+                .map(CompactionWorker::parseBlacklistedStream)
+                .flatMap(Optional::stream)
                 .collect(Collectors.toSet());
+    }
+
+    private static Optional<String> parseBlacklistedStream(String configuredName) {
+        try {
+            return Optional.of(partitionedStreamName(configuredName));
+        } catch (RuntimeException invalidName) {
+            log.warn("Ignoring invalid blackTopicOfCompact entry '{}'", configuredName, invalidName);
+            return Optional.empty();
+        }
     }
 
     @Override
@@ -140,6 +150,9 @@ public class CompactionWorker implements Runnable {
                     CompactStreamTask compactStreamTask = null;
                     try {
                         compactStreamTask = compactTaskManager.getCompactStreamTask(subTask).get();
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw interrupted;
                     } catch (Exception e) {
                         log.warn("Failed to get compact stream task {} for task {}",
                                 subTask, taskName, e);
@@ -203,11 +216,8 @@ public class CompactionWorker implements Runnable {
                                 compactionService.compactStream(validCompactTask);
                             }
                         } catch (MaterializationException me) {
-                            // Materialization implementations may bridge asynchronous APIs whose
-                            // ExecutionException is wrapped by MaterializationException. Preserve
-                            // fatal JVM failures across that boundary instead of quarantining them
-                            // as ordinary sink failures.
-                            rethrowErrorCause(me);
+                            failedTopicName = validCompactTask.getTopic();
+                            failedCompactTask = validCompactTask;
                             // Sink-neutral failure path: invalidate cached state when the code is
                             // non-retryable so the sink can drop writer state. The outer
                             // ExceptionWithCode handling still applies because
@@ -217,16 +227,13 @@ public class CompactionWorker implements Runnable {
                                 try {
                                     materializationService.invalidate(
                                             toStreamIdentifier(validCompactTask.getTopic()));
-                                } catch (RuntimeException invalidationFailure) {
-                                    rethrowErrorCause(invalidationFailure);
+                                } catch (Throwable invalidationFailure) {
                                     log.warn("Failed to invalidate stream {} after materialization failure",
                                             validCompactTask.getTopic(), invalidationFailure);
                                 }
                             }
-                            failedTopicName = validCompactTask.getTopic();
-                            failedCompactTask = validCompactTask;
                             throw me;
-                        } catch (Exception e) {
+                        } catch (Throwable e) {
                             failedTopicName = validCompactTask.getTopic();
                             failedCompactTask = validCompactTask;
                             throw e;
@@ -235,47 +242,97 @@ public class CompactionWorker implements Runnable {
                 } finally {
                     compactTaskManager.unlockTaskAndRemoveLock(taskName);
                 }
-            } catch (Exception e) {
-                rethrowErrorCause(e);
-                // Operational failures stay within the worker's retry and quarantine policy. JVM
-                // Errors deliberately escape so linkage, memory, and other fatal failures are not
-                // laundered into retryable materialization errors.
+            } catch (Throwable e) {
+                // Workers are submitted once as long-lived Runnables. Letting an Error escape would
+                // permanently remove one worker from the pool, so supervise every task failure here.
+                // A MaterializationException that happens to carry an Error still follows its explicit
+                // ExceptionCode; a directly thrown Error falls back to the non-retryable policy below.
                 if (e instanceof InterruptedException) {
                     log.warn("[{}] Compact runner thread interrupted", compactionTask, e);
                     break;
                 }
 
-                log.warn("[{}] During compact error", compactionTask, e);
+                recordTaskFailureBestEffort(compactionTask, e);
 
-                // Per-code quarantine: immediate retry for transient source read/throttle failures,
-                // shorter retryable quarantine for exhausted/input-client failures (which can recur on
-                // the same topic and would otherwise hot-loop the worker), and the existing nonRetryable
-                // quarantine for everything else.
-                ExceptionCode code = exceptionCode(e);
-                if (failedCompactTask != null && isTerminalCode(code)) {
-                    try {
+                boolean failureHandlingFailed = false;
+                try {
+                    // Per-code quarantine: immediate retry for transient source read/throttle
+                    // failures, shorter retryable quarantine for exhausted/input-client failures
+                    // (which can recur on the same topic and would otherwise hot-loop the worker),
+                    // and the existing nonRetryable quarantine for everything else.
+                    ExceptionCode code = exceptionCode(e);
+                    if (failedCompactTask != null && isTerminalCode(code)) {
                         if (deleteTerminalTask(failedCompactTask)) {
                             continue;
                         }
-                    } catch (InterruptedException deleteInterrupted) {
-                        Thread.currentThread().interrupt();
-                        log.warn("Compact runner interrupted while deleting terminal task {}",
-                                failedCompactTask.getTaskName(), deleteInterrupted);
-                        break;
+                    }
+                    if (failedTopicName != null && !isPureRetryCode(code)) {
+                        long quarantineMs = isRetryableQuarantineCode(code)
+                                ? retryableTaskQuarantineInMs : nonRetryableTaskQuarantineInMs;
+                        long currentTime = System.currentTimeMillis();
+                        log.info("Quarantine topic {} for {}ms until {} due to the task failed (code={}).",
+                            failedTopicName, quarantineMs, currentTime + quarantineMs, code);
+                        compactionTaskProvider.quarantineTopic(
+                                failedTopicName, currentTime + quarantineMs);
+                    }
+                    if (!isPureRetryCode(code) && code != ExceptionCode.NO_MORE_RECORDS) {
+                        compactionMetrics.getFailedCompactTaskCount().increment();
+                    }
+                } catch (InterruptedException handlingInterrupted) {
+                    Thread.currentThread().interrupt();
+                    log.warn("Compact runner interrupted while handling task failure",
+                            handlingInterrupted);
+                    break;
+                } catch (Throwable handlingFailure) {
+                    failureHandlingFailed = true;
+                    if (handlingFailure != e) {
+                        e.addSuppressed(handlingFailure);
+                    }
+                    try {
+                        log.error("Failed to apply compaction failure policy; keeping worker supervised",
+                                handlingFailure);
+                    } catch (Throwable observabilityFailure) {
+                        if (observabilityFailure != e && observabilityFailure != handlingFailure) {
+                            e.addSuppressed(observabilityFailure);
+                        }
                     }
                 }
-                if (failedTopicName != null && !isPureRetryCode(code)) {
-                    long quarantineMs = isRetryableQuarantineCode(code)
-                            ? retryableTaskQuarantineInMs : nonRetryableTaskQuarantineInMs;
-                    long currentTime = System.currentTimeMillis();
-                    log.info("Quarantine topic {} for {}ms until {} due to the task failed (code={}).",
-                        failedTopicName, quarantineMs, currentTime + quarantineMs, code);
-                    compactionTaskProvider.quarantineTopic(failedTopicName, currentTime + quarantineMs);
-                }
-                if (!isPureRetryCode(code) && code != ExceptionCode.NO_MORE_RECORDS) {
-                    compactionMetrics.getFailedCompactTaskCount().increment();
+
+                // Before a subtask identifies its topic there is nothing durable to quarantine.
+                // Back off the long-lived worker so a persistent provider/linkage Error cannot turn
+                // every worker into a CPU and log storm. Also back off when quarantine/metrics fail.
+                if ((failedTopicName == null || failureHandlingFailed)
+                        && !pauseAfterUnscopedFailure()) {
+                    break;
                 }
             }
+        }
+    }
+
+    private static void recordTaskFailureBestEffort(
+            PackagedCompactStreamTask compactionTask, Throwable failure) {
+        try {
+            if (failure instanceof Error) {
+                log.error("[{}] Fatal error during compaction; keeping worker supervised",
+                        compactionTask, failure);
+            } else {
+                log.warn("[{}] During compact error", compactionTask, failure);
+            }
+        } catch (Throwable observabilityFailure) {
+            if (observabilityFailure != failure) {
+                failure.addSuppressed(observabilityFailure);
+            }
+        }
+    }
+
+    private boolean pauseAfterUnscopedFailure() {
+        try {
+            Thread.sleep(Math.max(1L, waitForAvailableTaskIntervalInMs));
+            return true;
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            log.warn("Compact runner interrupted during supervised failure backoff", interrupted);
+            return false;
         }
     }
 
@@ -506,7 +563,6 @@ public class CompactionWorker implements Runnable {
                     + "synthesized from task properties for stream {}", name, resolved.tableIdentifier());
             }
         } catch (RuntimeException e) {
-            rethrowErrorCause(e);
             log.warn("Failed to load registered table catalog '{}'; using the catalog synthesized from "
                     + "task properties", name, e);
         }
@@ -525,28 +581,11 @@ public class CompactionWorker implements Runnable {
 
     private static MaterializationException catalogFailure(
             String message, RuntimeException failure) {
-        // CompletableFuture.join() wraps exceptional completion in a RuntimeException, including
-        // fatal JVM Errors. Do not turn those Errors into retryable materialization failures.
-        rethrowErrorCause(failure);
         ExceptionCode code = hasCause(failure, StreamPermanentlyDeletedException.class)
                 || hasCause(failure, PartitionLifecycleFencedException.class)
             ? ExceptionCode.NO_SUCH_STREAM
             : ExceptionCode.INTERNAL_ERROR;
         return new MaterializationException(code, message, failure);
-    }
-
-    private static void rethrowErrorCause(Throwable failure) {
-        Throwable current = failure;
-        while (current != null) {
-            if (current instanceof Error error) {
-                throw error;
-            }
-            Throwable cause = current.getCause();
-            if (cause == current) {
-                break;
-            }
-            current = cause;
-        }
     }
 
     private static boolean hasCause(Throwable failure, Class<? extends Throwable> type) {

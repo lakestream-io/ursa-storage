@@ -5,6 +5,7 @@
 package io.lakestream.ursa.storage.impl.compaction;
 
 import io.lakestream.ursa.compaction.CompactTaskManager;
+import io.lakestream.ursa.compaction.LegacyPublishedOffsetException;
 import io.lakestream.ursa.compaction.PublicationFencedException;
 import io.lakestream.ursa.compaction.task.CompactStreamTask;
 import io.lakestream.ursa.compaction.task.CompactedOffset;
@@ -173,12 +174,19 @@ public class MemoryCompactTaskManager implements CompactTaskManager {
 
     @Override
     public void updatePublishedOffset(long streamId, long offset, long cumulativeSize) {
+        validatePublishedOffset(offset, cumulativeSize);
         publishedOffsets.put(streamId, new CompactedOffset(streamId, offset, cumulativeSize));
     }
 
     @Override
     public synchronized void updatePublishedOffset(
             String name, long streamId, long offset, long cumulativeSize) {
+        validatePublishedOffset(offset, cumulativeSize);
+        publishedOffsets.put(name, new CompactedOffset(streamId, offset, cumulativeSize));
+        publishedOffsetVersions.put(name, nextRevision++);
+    }
+
+    private static void validatePublishedOffset(long offset, long cumulativeSize) {
         if (offset < -1) {
             throw new IllegalArgumentException("Published offset must be at least -1");
         }
@@ -189,8 +197,10 @@ public class MemoryCompactTaskManager implements CompactTaskManager {
             throw new IllegalArgumentException(
                     "Published cumulative size must be 0 when the published offset is -1");
         }
-        publishedOffsets.put(name, new CompactedOffset(streamId, offset, cumulativeSize));
-        publishedOffsetVersions.put(name, nextRevision++);
+        if (offset >= 0 && cumulativeSize == 0) {
+            throw new IllegalArgumentException(
+                    "Published cumulative size must be positive when the published offset is non-negative");
+        }
     }
 
     @Override
@@ -215,9 +225,21 @@ public class MemoryCompactTaskManager implements CompactTaskManager {
     }
 
     @Override
+    public CompletableFuture<Boolean> releasePublicationLeaseAsync(PublicationLease lease) {
+        try {
+            return CompletableFuture.completedFuture(releasePublicationLease(lease));
+        } catch (Exception | Error failure) {
+            return CompletableFuture.failedFuture(failure);
+        }
+    }
+
+    @Override
     public synchronized PublishedOffsetClaim claimPublishedOffset(PublicationLease lease) {
         ensureCurrentLease(lease);
         CompactedOffset current = publishedOffsets.get(lease.name());
+        if (current != null && current.getId() == lease.streamId()) {
+            validateStoredPublishedOffset(lease, current);
+        }
         CompactedOffset claimed = current != null && current.getId() == lease.streamId()
                 ? current : new CompactedOffset(lease.streamId(), -1L, 0L);
         long revision = nextRevision++;
@@ -231,21 +253,33 @@ public class MemoryCompactTaskManager implements CompactTaskManager {
             PublicationLease lease,
             PublishedOffsetClaim expected,
             CompactedOffset updated) {
+        if (expected.offset().getId() != lease.streamId() || updated.getId() != lease.streamId()) {
+            throw new IllegalArgumentException("The published-offset cursor must belong to the leased stream");
+        }
+        validateStoredPublishedOffset(lease, expected.offset());
+        validatePublishedOffset(updated.getOffset(), updated.getCumulativeSize());
+        if (updated.getOffset() < expected.offset().getOffset()) {
+            throw new IllegalArgumentException("The published-offset cursor cannot move backwards");
+        }
         ensureCurrentLease(lease);
         Long currentRevision = publishedOffsetVersions.get(lease.name());
         if (currentRevision == null || currentRevision != expected.revision()) {
             throw new PublicationFencedException("Published-offset revision is no longer current");
         }
-        if (expected.offset().getId() != lease.streamId() || updated.getId() != lease.streamId()) {
-            throw new IllegalArgumentException("The published-offset cursor must belong to the leased stream");
-        }
-        if (updated.getOffset() < expected.offset().getOffset()) {
-            throw new IllegalArgumentException("The published-offset cursor cannot move backwards");
-        }
         long revision = nextRevision++;
         publishedOffsets.put(lease.name(), updated);
         publishedOffsetVersions.put(lease.name(), revision);
         return new PublishedOffsetClaim(updated, revision);
+    }
+
+    private static void validateStoredPublishedOffset(
+            PublicationLease lease, CompactedOffset offset) {
+        if (offset.getOffset() >= 0 && offset.getCumulativeSize() == 0) {
+            throw new LegacyPublishedOffsetException(
+                    lease.name(), offset.getId(), offset.getOffset(),
+                    "the in-memory task manager cannot prove the missing cumulative byte size");
+        }
+        validatePublishedOffset(offset.getOffset(), offset.getCumulativeSize());
     }
 
     @Override

@@ -54,6 +54,11 @@ public class UpdatePublishTaskOffset implements Callable<Integer> {
             System.err.println("Published cumulative size must be 0 when offset is -1");
             return 1;
         }
+        if (offset >= 0 && cumulativeSize == 0) {
+            System.err.println(
+                    "Published cumulative size must be positive when offset is non-negative");
+            return 1;
+        }
         if (StringUtils.isEmpty(oxiaServerAddr)) {
             var config = Admin.getStorageConfig(parent.getConfigFile());
             var oxiaUrl = UrsaStorage.validateOxiaUrl(config.getOxiaStorageUrl());

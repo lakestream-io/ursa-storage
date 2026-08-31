@@ -48,13 +48,33 @@ class MemoryCompactTaskManagerPublicationTest {
     }
 
     @Test
+    void asynchronousPublicationLeaseReleaseCompletesImmediatelyAndRemainsConditional()
+            throws Exception {
+        MemoryCompactTaskManager manager = new MemoryCompactTaskManager();
+        CompactTaskManager.PublicationLease lease =
+                manager.tryAcquirePublicationLease(TOPIC, 1L).orElseThrow();
+        CompactTaskManager.PublicationLease stale = new CompactTaskManager.PublicationLease(
+                TOPIC, 1L, lease.ownerId(), lease.revision() + 1L);
+
+        var staleRelease = manager.releasePublicationLeaseAsync(stale);
+        assertTrue(staleRelease.isDone());
+        assertFalse(staleRelease.get());
+        assertTrue(manager.validatePublicationLease(lease));
+
+        var release = manager.releasePublicationLeaseAsync(lease);
+        assertTrue(release.isDone());
+        assertTrue(release.get());
+        assertFalse(manager.validatePublicationLease(lease));
+    }
+
+    @Test
     void successorCursorClaimFencesOldSessionAndResetsIncarnationOnce() throws Exception {
         MemoryCompactTaskManager manager = new MemoryCompactTaskManager();
         CompactTaskManager.PublicationLease oldLease =
                 manager.tryAcquirePublicationLease(TOPIC, 1L).orElseThrow();
         CompactTaskManager.PublishedOffsetClaim oldCursor = manager.claimPublishedOffset(oldLease);
         oldCursor = manager.compareAndSetPublishedOffset(
-                oldLease, oldCursor, new CompactedOffset(1L, 99L, 0L));
+                oldLease, oldCursor, new CompactedOffset(1L, 99L, 100L));
         assertTrue(manager.releasePublicationLease(oldLease));
 
         CompactTaskManager.PublicationLease newLease =
@@ -65,7 +85,7 @@ class MemoryCompactTaskManagerPublicationTest {
         CompactTaskManager.PublishedOffsetClaim staleCursor = oldCursor;
         assertThrows(PublicationFencedException.class,
                 () -> manager.compareAndSetPublishedOffset(
-                        oldLease, staleCursor, new CompactedOffset(1L, 199L, 0L)));
+                        oldLease, staleCursor, new CompactedOffset(1L, 199L, 200L)));
         assertEquals(new CompactedOffset(2L, -1L, 0L), manager.getPublishedOffset(TOPIC));
     }
 

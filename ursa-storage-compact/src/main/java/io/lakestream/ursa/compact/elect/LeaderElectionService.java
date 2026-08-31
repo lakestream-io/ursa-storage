@@ -10,6 +10,7 @@ import io.opentelemetry.api.metrics.ObservableLongMeasurement;
 import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.GetResult;
 import io.oxia.client.api.exceptions.KeyAlreadyExistsException;
+import io.oxia.client.api.exceptions.UnexpectedVersionIdException;
 import io.oxia.client.api.options.DeleteOption;
 import io.oxia.client.api.options.PutOption;
 import java.nio.charset.StandardCharsets;
@@ -39,8 +40,14 @@ public class LeaderElectionService implements AutoCloseable {
     private final ScheduledExecutorService executor;
     private final AtomicBoolean leader = new AtomicBoolean();
     private final AtomicBoolean closed = new AtomicBoolean();
+    // Guarded by updateLeadership. Tracks the state successfully applied by the listener, which
+    // can lag the observed Oxia ownership when runner startup or shutdown fails. A failed callback
+    // can have partial side effects, so listenerStateKnown forces the next refresh to reconcile it.
+    private boolean listenerLeadership;
+    private boolean listenerStateKnown = true;
     private volatile Optional<CompactLeader> currentLeader = Optional.empty();
     private volatile long versionId = -1;
+    private volatile long relinquishingVersionId = -1;
     private volatile ScheduledFuture<?> refreshFuture;
 
     public LeaderElectionService(AsyncOxiaClient client,
@@ -82,6 +89,9 @@ public class LeaderElectionService implements AutoCloseable {
 
     public void start() {
         refreshLeadership();
+        if (closed.get()) {
+            return;
+        }
         refreshFuture = executor.scheduleWithFixedDelay(
                 this::refreshLeadership,
                 REFRESH_INTERVAL_SECONDS,
@@ -95,8 +105,16 @@ public class LeaderElectionService implements AutoCloseable {
         }
         try {
             GetResult existing = client.get(electionRoot).join();
+            if (closed.get()) {
+                return;
+            }
+            if (retryPendingLeadershipRelinquish(existing)) {
+                return;
+            }
             if (isOurRecord(existing)) {
-                updateLeadership(true, Optional.of(new CompactLeader(hostname)));
+                if (!updateLeadership(true, Optional.of(new CompactLeader(hostname)))) {
+                    relinquishFailedLeadership(versionId);
+                }
                 return;
             }
             if (existing != null) {
@@ -104,9 +122,11 @@ public class LeaderElectionService implements AutoCloseable {
                 return;
             }
             tryAcquire();
-        } catch (RuntimeException e) {
-            log.warn("Failed to refresh compaction leadership", unwrap(e));
-            updateLeadership(false, Optional.empty());
+        } catch (Throwable failure) {
+            recordRefreshFailure(failure);
+            if (!closed.get()) {
+                updateLeadership(false, Optional.empty());
+            }
         }
     }
 
@@ -116,12 +136,22 @@ public class LeaderElectionService implements AutoCloseable {
 
     private void tryAcquire() {
         try {
+            if (closed.get()) {
+                return;
+            }
             var result = client.put(
                     electionRoot,
                     hostname.getBytes(StandardCharsets.UTF_8),
                     Set.of(PutOption.AsEphemeralRecord, PutOption.IfRecordDoesNotExist)).join();
             versionId = result.version().versionId();
-            updateLeadership(true, Optional.of(new CompactLeader(hostname)));
+            if (closed.get()) {
+                markLeadershipRelinquishing(versionId);
+                tryReleaseElectionRecord(versionId);
+                return;
+            }
+            if (!updateLeadership(true, Optional.of(new CompactLeader(hostname)))) {
+                relinquishFailedLeadership(versionId);
+            }
         } catch (RuntimeException e) {
             Throwable cause = unwrap(e);
             if (!(cause instanceof KeyAlreadyExistsException)) {
@@ -131,16 +161,132 @@ public class LeaderElectionService implements AutoCloseable {
         }
     }
 
-    private void updateLeadership(boolean leading, Optional<CompactLeader> observedLeader) {
+    private synchronized boolean updateLeadership(
+            boolean leading, Optional<CompactLeader> observedLeader) {
+        if (leading && closed.get()) {
+            leader.set(false);
+            return false;
+        }
         currentLeader = observedLeader;
-        boolean changed = leader.getAndSet(leading) != leading;
-        if (changed) {
-            try {
-                listener.accept(leading);
-            } catch (RuntimeException e) {
-                log.error("Compaction leadership listener failed while transitioning to {}",
-                        leading ? "leader" : "follower", e);
+        leader.set(leading);
+        if (listenerStateKnown && listenerLeadership == leading) {
+            return true;
+        }
+        try {
+            listener.accept(leading);
+            listenerLeadership = leading;
+            listenerStateKnown = true;
+            return true;
+        } catch (Throwable failure) {
+            // Starting leader-only runners is part of becoming locally usable as leader. If it
+            // fails, keep the successfully-applied listener state unchanged and report this node
+            // as a follower until a later refresh retries the same observed Oxia ownership.
+            if (leading) {
+                leader.set(false);
             }
+            listenerStateKnown = false;
+            try {
+                log.error("Compaction leadership listener failed while transitioning to {}; "
+                                + "the transition will be retried on the next refresh",
+                        leading ? "leader" : "follower", failure);
+            } catch (Throwable observabilityFailure) {
+                addSuppressed(failure, observabilityFailure);
+            }
+            return false;
+        }
+    }
+
+    /**
+     * Gives up an Oxia claim whose leader-only runners could not be started.
+     *
+     * <p>Keeping the ephemeral record while only retrying the local listener would make this
+     * unhealthy process the permanent cluster leader and prevent a healthy peer from taking over.
+     * Reconcile any partial listener side effects first, then delete only the exact version this
+     * process acquired.
+     */
+    private void relinquishFailedLeadership(long failedVersionId) {
+        leader.set(false);
+        markLeadershipRelinquishing(failedVersionId);
+        if (updateLeadership(false, Optional.empty())) {
+            tryReleaseElectionRecord(failedVersionId);
+        }
+    }
+
+    /**
+     * Retries an exact-version release without promoting the locally unusable owner again.
+     *
+     * <p>A missing key or a different version proves that the pending claim is already gone. When
+     * the same version remains, follower reconciliation must succeed before its record is exposed
+     * to a peer; otherwise partially stopped leader work could overlap its successor.
+     */
+    private boolean retryPendingLeadershipRelinquish(GetResult existing) {
+        long pendingVersionId = relinquishingVersionId;
+        if (pendingVersionId < 0) {
+            return false;
+        }
+        if (existing == null || existing.version().versionId() != pendingVersionId) {
+            clearLeadershipClaim(pendingVersionId);
+            if (existing != null) {
+                updateLeadership(false, decodeLeader(existing));
+            }
+            return true;
+        }
+        leader.set(false);
+        if (updateLeadership(false, Optional.empty())) {
+            tryReleaseElectionRecord(pendingVersionId);
+        }
+        return true;
+    }
+
+    private synchronized void markLeadershipRelinquishing(long recordVersionId) {
+        if (recordVersionId >= 0 && versionId == recordVersionId) {
+            relinquishingVersionId = recordVersionId;
+        }
+    }
+
+    private synchronized void clearLeadershipClaim(long recordVersionId) {
+        if (relinquishingVersionId == recordVersionId) {
+            relinquishingVersionId = -1L;
+        }
+        if (versionId == recordVersionId) {
+            versionId = -1L;
+        }
+    }
+
+    private void recordRefreshFailure(Throwable failure) {
+        try {
+            log.warn("Failed to refresh compaction leadership", unwrap(failure));
+        } catch (Throwable observabilityFailure) {
+            addSuppressed(failure, observabilityFailure);
+        }
+    }
+
+    private boolean tryReleaseElectionRecord(long recordVersionId) {
+        try {
+            client.delete(electionRoot,
+                    Set.of(DeleteOption.IfVersionIdEquals(recordVersionId))).join();
+            clearLeadershipClaim(recordVersionId);
+            return true;
+        } catch (Throwable failure) {
+            Throwable cause = unwrap(failure);
+            if (cause instanceof UnexpectedVersionIdException) {
+                clearLeadershipClaim(recordVersionId);
+                return true;
+            }
+            try {
+                log.warn("Failed to release compaction leadership record version {}; "
+                                + "the exact claim remains pending for retry",
+                        recordVersionId, cause);
+            } catch (Throwable observabilityFailure) {
+                addSuppressed(failure, observabilityFailure);
+            }
+            return false;
+        }
+    }
+
+    private static void addSuppressed(Throwable primary, Throwable secondary) {
+        if (primary != secondary) {
+            primary.addSuppressed(secondary);
         }
     }
 
@@ -166,16 +312,41 @@ public class LeaderElectionService implements AutoCloseable {
         }
         try {
             if (refreshFuture != null) {
-                refreshFuture.cancel(true);
+                try {
+                    refreshFuture.cancel(true);
+                } catch (Throwable cancelFailure) {
+                    recordRefreshFailure(cancelFailure);
+                }
             }
-            if (leader.get() && versionId >= 0) {
-                client.delete(electionRoot, Set.of(DeleteOption.IfVersionIdEquals(versionId))).join();
-            }
-        } catch (RuntimeException e) {
-            log.debug("Leadership record was already released", unwrap(e));
         } finally {
-            updateLeadership(false, Optional.empty());
-            executor.shutdownNow();
+            boolean followerReady = false;
+            try {
+                // Stop this node's leader-only work before making the election record available
+                // to a successor. If the callback cannot prove that local work stopped, retain the
+                // claim until the scheduler shuts down the Oxia session instead of allowing an
+                // overlapping successor.
+                followerReady = updateLeadership(false, Optional.empty());
+            } finally {
+                try {
+                    // A failed listener startup deliberately reports this node as a follower, but
+                    // the ephemeral record acquired immediately before the callback still belongs
+                    // to this service. Delete it only after follower reconciliation has completed;
+                    // a stale version cannot delete a successor's record.
+                    long recordVersionId = relinquishingVersionId >= 0
+                            ? relinquishingVersionId : versionId;
+                    if (followerReady && recordVersionId >= 0) {
+                        markLeadershipRelinquishing(recordVersionId);
+                        tryReleaseElectionRecord(recordVersionId);
+                    } else if (!followerReady && recordVersionId >= 0) {
+                        log.warn("Retaining compaction leadership record version {} because "
+                                        + "leader-only work did not stop cleanly; closing the Oxia "
+                                        + "session will provide the final release",
+                                recordVersionId);
+                    }
+                } finally {
+                    executor.shutdownNow();
+                }
+            }
         }
     }
 

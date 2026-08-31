@@ -12,6 +12,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -24,6 +25,7 @@ import static org.mockito.Mockito.when;
 import io.lakestream.ursa.compaction.metrics.CompactionMetrics;
 import io.lakestream.ursa.compaction.task.CompactedOffset;
 import io.lakestream.ursa.compaction.task.PreparedCompactStreamTask;
+import io.lakestream.ursa.metrics.Counter;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.api.metrics.LongGauge;
@@ -37,6 +39,8 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -50,7 +54,7 @@ public class CompactionManagerTest {
     private static final long START_OFFSET = 0L;
     private static final long END_OFFSET = 100L;
     private static final long LAST_INCLUDED_OFFSET = END_OFFSET - 1;
-    private static final long TOTAL_SIZE = 4096L;
+    private static final long TOTAL_SIZE = 5000L;
     private static final long CUMULATIVE_SIZE = 5000L;
     private static final long PREVIOUS_CUMULATIVE_SIZE = CUMULATIVE_SIZE - TOTAL_SIZE;
 
@@ -61,6 +65,17 @@ public class CompactionManagerTest {
     @BeforeEach
     public void setup() {
         taskManager = mock(CompactTaskManager.class);
+        when(taskManager.releasePublicationLeaseAsync(any())).thenAnswer(invocation -> {
+            try {
+                return CompletableFuture.completedFuture(
+                        taskManager.releasePublicationLease(invocation.getArgument(0)));
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return CompletableFuture.failedFuture(interrupted);
+            } catch (Exception | Error failure) {
+                return CompletableFuture.failedFuture(failure);
+            }
+        });
         compactionManager = new CompactionManager(taskManager);
         executor = Executors.newCachedThreadPool();
     }
@@ -205,6 +220,87 @@ public class CompactionManagerTest {
                 () -> new CompactionManager.PublicationCursor(STREAM_ID, -2L, 0L));
         assertThrows(IllegalArgumentException.class,
                 () -> new CompactionManager.PublicationCursor(STREAM_ID, -1L, -1L));
+        assertThrows(IllegalArgumentException.class,
+                () -> new CompactionManager.PublicationCursor(STREAM_ID, -1L, 1L));
+        assertThrows(IllegalArgumentException.class,
+                () -> new CompactionManager.PublicationCursor(STREAM_ID, 0L, 0L));
+    }
+
+    @Test
+    public void testUnrepairableLegacyCursorReleasesLeaseBeforeQuarantine() throws Exception {
+        CompactTaskManager.PublicationLease lease = lease();
+        LegacyPublishedOffsetException repairFailure = new LegacyPublishedOffsetException(
+                TOPIC, STREAM_ID, 9L, "no durable prepared task exists");
+        when(taskManager.tryAcquirePublicationLease(TOPIC, STREAM_ID))
+                .thenReturn(Optional.of(lease));
+        when(taskManager.repairLegacyPublishedOffset(lease)).thenThrow(repairFailure);
+        when(taskManager.releasePublicationLease(lease)).thenReturn(true);
+
+        LegacyPublishedOffsetException error = assertThrows(
+                LegacyPublishedOffsetException.class,
+                () -> compactionManager.tryOpenPublicationSession(TOPIC, STREAM_ID));
+
+        assertEquals(repairFailure, error);
+        assertFalse(compactionManager.hasPendingPublicationLeaseReleases());
+        verify(taskManager).releasePublicationLease(lease);
+        verify(taskManager, never()).claimPublishedOffset(lease);
+    }
+
+    @Test
+    public void testTaskFactoryCannotObserveUnrepairedLegacyCursor() throws Exception {
+        CompactTaskManager.PublicationLease lease = lease();
+        when(taskManager.tryAcquirePublicationLease(TOPIC, STREAM_ID))
+                .thenReturn(Optional.of(lease));
+        when(taskManager.claimPublishedOffset(lease)).thenReturn(
+                new CompactTaskManager.PublishedOffsetClaim(
+                        new CompactedOffset(STREAM_ID, 9L, 0L), 11L));
+        when(taskManager.releasePublicationLease(lease)).thenReturn(true);
+
+        LegacyPublishedOffsetException error = assertThrows(
+                LegacyPublishedOffsetException.class,
+                () -> compactionManager.tryOpenPublicationSession(TOPIC, STREAM_ID));
+
+        assertTrue(error.getMessage().contains("unrepaired cursor"));
+        assertFalse(compactionManager.hasPendingPublicationLeaseReleases());
+        verify(taskManager).releasePublicationLease(lease);
+    }
+
+    @Test
+    public void testMalformedCursorRecoveryMetadataIsReleasedAndQuarantined() throws Exception {
+        CompactTaskManager.PublicationLease lease = lease();
+        IOException malformed = new IOException("malformed legacy cursor");
+        when(taskManager.tryAcquirePublicationLease(TOPIC, STREAM_ID))
+                .thenReturn(Optional.of(lease));
+        when(taskManager.repairLegacyPublishedOffset(lease)).thenThrow(malformed);
+        when(taskManager.releasePublicationLease(lease)).thenReturn(true);
+
+        PublicationRecoveryException error = assertThrows(
+                PublicationRecoveryException.class,
+                () -> compactionManager.tryOpenPublicationSession(TOPIC, STREAM_ID));
+
+        assertEquals(malformed, error.getCause());
+        assertFalse(compactionManager.hasPendingPublicationLeaseReleases());
+        verify(taskManager).releasePublicationLease(lease);
+        verify(taskManager, never()).claimPublishedOffset(lease);
+    }
+
+    @Test
+    public void testInvalidClaimedCursorCoordinatesAreReleasedAndQuarantined() throws Exception {
+        CompactTaskManager.PublicationLease lease = lease();
+        when(taskManager.tryAcquirePublicationLease(TOPIC, STREAM_ID))
+                .thenReturn(Optional.of(lease));
+        when(taskManager.claimPublishedOffset(lease)).thenReturn(
+                new CompactTaskManager.PublishedOffsetClaim(
+                        new CompactedOffset(STREAM_ID, -1L, 1L), 11L));
+        when(taskManager.releasePublicationLease(lease)).thenReturn(true);
+
+        PublicationRecoveryException error = assertThrows(
+                PublicationRecoveryException.class,
+                () -> compactionManager.tryOpenPublicationSession(TOPIC, STREAM_ID));
+
+        assertTrue(error.getMessage().contains("invalid durable coordinates"));
+        assertFalse(compactionManager.hasPendingPublicationLeaseReleases());
+        verify(taskManager).releasePublicationLease(lease);
     }
 
     @Test
@@ -357,8 +453,10 @@ public class CompactionManagerTest {
         CompactionManager.PublicationSession session =
                 compactionManager.tryOpenPublicationSession(TOPIC, STREAM_ID).orElseThrow();
 
-        assertThrows(IllegalStateException.class,
+        PublicationRecoveryException error = assertThrows(
+                PublicationRecoveryException.class,
                 () -> session.publishNext(ignored -> Optional.empty()));
+        assertTrue(error.getMessage().contains("already-committed cursor"));
         verify(taskManager, never()).publishPackagedTaskName(any());
         verify(taskManager, never()).deletePreparedTaskClaim(any(), any());
     }
@@ -379,10 +477,80 @@ public class CompactionManagerTest {
         CompactionManager.PublicationSession session =
                 compactionManager.tryOpenPublicationSession(TOPIC, STREAM_ID).orElseThrow();
 
-        assertThrows(IllegalArgumentException.class,
+        PublicationRecoveryException error = assertThrows(
+                PublicationRecoveryException.class,
                 () -> session.publishNext(ignored -> Optional.empty()));
+        assertTrue(error.getMessage().contains("already-committed cursor"));
         verify(taskManager, never()).publishPackagedTaskName(any());
         verify(taskManager, never()).deletePreparedTaskClaim(any(), any());
+    }
+
+    @Test
+    public void testPublicationSessionRejectsRecoveredTaskWithUnknownStatus() throws Exception {
+        CompactTaskManager.PublicationLease lease = lease();
+        PreparedCompactStreamTask task = newTask(99);
+        CompactTaskManager.PreparedTaskClaim prepared =
+                new CompactTaskManager.PreparedTaskClaim(task, 21L);
+        when(taskManager.tryAcquirePublicationLease(TOPIC, STREAM_ID)).thenReturn(Optional.of(lease));
+        when(taskManager.claimPublishedOffset(lease)).thenReturn(cursor(-1L, 11L));
+        when(taskManager.validatePublicationLease(lease)).thenReturn(true);
+        when(taskManager.getPreparedTaskClaim(TOPIC)).thenReturn(Optional.of(prepared));
+
+        CompactionManager.PublicationSession session =
+                compactionManager.tryOpenPublicationSession(TOPIC, STREAM_ID).orElseThrow();
+
+        PublicationRecoveryException error = assertThrows(
+                PublicationRecoveryException.class,
+                () -> session.publishNext(ignored -> Optional.empty()));
+        assertTrue(error.getMessage().contains("does not advance the persisted cursor consistently"));
+        verify(taskManager, never()).publishCompactTaskIfAbsent(any());
+        verify(taskManager, never()).compareAndSetPublishedOffset(any(), any(), any());
+        verify(taskManager, never()).publishPackagedTaskName(any());
+    }
+
+    @Test
+    public void testPublicationSessionRejectsRecoveredTaskWithInvalidName() throws Exception {
+        CompactTaskManager.PublicationLease lease = lease();
+        PreparedCompactStreamTask task = newTask(PreparedCompactStreamTask.INIT);
+        task.setTaskName("invalid/name");
+        CompactTaskManager.PreparedTaskClaim prepared =
+                new CompactTaskManager.PreparedTaskClaim(task, 21L);
+        when(taskManager.tryAcquirePublicationLease(TOPIC, STREAM_ID)).thenReturn(Optional.of(lease));
+        when(taskManager.claimPublishedOffset(lease)).thenReturn(cursor(-1L, 11L));
+        when(taskManager.validatePublicationLease(lease)).thenReturn(true);
+        when(taskManager.getPreparedTaskClaim(TOPIC)).thenReturn(Optional.of(prepared));
+
+        CompactionManager.PublicationSession session =
+                compactionManager.tryOpenPublicationSession(TOPIC, STREAM_ID).orElseThrow();
+
+        PublicationRecoveryException error = assertThrows(
+                PublicationRecoveryException.class,
+                () -> session.publishNext(ignored -> Optional.empty()));
+        assertTrue(error.getMessage().contains("does not advance the persisted cursor consistently"));
+        verify(taskManager, never()).publishCompactTaskIfAbsent(any());
+        verify(taskManager, never()).compareAndSetPublishedOffset(any(), any(), any());
+        verify(taskManager, never()).publishPackagedTaskName(any());
+    }
+
+    @Test
+    public void testPublicationSessionQuarantinesMalformedPreparedTaskMetadata() throws Exception {
+        CompactTaskManager.PublicationLease lease = lease();
+        when(taskManager.tryAcquirePublicationLease(TOPIC, STREAM_ID)).thenReturn(Optional.of(lease));
+        when(taskManager.claimPublishedOffset(lease)).thenReturn(cursor(-1L, 11L));
+        when(taskManager.validatePublicationLease(lease)).thenReturn(true);
+        when(taskManager.getPreparedTaskClaim(TOPIC))
+                .thenThrow(new IOException("corrupt prepared task"));
+        when(taskManager.releasePublicationLease(lease)).thenReturn(true);
+        CompactionManager.PublicationSession session =
+                compactionManager.tryOpenPublicationSession(TOPIC, STREAM_ID).orElseThrow();
+
+        PublicationRecoveryException error = assertThrows(
+                PublicationRecoveryException.class,
+                () -> session.publishNext(ignored -> Optional.empty()));
+
+        assertTrue(error.getMessage().contains("cannot be decoded safely"));
+        assertTrue(error.getCause() instanceof IOException);
+        session.close();
     }
 
     @Test
@@ -415,6 +583,8 @@ public class CompactionManagerTest {
 
         assertTimeoutPreemptively(Duration.ofSeconds(1), session::fence);
         assertTrue(session.isFenced());
+        assertFalse(session.tryClose());
+        verify(taskManager, never()).releasePublicationLease(lease);
         CompletableFuture<Void> closeFuture = CompletableFuture.runAsync(() -> {
             closeStarted.countDown();
             try {
@@ -437,6 +607,182 @@ public class CompactionManagerTest {
         verify(taskManager, never()).publishCompactTaskIfAbsent(any());
         verify(taskManager, never()).compareAndSetPublishedOffset(any(), any(), any());
         verify(taskManager, never()).publishPackagedTaskName(any());
+    }
+
+    @Test
+    public void testSupervisorReleasesLeaseWhilePublicationCallableIsStillBlocked() throws Exception {
+        CompactTaskManager.PublicationLease lease = lease();
+        when(taskManager.tryAcquirePublicationLease(TOPIC, STREAM_ID)).thenReturn(Optional.of(lease));
+        when(taskManager.claimPublishedOffset(lease)).thenReturn(cursor(-1L, 11L));
+        when(taskManager.validatePublicationLease(lease)).thenReturn(true);
+        when(taskManager.getPreparedTaskClaim(TOPIC)).thenReturn(Optional.empty());
+        when(taskManager.releasePublicationLease(lease)).thenReturn(true);
+        CompactionManager.PublicationSession session =
+                compactionManager.tryOpenPublicationSession(TOPIC, STREAM_ID).orElseThrow();
+        CountDownLatch factoryEntered = new CountDownLatch(1);
+        CountDownLatch allowFactoryReturn = new CountDownLatch(1);
+
+        CompletableFuture<CompactionManager.PublicationResult> publishFuture = new CompletableFuture<>();
+        executor.execute(() -> {
+            try {
+                publishFuture.complete(session.publishNext(ignored -> {
+                    factoryEntered.countDown();
+                    assertTrue(allowFactoryReturn.await(5, TimeUnit.SECONDS));
+                    return Optional.of(newTask(PreparedCompactStreamTask.INIT));
+                }));
+            } catch (Throwable error) {
+                publishFuture.completeExceptionally(error);
+            }
+        });
+        assertTrue(factoryEntered.await(5, TimeUnit.SECONDS));
+
+        CompletableFuture<Void> release = assertTimeoutPreemptively(
+                Duration.ofSeconds(1), session::fenceAndReleaseLeaseAsync);
+        release.get(5, TimeUnit.SECONDS);
+
+        assertTrue(session.isClosed());
+        assertTrue(session.isFenced());
+        assertFalse(publishFuture.isDone());
+        verify(taskManager).releasePublicationLease(lease);
+
+        allowFactoryReturn.countDown();
+        ExecutionException publishError = assertThrows(
+                ExecutionException.class, () -> publishFuture.get(5, TimeUnit.SECONDS));
+        assertTrue(publishError.getCause() instanceof PublicationFencedException);
+        verify(taskManager, never()).tryCreatePreparedTaskClaim(any(), any());
+        verify(taskManager, never()).publishCompactTaskIfAbsent(any());
+        verify(taskManager, never()).compareAndSetPublishedOffset(any(), any(), any());
+        verify(taskManager, never()).publishPackagedTaskName(any());
+    }
+
+    @Test
+    public void testPublicationSessionAsyncCloseDoesNotWaitForRemoteLeaseDelete() throws Exception {
+        CompactTaskManager.PublicationLease lease = lease();
+        CompletableFuture<Boolean> remoteRelease = new CompletableFuture<>();
+        when(taskManager.tryAcquirePublicationLease(TOPIC, STREAM_ID)).thenReturn(Optional.of(lease));
+        when(taskManager.claimPublishedOffset(lease)).thenReturn(cursor(-1L, 11L));
+        doReturn(remoteRelease).when(taskManager).releasePublicationLeaseAsync(lease);
+        CompactionManager.PublicationSession session =
+                compactionManager.tryOpenPublicationSession(TOPIC, STREAM_ID).orElseThrow();
+
+        Optional<CompletableFuture<Void>> closeAttempt = assertTimeoutPreemptively(
+                Duration.ofSeconds(1), session::tryCloseAsync);
+
+        assertTrue(closeAttempt.isPresent());
+        assertFalse(closeAttempt.orElseThrow().isDone());
+        assertTrue(session.isClosed());
+        assertTrue(session.isFenced());
+        assertTrue(compactionManager.hasPendingPublicationLeaseReleases());
+
+        remoteRelease.complete(true);
+        closeAttempt.orElseThrow().get(5, TimeUnit.SECONDS);
+        assertFalse(compactionManager.hasPendingPublicationLeaseReleases());
+        verify(taskManager, never()).releasePublicationLease(lease);
+    }
+
+    @Test
+    public void testStalledRemoteLeaseDeleteTimesOutAndCanBeRetried() throws Exception {
+        CompactTaskManager.PublicationLease lease = lease();
+        CompletableFuture<Boolean> stalledRelease = new CompletableFuture<>();
+        when(taskManager.tryAcquirePublicationLease(TOPIC, STREAM_ID)).thenReturn(Optional.of(lease));
+        when(taskManager.claimPublishedOffset(lease)).thenReturn(cursor(-1L, 11L));
+        doReturn(stalledRelease, CompletableFuture.completedFuture(true))
+                .when(taskManager).releasePublicationLeaseAsync(lease);
+        compactionManager = new CompactionManager(taskManager, CompactionMetrics.NOOP, 50L);
+        CompactionManager.PublicationSession session =
+                compactionManager.tryOpenPublicationSession(TOPIC, STREAM_ID).orElseThrow();
+
+        CompletableFuture<Void> firstRelease = session.tryCloseAsync().orElseThrow();
+        ExecutionException timeout = assertThrows(
+                ExecutionException.class, () -> firstRelease.get(5, TimeUnit.SECONDS));
+
+        assertTrue(timeout.getCause() instanceof TimeoutException);
+        assertTrue(stalledRelease.isCancelled());
+        assertTrue(compactionManager.hasPendingPublicationLeaseReleases());
+
+        compactionManager.retryPendingPublicationLeaseReleasesAsync();
+        assertTimeoutPreemptively(Duration.ofSeconds(1), () -> {
+            while (compactionManager.hasPendingPublicationLeaseReleases()) {
+                Thread.onSpinWait();
+            }
+        });
+        session.close();
+        verify(taskManager, times(2)).releasePublicationLeaseAsync(lease);
+    }
+
+    @Test
+    public void testSessionCloseDoesNotRestartReleaseSettledByConcurrentManagerRetry()
+            throws Exception {
+        CompactTaskManager.PublicationLease lease = lease();
+        IOException firstReleaseFailure = new IOException("temporary release failure");
+        CompletableFuture<Boolean> retryRelease = new CompletableFuture<>();
+        when(taskManager.tryAcquirePublicationLease(TOPIC, STREAM_ID)).thenReturn(Optional.of(lease));
+        when(taskManager.claimPublishedOffset(lease)).thenReturn(cursor(-1L, 11L));
+        doReturn(CompletableFuture.failedFuture(firstReleaseFailure), retryRelease)
+                .when(taskManager).releasePublicationLeaseAsync(lease);
+        CompactionManager.PublicationSession session =
+                compactionManager.tryOpenPublicationSession(TOPIC, STREAM_ID).orElseThrow();
+
+        assertEquals(firstReleaseFailure, assertThrows(IOException.class, session::close));
+        assertTrue(compactionManager.hasPendingPublicationLeaseReleases());
+        compactionManager.retryPendingPublicationLeaseReleasesAsync();
+        verify(taskManager, times(2)).releasePublicationLeaseAsync(lease);
+
+        CountDownLatch closeStarted = new CountDownLatch(1);
+        AtomicReference<Throwable> closeFailure = new AtomicReference<>();
+        Thread concurrentClose = new Thread(() -> {
+            closeStarted.countDown();
+            try {
+                session.close();
+            } catch (Throwable error) {
+                closeFailure.set(error);
+            }
+        }, "concurrent-publication-session-close");
+        concurrentClose.setDaemon(true);
+
+        // Hold the manager monitor so close() reaches the atomic retry decision but cannot make it
+        // until the already-running manager retry is settled. Before the pending check and in-flight
+        // lookup were made atomic, close() observed the pending entry here and issued a third delete
+        // after the retry removed it.
+        synchronized (compactionManager) {
+            concurrentClose.start();
+            assertTrue(closeStarted.await(5, TimeUnit.SECONDS));
+            try {
+                awaitThreadBlocked(concurrentClose);
+            } finally {
+                retryRelease.complete(true);
+            }
+        }
+
+        concurrentClose.join(TimeUnit.SECONDS.toMillis(5));
+        assertFalse(concurrentClose.isAlive());
+        assertEquals(null, closeFailure.get());
+        assertFalse(compactionManager.hasPendingPublicationLeaseReleases());
+        session.close();
+        verify(taskManager, times(2)).releasePublicationLeaseAsync(lease);
+    }
+
+    @Test
+    public void testAsyncLeaseReleaseErrorIsObservedAndRemainsRetryable() throws Exception {
+        CompactTaskManager.PublicationLease lease = lease();
+        AssertionError fatalRelease = new AssertionError("fatal release failure");
+        CompactionMetrics metrics = mock(CompactionMetrics.class);
+        Counter releaseFailures = mock(Counter.class);
+        when(metrics.getPublishTaskFailedCount()).thenReturn(releaseFailures);
+        when(taskManager.tryAcquirePublicationLease(TOPIC, STREAM_ID)).thenReturn(Optional.of(lease));
+        when(taskManager.claimPublishedOffset(lease)).thenReturn(cursor(-1L, 11L));
+        doReturn(CompletableFuture.failedFuture(fatalRelease))
+                .when(taskManager).releasePublicationLeaseAsync(lease);
+        compactionManager = new CompactionManager(taskManager, metrics);
+        CompactionManager.PublicationSession session =
+                compactionManager.tryOpenPublicationSession(TOPIC, STREAM_ID).orElseThrow();
+
+        CompletableFuture<Void> release = session.tryCloseAsync().orElseThrow();
+        ExecutionException failure = assertThrows(ExecutionException.class, release::get);
+
+        assertEquals(fatalRelease, failure.getCause());
+        assertTrue(compactionManager.hasPendingPublicationLeaseReleases());
+        verify(releaseFailures).increment();
     }
 
     @Test
@@ -590,6 +936,14 @@ public class CompactionManagerTest {
 
     private static CompactTaskManager.PublicationLease lease() {
         return new CompactTaskManager.PublicationLease(TOPIC, STREAM_ID, "owner", 7L);
+    }
+
+    private static void awaitThreadBlocked(Thread thread) throws InterruptedException {
+        long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (thread.getState() != Thread.State.BLOCKED && System.nanoTime() < deadlineNanos) {
+            Thread.sleep(1L);
+        }
+        assertEquals(Thread.State.BLOCKED, thread.getState());
     }
 
     private static CompactTaskManager.PublishedOffsetClaim cursor(long offset, long revision) {

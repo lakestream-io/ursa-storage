@@ -5,6 +5,7 @@
 package io.lakestream.ursa.compact;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -28,6 +29,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -71,6 +73,7 @@ public class CompactionWorkerTest {
     public void testBlacklistedTopicIsSkipped() throws Exception {
         Set<String> blackTopics = new HashSet<>();
         blackTopics.add("default/my-topic-partition-2");
+        blackTopics.add("bad://topic");
         CompactionWorker worker = createWorker(blackTopics);
 
         // The topic in the task uses persistence naming encoding with partition suffix
@@ -216,6 +219,33 @@ public class CompactionWorkerTest {
         // Only the allowed task should be compacted
         verify(compactionService).compactStream(allowedTask);
         verify(compactionService, never()).compactStream(blockedTask);
+    }
+
+    @Test
+    public void interruptWhileLoadingSubTaskStopsWorker() throws Exception {
+        CompactionWorker worker = createWorker(new HashSet<>());
+        PackagedCompactStreamTask packagedTask = new PackagedCompactStreamTask();
+        packagedTask.setTaskName("interrupt-load-task");
+        packagedTask.setSubTasks(List.of("pending-sub-task"));
+        CountDownLatch loadStarted = new CountDownLatch(1);
+        CompletableFuture<CompactStreamTask> pendingLoad = new CompletableFuture<>();
+        when(compactionTaskProvider.getTask()).thenReturn(packagedTask);
+        when(compactTaskManager.getCompactStreamTask("pending-sub-task")).thenAnswer(invocation -> {
+            loadStarted.countDown();
+            return pendingLoad;
+        });
+
+        Thread thread = new Thread(worker);
+        thread.start();
+        assertTrue(loadStarted.await(5, TimeUnit.SECONDS));
+
+        thread.interrupt();
+        thread.join(5_000L);
+
+        assertFalse(thread.isAlive());
+        assertTrue(thread.isInterrupted());
+        verify(compactionService, never()).compactStream(any());
+        verify(compactionTaskProvider, never()).quarantineTask(anyLong(), any());
     }
 
     @Test

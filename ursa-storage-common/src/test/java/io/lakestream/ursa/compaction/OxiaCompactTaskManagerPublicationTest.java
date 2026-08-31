@@ -22,6 +22,7 @@ import static org.mockito.Mockito.when;
 import io.lakestream.ursa.compaction.task.CompactOffsetSerde;
 import io.lakestream.ursa.compaction.task.CompactedOffset;
 import io.lakestream.ursa.compaction.task.PreparedCompactStreamTask;
+import io.lakestream.ursa.compaction.task.PreparedCompactStreamTaskSerde;
 import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.GetResult;
 import io.oxia.client.api.PutResult;
@@ -68,6 +69,21 @@ class OxiaCompactTaskManagerPublicationTest {
     }
 
     @Test
+    void cancellingAsyncReleaseCancelsTheUnderlyingOxiaDelete() {
+        AsyncOxiaClient client = mock(AsyncOxiaClient.class);
+        CompletableFuture<Boolean> oxiaDelete = new CompletableFuture<>();
+        when(client.delete(anyString(), anySet())).thenReturn(oxiaDelete);
+        OxiaCompactTaskManager manager = new OxiaCompactTaskManager(client);
+        CompactTaskManager.PublicationLease lease =
+                new CompactTaskManager.PublicationLease(TOPIC, STREAM_ID, "owner", 7L);
+
+        CompletableFuture<Boolean> release = manager.releasePublicationLeaseAsync(lease);
+        assertTrue(release.cancel(false));
+
+        assertTrue(oxiaDelete.isCancelled());
+    }
+
+    @Test
     void leaseHasOneWinnerAndStaleReleaseCannotDeleteSuccessor() throws Exception {
         AsyncOxiaClient client = mock(AsyncOxiaClient.class);
         when(client.put(anyString(), any(), anySet())).thenReturn(CompletableFuture.failedFuture(
@@ -94,7 +110,7 @@ class OxiaCompactTaskManagerPublicationTest {
         byte[] leaseValue = (STREAM_ID + "\n" + lease.ownerId()).getBytes(StandardCharsets.UTF_8);
         GetResult leaseResult = new GetResult("lease", leaseValue, version(lease.revision()));
         String cursorKey = "compact-offset-" + TOPIC;
-        CompactedOffset cursor = new CompactedOffset(STREAM_ID, 99L, 0L);
+        CompactedOffset cursor = new CompactedOffset(STREAM_ID, 99L, 100L);
         GetResult cursorResult = new GetResult(cursorKey,
                 CompactOffsetSerde.INSTANCE.serialize(cursor), version(11L));
         when(client.get(anyString(), anySet())).thenAnswer(invocation -> {
@@ -157,6 +173,222 @@ class OxiaCompactTaskManagerPublicationTest {
         assertEquals(
                 new CompactedOffset(STREAM_ID, 19L, 250L),
                 CompactOffsetSerde.INSTANCE.deserialize(serialized.getValue()));
+    }
+
+    @Test
+    void repairsLegacyCursorBeforePreparedTaskCasWithoutNarrowingCumulativeSize()
+            throws Exception {
+        long taskCumulativeSize = (long) Integer.MAX_VALUE + 1_000L;
+        long taskTotalSize = 250L;
+        CompactedOffset legacy = new CompactedOffset(STREAM_ID, 9L, 0L);
+        PreparedCompactStreamTask prepared = preparedTask(
+                10L, 20L, taskTotalSize, taskCumulativeSize);
+        AsyncOxiaClient client = repairClient(legacy, prepared);
+        CompactTaskManager.PublicationLease lease = lease();
+        OxiaCompactTaskManager manager = new OxiaCompactTaskManager(client);
+
+        assertTrue(manager.repairLegacyPublishedOffset(lease));
+
+        ArgumentCaptor<byte[]> serialized = ArgumentCaptor.forClass(byte[].class);
+        verify(client).put(eq("compact-offset-" + TOPIC), serialized.capture(), eq(Set.of(
+                PutOption.PartitionKey(TOPIC), PutOption.IfVersionIdEquals(11L))));
+        CompactedOffset repaired = CompactOffsetSerde.INSTANCE.deserialize(serialized.getValue());
+        assertEquals(taskCumulativeSize - taskTotalSize, repaired.getCumulativeSize());
+        assertTrue(repaired.getCumulativeSize() > Integer.MAX_VALUE);
+        assertEquals(legacy.getOffset(), repaired.getOffset());
+    }
+
+    @Test
+    void repairsLegacyCursorAfterPreparedTaskCas() throws Exception {
+        long taskCumulativeSize = (long) Integer.MAX_VALUE + 1_000L;
+        CompactedOffset legacy = new CompactedOffset(STREAM_ID, 19L, 0L);
+        PreparedCompactStreamTask prepared = preparedTask(
+                10L, 20L, 250L, taskCumulativeSize);
+        prepared.setStatus(PreparedCompactStreamTask.PUSHED_TASK);
+        AsyncOxiaClient client = repairClient(legacy, prepared);
+        OxiaCompactTaskManager manager = new OxiaCompactTaskManager(client);
+
+        assertTrue(manager.repairLegacyPublishedOffset(lease()));
+
+        ArgumentCaptor<byte[]> serialized = ArgumentCaptor.forClass(byte[].class);
+        verify(client).put(eq("compact-offset-" + TOPIC), serialized.capture(), eq(Set.of(
+                PutOption.PartitionKey(TOPIC), PutOption.IfVersionIdEquals(11L))));
+        CompactedOffset repaired = CompactOffsetSerde.INSTANCE.deserialize(serialized.getValue());
+        assertEquals(taskCumulativeSize, repaired.getCumulativeSize());
+        assertEquals(legacy.getOffset(), repaired.getOffset());
+    }
+
+    @Test
+    void rejectsLegacyCursorWhenNoPreparedTaskCanProveItsCumulativeSize() throws Exception {
+        CompactedOffset legacy = new CompactedOffset(STREAM_ID, 9L, 0L);
+        AsyncOxiaClient client = repairClient(legacy, null);
+        OxiaCompactTaskManager manager = new OxiaCompactTaskManager(client);
+
+        LegacyPublishedOffsetException error = assertThrows(
+                LegacyPublishedOffsetException.class,
+                () -> manager.repairLegacyPublishedOffset(lease()));
+
+        assertEquals(TOPIC, error.publicationName());
+        assertEquals(STREAM_ID, error.streamId());
+        assertEquals(9L, error.offset());
+        assertTrue(error.getMessage().contains("no durable prepared task exists"));
+        verify(client, never()).put(eq("compact-offset-" + TOPIC), any(), anySet());
+    }
+
+    @Test
+    void claimLoudlyRejectsUnrepairedLegacyCursor() throws Exception {
+        CompactedOffset legacy = new CompactedOffset(STREAM_ID, 9L, 0L);
+        AsyncOxiaClient client = repairClient(legacy, null);
+        OxiaCompactTaskManager manager = new OxiaCompactTaskManager(client);
+
+        LegacyPublishedOffsetException error = assertThrows(
+                LegacyPublishedOffsetException.class,
+                () -> manager.claimPublishedOffset(lease()));
+
+        assertTrue(error.getMessage().contains("no safe automatic repair was completed"));
+        verify(client, never()).put(eq("compact-offset-" + TOPIC), any(), anySet());
+    }
+
+    @Test
+    void claimRejectsNonzeroCumulativeSizeForEmptyCursor() throws Exception {
+        CompactedOffset invalid = new CompactedOffset(STREAM_ID, -1L, 1L);
+        AsyncOxiaClient client = repairClient(invalid, null);
+        OxiaCompactTaskManager manager = new OxiaCompactTaskManager(client);
+
+        PublicationRecoveryException error = assertThrows(
+                PublicationRecoveryException.class,
+                () -> manager.claimPublishedOffset(lease()));
+
+        assertTrue(error.getMessage().contains("Stored published-offset cursor"));
+        verify(client, never()).put(eq("compact-offset-" + TOPIC), any(), anySet());
+    }
+
+    @Test
+    void rootJsonNullCursorIsRecoveryFailureAcrossReadsRepairAndClaim() throws Exception {
+        byte[] rootJsonNull = "null".getBytes(StandardCharsets.UTF_8);
+        AsyncOxiaClient client = publicationMetadataClient(rootJsonNull, null);
+        OxiaCompactTaskManager manager = new OxiaCompactTaskManager(client);
+
+        assertThrows(PublicationRecoveryException.class,
+                () -> manager.getPublishedOffset(STREAM_ID));
+        assertThrows(PublicationRecoveryException.class,
+                () -> manager.getPublishedOffset(TOPIC));
+        assertThrows(PublicationRecoveryException.class,
+                () -> manager.repairLegacyPublishedOffset(lease()));
+        assertThrows(PublicationRecoveryException.class,
+                () -> manager.claimPublishedOffset(lease()));
+
+        verify(client, never()).put(eq("compact-offset-" + TOPIC), any(), anySet());
+    }
+
+    @Test
+    void runtimeCursorDecodeFailureIsRecoveryFailureAndCannotOverwriteCursor() throws Exception {
+        AsyncOxiaClient client = publicationMetadataClient(null, null);
+        OxiaCompactTaskManager manager = new OxiaCompactTaskManager(client);
+
+        PublicationRecoveryException error = assertThrows(
+                PublicationRecoveryException.class,
+                () -> manager.claimPublishedOffset(lease()));
+
+        assertTrue(error.getCause() instanceof NullPointerException);
+        verify(client, never()).put(eq("compact-offset-" + TOPIC), any(), anySet());
+    }
+
+    @Test
+    void claimStillResetsValidCursorFromDifferentStreamIncarnation() throws Exception {
+        CompactedOffset previous = new CompactedOffset(STREAM_ID + 1L, 99L, 1_000L);
+        AsyncOxiaClient client = publicationMetadataClient(
+                CompactOffsetSerde.INSTANCE.serialize(previous), null);
+        String cursorKey = "compact-offset-" + TOPIC;
+        when(client.put(eq(cursorKey), any(), anySet())).thenReturn(
+                CompletableFuture.completedFuture(new PutResult(cursorKey, version(12L))));
+        OxiaCompactTaskManager manager = new OxiaCompactTaskManager(client);
+
+        CompactTaskManager.PublishedOffsetClaim claim = manager.claimPublishedOffset(lease());
+
+        assertEquals(new CompactedOffset(STREAM_ID, -1L, 0L), claim.offset());
+        ArgumentCaptor<byte[]> serialized = ArgumentCaptor.forClass(byte[].class);
+        verify(client).put(eq(cursorKey), serialized.capture(), eq(Set.of(
+                PutOption.PartitionKey(TOPIC), PutOption.IfVersionIdEquals(11L))));
+        assertEquals(claim.offset(), CompactOffsetSerde.INSTANCE.deserialize(serialized.getValue()));
+    }
+
+    @Test
+    void rootJsonNullPreparedClaimAndRepairAreRecoveryFailures() throws Exception {
+        CompactedOffset legacy = new CompactedOffset(STREAM_ID, 9L, 0L);
+        byte[] serializedLegacy = CompactOffsetSerde.INSTANCE.serialize(legacy);
+        byte[] rootJsonNull = "null".getBytes(StandardCharsets.UTF_8);
+        AsyncOxiaClient client = publicationMetadataClient(serializedLegacy, rootJsonNull);
+        OxiaCompactTaskManager manager = new OxiaCompactTaskManager(client);
+
+        assertThrows(PublicationRecoveryException.class,
+                () -> manager.getPreparedTaskClaim(TOPIC));
+        assertThrows(PublicationRecoveryException.class,
+                () -> manager.repairLegacyPublishedOffset(lease()));
+
+        verify(client, never()).put(eq("compact-offset-" + TOPIC), any(), anySet());
+    }
+
+    @Test
+    void runtimePreparedDecodeFailureIsRecoveryFailure() throws Exception {
+        CompactedOffset legacy = new CompactedOffset(STREAM_ID, 9L, 0L);
+        AsyncOxiaClient client = publicationMetadataClient(
+                CompactOffsetSerde.INSTANCE.serialize(legacy), null);
+        OxiaCompactTaskManager manager = new OxiaCompactTaskManager(client);
+
+        PublicationRecoveryException claimError = assertThrows(
+                PublicationRecoveryException.class,
+                () -> manager.getPreparedTaskClaim(TOPIC));
+        PublicationRecoveryException repairError = assertThrows(
+                PublicationRecoveryException.class,
+                () -> manager.repairLegacyPublishedOffset(lease()));
+
+        assertTrue(claimError.getCause() instanceof NullPointerException);
+        assertTrue(repairError.getCause() instanceof NullPointerException);
+        verify(client, never()).put(eq("compact-offset-" + TOPIC), any(), anySet());
+    }
+
+    @Test
+    void normalOffsetUpdatesRejectPublishedCursorWithoutCumulativeSize() {
+        AsyncOxiaClient client = mock(AsyncOxiaClient.class);
+        OxiaCompactTaskManager manager = new OxiaCompactTaskManager(client);
+
+        assertThrows(IllegalArgumentException.class,
+                () -> manager.updatePublishedOffset(STREAM_ID, 9L, 0L));
+        assertThrows(IllegalArgumentException.class,
+                () -> manager.updatePublishedOffset(TOPIC, STREAM_ID, 9L, 0L));
+
+        verify(client, never()).put(anyString(), any(), anySet());
+    }
+
+    @Test
+    void cursorCasRejectsPublishedCursorWithoutCumulativeSize() {
+        AsyncOxiaClient client = mock(AsyncOxiaClient.class);
+        OxiaCompactTaskManager manager = new OxiaCompactTaskManager(client);
+        CompactTaskManager.PublishedOffsetClaim current =
+                new CompactTaskManager.PublishedOffsetClaim(
+                        new CompactedOffset(STREAM_ID, 9L, 100L), 11L);
+
+        assertThrows(IllegalArgumentException.class,
+                () -> manager.compareAndSetPublishedOffset(
+                        lease(), current, new CompactedOffset(STREAM_ID, 19L, 0L)));
+
+        verify(client, never()).put(anyString(), any(), anySet());
+    }
+
+    @Test
+    void cursorCasRejectsLegacyExpectedCursor() {
+        AsyncOxiaClient client = mock(AsyncOxiaClient.class);
+        OxiaCompactTaskManager manager = new OxiaCompactTaskManager(client);
+        CompactTaskManager.PublishedOffsetClaim legacy =
+                new CompactTaskManager.PublishedOffsetClaim(
+                        new CompactedOffset(STREAM_ID, 9L, 0L), 11L);
+
+        assertThrows(LegacyPublishedOffsetException.class,
+                () -> manager.compareAndSetPublishedOffset(
+                        lease(), legacy, new CompactedOffset(STREAM_ID, 19L, 250L)));
+
+        verify(client, never()).put(anyString(), any(), anySet());
     }
 
     @Test
@@ -261,5 +493,98 @@ class OxiaCompactTaskManagerPublicationTest {
 
     private static Version version(long versionId) {
         return new Version(versionId, 0L, 0L, 0L, Optional.empty(), Optional.empty());
+    }
+
+    private static CompactTaskManager.PublicationLease lease() {
+        return new CompactTaskManager.PublicationLease(TOPIC, STREAM_ID, "owner", 7L);
+    }
+
+    private static PreparedCompactStreamTask preparedTask(
+            long startOffset, long endOffset, long totalSize, long cumulativeSize) {
+        return PreparedCompactStreamTask.builder()
+                .streamId(STREAM_ID)
+                .startOffset(startOffset)
+                .endOffset(endOffset)
+                .totalSize(totalSize)
+                .cumulativeSize(cumulativeSize)
+                .status(PreparedCompactStreamTask.INIT)
+                .taskName("prepared-task")
+                .topic(TOPIC)
+                .properties(Map.of())
+                .build();
+    }
+
+    private static AsyncOxiaClient repairClient(
+            CompactedOffset cursor, PreparedCompactStreamTask preparedTask) throws Exception {
+        AsyncOxiaClient client = mock(AsyncOxiaClient.class);
+        CompactTaskManager.PublicationLease lease = lease();
+        byte[] leaseValue = (STREAM_ID + "\n" + lease.ownerId()).getBytes(StandardCharsets.UTF_8);
+        GetResult leaseResult = new GetResult(
+                "publication-lease", leaseValue, version(lease.revision()));
+        GetResult cursorResult = new GetResult(
+                "compact-offset-" + TOPIC,
+                CompactOffsetSerde.INSTANCE.serialize(cursor),
+                version(11L));
+        GetResult preparedResult = preparedTask == null
+                ? null
+                : new GetResult(
+                        "prepared-task-" + TOPIC,
+                        PreparedCompactStreamTaskSerde.INSTANCE.serialize(preparedTask),
+                        version(21L));
+        when(client.get(anyString(), anySet())).thenAnswer(invocation -> {
+            String key = invocation.getArgument(0);
+            if (key.startsWith("publication-lease-")) {
+                return CompletableFuture.completedFuture(leaseResult);
+            }
+            if (key.startsWith("compact-offset-")) {
+                return CompletableFuture.completedFuture(cursorResult);
+            }
+            if (key.startsWith("prepared-task-")) {
+                return CompletableFuture.completedFuture(preparedResult);
+            }
+            throw new AssertionError("Unexpected key: " + key);
+        });
+        when(client.put(eq("compact-offset-" + TOPIC), any(), anySet()))
+                .thenReturn(CompletableFuture.completedFuture(
+                        new PutResult("compact-offset-" + TOPIC, version(12L))));
+        return client;
+    }
+
+    private static AsyncOxiaClient publicationMetadataClient(
+            byte[] cursorContent, byte[] preparedContent) {
+        AsyncOxiaClient client = mock(AsyncOxiaClient.class);
+        CompactTaskManager.PublicationLease lease = lease();
+        byte[] leaseValue = (STREAM_ID + "\n" + lease.ownerId()).getBytes(StandardCharsets.UTF_8);
+        GetResult leaseResult = new GetResult(
+                "publication-lease", leaseValue, version(lease.revision()));
+        GetResult cursorResult = metadataResult(
+                "compact-offset-" + TOPIC, cursorContent, 11L);
+        GetResult preparedResult = metadataResult(
+                "prepared-task-" + TOPIC, preparedContent, 21L);
+        when(client.get(anyString(), anySet())).thenAnswer(invocation -> {
+            String key = invocation.getArgument(0);
+            if (key.startsWith("publication-lease-")) {
+                return CompletableFuture.completedFuture(leaseResult);
+            }
+            if (key.startsWith("compact-offset-")) {
+                return CompletableFuture.completedFuture(cursorResult);
+            }
+            if (key.startsWith("prepared-task-")) {
+                return CompletableFuture.completedFuture(preparedResult);
+            }
+            throw new AssertionError("Unexpected key: " + key);
+        });
+        return client;
+    }
+
+    private static GetResult metadataResult(String key, byte[] content, long versionId) {
+        if (content != null) {
+            return new GetResult(key, content, version(versionId));
+        }
+        GetResult result = mock(GetResult.class);
+        when(result.key()).thenReturn(key);
+        when(result.value()).thenReturn(null);
+        when(result.version()).thenReturn(version(versionId));
+        return result;
     }
 }

@@ -22,6 +22,7 @@ import io.lakestream.ursa.materialization.serde.EntryFormat;
 import io.lakestream.ursa.materialization.serde.SchemaEvolutionManager;
 import io.lakestream.ursa.materialization.serde.SchemaService;
 import io.lakestream.ursa.metrics.InstrumentProvider;
+import io.lakestream.ursa.storage.FileStorage;
 import io.lakestream.ursa.storage.OxiaClientFactory;
 import io.lakestream.ursa.storage.StorageApi;
 import io.lakestream.ursa.storage.UrsaStorage;
@@ -40,6 +41,7 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
@@ -50,6 +52,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 import javax.annotation.Nullable;
@@ -106,7 +109,8 @@ public class CompactionScheduler {
     private final LockManager lockManager;
     private StorageApi storageApi;
     private final ExecutorService scanTopicExecutor;
-    private final ScheduledExecutorService publishTaskExecutor;
+    private final ScheduledExecutorService publicationControlExecutor;
+    private final ExecutorService publishTaskExecutor;
     private final ExecutorService compactedTaskExecutor;
     private final ExecutorService commitParquetFileExecutor;
     private LeaderElectionService leaderElectionService = null;
@@ -158,9 +162,17 @@ public class CompactionScheduler {
         }
         this.scanTopicExecutor = Executors
                 .newSingleThreadExecutor(new DefaultThreadFactory("scan-topic"));
-        this.publishTaskExecutor = Executors.newScheduledThreadPool(
-                Math.max(1, config.getPublishThreadNum()),
-                new DefaultThreadFactory("publish-task"));
+        ScheduledThreadPoolExecutor controlExecutor = new ScheduledThreadPoolExecutor(
+                1, new DefaultThreadFactory("publication-control"));
+        controlExecutor.setRemoveOnCancelPolicy(true);
+        this.publicationControlExecutor = controlExecutor;
+        // Runner-side admission keeps normal concurrency at publishThreadNum. Cached replacement
+        // threads are created only after a started, non-interruptible attempt exceeds its deadline.
+        // They are daemon threads because bounded shutdown cannot make an uncooperative callable
+        // return; fencing prevents any late result from being installed while daemon status lets
+        // process shutdown continue after the remaining dependencies are closed.
+        this.publishTaskExecutor = Executors.newCachedThreadPool(
+                new DefaultThreadFactory("publish-task", true));
         this.compactedTaskExecutor = Executors
                 .newSingleThreadExecutor(new DefaultThreadFactory("compacted-task"));
         this.commitParquetFileExecutor = Executors.newFixedThreadPool(
@@ -259,7 +271,9 @@ public class CompactionScheduler {
         try {
             Class<?> clazz = Class.forName(className);
             Class<?> depsClass = Class.forName(className + "$Dependencies");
-            Constructor<?> depsCtor = depsClass.getConstructors()[0];
+            Class<?> schemaRegistryClass = Class.forName(INTEGRATION_PKG + ".schema.SchemaRegistry");
+            Constructor<?> depsCtor = resolveStorageBindingsDependenciesConstructor(
+                    depsClass, schemaRegistryClass);
             Object depsInstance = depsCtor.newInstance(
                     storageConfig,
                     streamCatalog,
@@ -270,6 +284,7 @@ public class CompactionScheduler {
                     commitTaskProvider,
                     null,
                     scanTopicExecutor,
+                    publicationControlExecutor,
                     publishTaskExecutor,
                     compactedTaskExecutor,
                     commitParquetFileExecutor);
@@ -279,6 +294,24 @@ public class CompactionScheduler {
             throw new IllegalStateException(
                     "Failed to load CompactionStorageBindings class: " + className, e);
         }
+    }
+
+    static Constructor<?> resolveStorageBindingsDependenciesConstructor(
+            Class<?> dependenciesClass, Class<?> schemaRegistryClass) throws NoSuchMethodException {
+        return dependenciesClass.getConstructor(
+                StorageConfig.class,
+                StreamCatalog.class,
+                StorageApi.class,
+                FileStorage.class,
+                CompactTaskManager.class,
+                CompactionMetrics.class,
+                CommitTaskProvider.class,
+                schemaRegistryClass,
+                ExecutorService.class,
+                ScheduledExecutorService.class,
+                ExecutorService.class,
+                ExecutorService.class,
+                ExecutorService.class);
     }
 
     /**
@@ -423,9 +456,7 @@ public class CompactionScheduler {
                         leading -> {
                             if (leading) {
                                 log.info("This compactor {} was elected leader", hostname);
-                                startPublishCompactTaskRunner();
-                                startCommitParquetFileRunner();
-                                startAsyncCompactedDataCleaner();
+                                startLeaderRunners();
                             } else {
                                 if (leaderElectionService != null) {
                                     final Optional<CompactLeader> currentLeader =
@@ -439,12 +470,69 @@ public class CompactionScheduler {
                                     }
 
                                 }
-                                stopPublishCompactTaskRunner();
-                                stopCommitParquetFileRunner();
-                                stopAsyncCompactedDataCleaner();
+                                stopLeaderRunners();
                             }
                         }, instrumentProvider);
         leaderElectionService.start();
+    }
+
+    void startLeaderRunners() {
+        try {
+            startPublishCompactTaskRunner();
+            startCommitParquetFileRunner();
+            startAsyncCompactedDataCleaner();
+        } catch (RuntimeException | Error startupFailure) {
+            stopAfterLeaderStartupFailure(this::stopAsyncCompactedDataCleaner, startupFailure);
+            stopAfterLeaderStartupFailure(this::stopCommitParquetFileRunner, startupFailure);
+            stopAfterLeaderStartupFailure(this::stopPublishCompactTaskRunner, startupFailure);
+            try {
+                log.error("Failed to start compaction leader runners; rolled back partial startup",
+                        startupFailure);
+            } catch (RuntimeException | Error observabilityFailure) {
+                addSuppressed(startupFailure, observabilityFailure);
+            }
+            throw startupFailure;
+        }
+    }
+
+    void stopLeaderRunners() {
+        List<Throwable> stopFailures = new ArrayList<>(3);
+        stopLeaderRunner(this::stopAsyncCompactedDataCleaner, stopFailures);
+        stopLeaderRunner(this::stopCommitParquetFileRunner, stopFailures);
+        stopLeaderRunner(this::stopPublishCompactTaskRunner, stopFailures);
+        if (stopFailures.isEmpty()) {
+            return;
+        }
+        Throwable stopFailure = stopFailures.get(0);
+        stopFailures.stream().skip(1).forEach(failure -> addSuppressed(stopFailure, failure));
+        if (stopFailure instanceof Error error) {
+            throw error;
+        }
+        if (stopFailure instanceof RuntimeException runtimeException) {
+            throw runtimeException;
+        }
+    }
+
+    private static void stopLeaderRunner(Runnable stopAction, List<Throwable> stopFailures) {
+        try {
+            stopAction.run();
+        } catch (RuntimeException | Error stopFailure) {
+            stopFailures.add(stopFailure);
+        }
+    }
+
+    private static void stopAfterLeaderStartupFailure(Runnable stopAction, Throwable startupFailure) {
+        try {
+            stopAction.run();
+        } catch (RuntimeException | Error stopFailure) {
+            addSuppressed(startupFailure, stopFailure);
+        }
+    }
+
+    private static void addSuppressed(Throwable primary, Throwable secondary) {
+        if (primary != secondary) {
+            primary.addSuppressed(secondary);
+        }
     }
 
     private void startPublishCompactTaskRunner() {
@@ -458,27 +546,35 @@ public class CompactionScheduler {
     }
 
     private void startAsyncCompactedDataCleaner() {
+        stopAsyncCompactedDataCleaner();
         asyncCompactedDataCleaner = storageBindings.createAsyncCompactedDataCleaner();
     }
 
     private void stopAsyncCompactedDataCleaner() {
-        if (asyncCompactedDataCleaner != null) {
-            asyncCompactedDataCleaner.stop();
+        StartStopRunner runner = asyncCompactedDataCleaner;
+        if (runner != null) {
+            runner.stop();
+            if (asyncCompactedDataCleaner == runner) {
+                asyncCompactedDataCleaner = null;
+            }
         }
     }
 
     private void stopPublishCompactTaskRunner() {
-        if (streamCompactTaskRunner != null) {
-            streamCompactTaskRunner.stop();
+        StartStopRunner runner = streamCompactTaskRunner;
+        if (runner != null) {
+            runner.stop();
+            if (streamCompactTaskRunner == runner) {
+                streamCompactTaskRunner = null;
+            }
         }
-
     }
 
     private void startCommitParquetFileRunner() {
         stopCommitParquetFileRunner();
-        // Gate commits on still being the leader. On demotion the runner stops committing promptly instead of
-        // draining in-flight work for up to commitTimeoutInSeconds while the newly elected leader commits the same
-        // tasks (which would double-commit, e.g. duplicate Iceberg data files).
+        // Gate new commits on leadership. A commit that already entered an external catalog cannot
+        // be safely cancelled; the runner therefore drains it before releasing the leader claim and
+        // fail-stops this process if the configured deadline expires.
         commitParquetFileRunner = getCommitRunner(
             () -> leaderElectionService != null && leaderElectionService.isLeader());
         commitParquetFileRunner.start();
@@ -493,17 +589,51 @@ public class CompactionScheduler {
     // Leadership-gated commit runner, built via the storage bindings so this module stays free of
     // direct integration-package imports (T10). The bindings thread isLeader into CompactedTaskRunner.
     public StartStopRunner getCommitRunner(BooleanSupplier isLeader) {
-        return storageBindings.createCompactedTaskRunner(isLeader);
+        return storageBindings.createCompactedTaskRunner(isLeader, this::failStopCompactionProcess);
+    }
+
+    private void failStopCompactionProcess(Throwable failure) {
+        try {
+            log.error("Terminating the compaction process because leader-only work could not be fenced", failure);
+        } finally {
+            // An external lakehouse commit is not interruptible and cannot be fenced by closing the
+            // Oxia client alone. Halt the process so the old callable cannot overlap a successor;
+            // the OS closes the Oxia session and its ephemeral leader record as part of termination.
+            Runtime.getRuntime().halt(ExitCode.SERVER_EXCEPTION);
+        }
     }
 
     private void stopCommitParquetFileRunner() {
-        if (commitParquetFileRunner != null) {
-            commitParquetFileRunner.stop();
+        Throwable stopFailure = null;
+        StartStopRunner runner = commitParquetFileRunner;
+        if (runner != null) {
+            try {
+                runner.stop();
+                if (commitParquetFileRunner == runner) {
+                    commitParquetFileRunner = null;
+                }
+            } catch (RuntimeException | Error runnerFailure) {
+                stopFailure = runnerFailure;
+            }
         }
 
         if (updateCommitTasksFuture != null) {
-            updateCommitTasksFuture.cancel(true);
-            updateCommitTasksFuture = null;
+            try {
+                updateCommitTasksFuture.cancel(true);
+                updateCommitTasksFuture = null;
+            } catch (RuntimeException | Error cancellationFailure) {
+                if (stopFailure == null) {
+                    stopFailure = cancellationFailure;
+                } else {
+                    addSuppressed(stopFailure, cancellationFailure);
+                }
+            }
+        }
+        if (stopFailure instanceof Error error) {
+            throw error;
+        }
+        if (stopFailure instanceof RuntimeException runtimeException) {
+            throw runtimeException;
         }
     }
 
@@ -526,17 +656,44 @@ public class CompactionScheduler {
     }
 
     public void close() throws InterruptedException {
-        if (updateCommitTasksFuture != null) {
-            updateCommitTasksFuture.cancel(true);
+        // Fence leadership before stopping or closing any dependency that a leadership callback
+        // can start. LeaderElectionService.close waits for an in-flight listener transition and
+        // rejects late promotions after its closed flag is set.
+        if (leaderElectionService != null) {
+            try {
+                leaderElectionService.close();
+            } catch (RuntimeException | Error error) {
+                try {
+                    log.warn("Failed to close leader election", error);
+                } catch (RuntimeException | Error observabilityFailure) {
+                    addSuppressed(error, observabilityFailure);
+                }
+            } finally {
+                leaderElectionService = null;
+            }
+        }
+
+        try {
+            stopLeaderRunners();
+        } catch (RuntimeException | Error stopFailure) {
+            try {
+                log.warn("Failed to stop one or more compaction leader runners", stopFailure);
+            } catch (RuntimeException | Error observabilityFailure) {
+                addSuppressed(stopFailure, observabilityFailure);
+            }
         }
 
         if (maintenanceFuture != null) {
-            maintenanceFuture.cancel(true);
+            try {
+                maintenanceFuture.cancel(true);
+            } catch (RuntimeException | Error cancellationFailure) {
+                try {
+                    log.warn("Failed to cancel compaction maintenance", cancellationFailure);
+                } catch (RuntimeException | Error observabilityFailure) {
+                    addSuppressed(cancellationFailure, observabilityFailure);
+                }
+            }
         }
-
-        stopPublishCompactTaskRunner();
-        stopCommitParquetFileRunner();
-        stopAsyncCompactedDataCleaner();
 
         InterruptedException shutdownInterrupted = null;
         ExecutorService[] executors = {
@@ -545,7 +702,8 @@ public class CompactionScheduler {
             publishTaskExecutor,
             compactedTaskExecutor,
             commitParquetFileExecutor,
-            scheduledExecutor
+            scheduledExecutor,
+            publicationControlExecutor
         };
         for (ExecutorService service : executors) {
             if (service == null) {
@@ -594,14 +752,6 @@ public class CompactionScheduler {
                 streamCatalog.close();
             } catch (Exception e) {
                 log.warn("Failed to close stream catalog", e);
-            }
-        }
-
-        if (leaderElectionService != null) {
-            try {
-                leaderElectionService.close();
-            } catch (Exception e) {
-                log.warn("Failed to close leader election", e);
             }
         }
 

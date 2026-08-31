@@ -53,4 +53,15 @@ class UpdatePublishTaskOffsetTest {
 
         assertEquals(1, exitCode);
     }
+
+    @Test
+    void rejectsZeroCumulativeSizeForPublishedCursor() {
+        int exitCode = new CommandLine(new UpdatePublishTaskOffset()).execute(
+                "--stream", "default/test-partition-0",
+                "--stream-id", "1",
+                "--offset", "10",
+                "--cumulative-size", "0");
+
+        assertEquals(1, exitCode);
+    }
 }

@@ -94,13 +94,21 @@ public interface CompactTaskManager {
     CompactedOffset getPublishedOffset(String name)
         throws ExecutionException, InterruptedException, IOException;
 
-    /** Records the last logical offset included in a published task for a stream. */
+    /**
+     * Records the last logical offset included in a published task for a stream.
+     *
+     * @throws IllegalArgumentException when a non-negative offset has no positive cumulative byte
+     *         size, or when the empty-cursor coordinates are inconsistent
+     */
     void updatePublishedOffset(long streamId, long offset, long cumulativeSize)
             throws IOException, ExecutionException, InterruptedException;
 
     /**
      * Records the last logical offset and cumulative byte size included in a published task under a
      * named key.
+     *
+     * @throws IllegalArgumentException when a non-negative offset has no positive cumulative byte
+     *         size, or when the empty-cursor coordinates are inconsistent
      */
     void updatePublishedOffset(String name, long streamId, long offset, long cumulativeSize)
             throws IOException, ExecutionException, InterruptedException;
@@ -123,16 +131,55 @@ public interface CompactTaskManager {
             throws ExecutionException, InterruptedException;
 
     /**
+     * Asynchronously releases the exact lease without affecting a successor lease.
+     *
+     * <p>This method must return immediately without performing blocking remote I/O. Remote
+     * implementations must return the future from their native asynchronous API so a stalled
+     * metadata-store request cannot block cleanup of unrelated publication leases.
+     */
+    CompletableFuture<Boolean> releasePublicationLeaseAsync(PublicationLease lease);
+
+    /**
+     * Repairs a pre-upgrade named cursor whose non-negative offset was persisted without a
+     * cumulative byte size.
+     *
+     * <p>This is an internal recovery path. Implementations must derive the missing value from a
+     * durable prepared task, condition the repair on the exact cursor revision, and reject rather
+     * than guess when the value cannot be proven. Normal cursor claims and updates must not accept
+     * this legacy shape.
+     *
+     * @return {@code true} when a legacy cursor was repaired, or {@code false} when no repair was
+     *         needed
+     * @throws LegacyPublishedOffsetException when a legacy cursor exists but cannot be repaired
+     *         safely
+     */
+    default boolean repairLegacyPublishedOffset(PublicationLease lease)
+            throws IOException, ExecutionException, InterruptedException {
+        return false;
+    }
+
+    /**
      * Claims the named published-offset cursor for this publisher session.
      *
      * <p>Claiming the same stream preserves its offset while changing the cursor revision. Claiming
      * a different stream starts that stream incarnation at offset {@code -1}. The returned revision
-     * fences cursor writes from previous publisher sessions.
+     * fences cursor writes from previous publisher sessions. A non-negative cursor must already
+     * contain a positive cumulative byte size; callers must invoke
+     * {@link #repairLegacyPublishedOffset(PublicationLease)} before claiming.
+     *
+     * @throws LegacyPublishedOffsetException when the current stream still has a pre-upgrade
+     *         cursor without a cumulative byte size
      */
     PublishedOffsetClaim claimPublishedOffset(PublicationLease lease)
             throws IOException, ExecutionException, InterruptedException;
 
-    /** Advances a named cursor only if {@code expected} is still its exact storage revision. */
+    /**
+     * Advances a named cursor only if {@code expected} is still its exact storage revision.
+     *
+     * @throws LegacyPublishedOffsetException when {@code expected} is a pre-upgrade cursor without
+     *         a cumulative byte size
+     * @throws IllegalArgumentException when {@code updated} has invalid offset/size coordinates
+     */
     PublishedOffsetClaim compareAndSetPublishedOffset(
             PublicationLease lease,
             PublishedOffsetClaim expected,

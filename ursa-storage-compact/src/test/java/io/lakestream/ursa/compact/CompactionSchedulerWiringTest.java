@@ -10,6 +10,8 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -18,6 +20,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import io.lakestream.api.StreamIdentifier;
+import io.lakestream.ursa.compact.elect.LeaderElectionService;
 import io.lakestream.ursa.materialization.MaterializationRuntime;
 import io.lakestream.ursa.materialization.MaterializationService;
 import io.lakestream.ursa.materialization.MaterializationServiceConfig;
@@ -26,11 +29,13 @@ import io.lakestream.ursa.materialization.MaterializationTask;
 import io.lakestream.ursa.storage.impl.StorageConfig;
 import io.lakestream.ursa.storage.impl.compaction.CompactionStorageBindings;
 import io.lakestream.ursa.storage.impl.compaction.StartStopRunner;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.mockito.Answers;
@@ -172,6 +177,104 @@ public class CompactionSchedulerWiringTest {
 
         verify(storageBindings).createPublishCompactTaskRunner();
         verify(runner).start();
+    }
+
+    @Test
+    public void storageBindingsDependenciesConstructorUsesStableExecutorSignature() throws Exception {
+        Class<?> dependenciesClass = Class.forName(
+                "io.lakestream.ursa.lakehouse.compact.LakehouseCompactionStorageBindings$Dependencies");
+        Class<?> schemaRegistryClass = Class.forName(
+                "io.lakestream.ursa.lakehouse.schema.SchemaRegistry");
+
+        Constructor<?> constructor = CompactionScheduler.resolveStorageBindingsDependenciesConstructor(
+                dependenciesClass, schemaRegistryClass);
+
+        assertEquals(13, constructor.getParameterCount());
+        assertSame(ExecutorService.class, constructor.getParameterTypes()[8]);
+        assertSame(ScheduledExecutorService.class, constructor.getParameterTypes()[9]);
+        assertSame(ExecutorService.class, constructor.getParameterTypes()[10]);
+    }
+
+    @Test
+    public void leaderRunnerStartupFailureRollsBackAlreadyStartedPublisher() throws Exception {
+        CompactionScheduler scheduler = mock(CompactionScheduler.class, Answers.CALLS_REAL_METHODS);
+        StorageConfig config = StorageConfig.builder().build();
+        CompactionStorageBindings storageBindings = mock(CompactionStorageBindings.class);
+        StartStopRunner publisher = mock(StartStopRunner.class);
+        StartStopRunner committer = mock(StartStopRunner.class);
+        when(storageBindings.createPublishCompactTaskRunner()).thenReturn(publisher);
+        when(storageBindings.createCompactedTaskRunner(any(), any())).thenReturn(committer);
+        AssertionError startupFailure = new AssertionError("commit runner failed to start");
+        doThrow(startupFailure).when(committer).start();
+        setField(scheduler, "config", config);
+        setField(scheduler, "storageBindings", storageBindings);
+
+        assertSame(startupFailure, assertThrows(AssertionError.class, scheduler::startLeaderRunners));
+
+        InOrder rollback = inOrder(publisher, committer);
+        rollback.verify(publisher).start();
+        rollback.verify(committer).start();
+        rollback.verify(committer).stop();
+        rollback.verify(publisher).stop();
+        verify(storageBindings, never()).createAsyncCompactedDataCleaner();
+    }
+
+    @Test
+    public void leaderRunnerStopFailureStillStopsEveryRunnerAndCanReacquire() throws Exception {
+        CompactionScheduler scheduler = mock(CompactionScheduler.class, Answers.CALLS_REAL_METHODS);
+        StorageConfig config = StorageConfig.builder().build();
+        CompactionStorageBindings storageBindings = mock(CompactionStorageBindings.class);
+        StartStopRunner oldPublisher = mock(StartStopRunner.class);
+        StartStopRunner oldCommitter = mock(StartStopRunner.class);
+        StartStopRunner oldCleaner = mock(StartStopRunner.class);
+        StartStopRunner newPublisher = mock(StartStopRunner.class);
+        StartStopRunner newCommitter = mock(StartStopRunner.class);
+        StartStopRunner newCleaner = mock(StartStopRunner.class);
+        AssertionError stopFailure = new AssertionError("cleaner failed to stop");
+        doThrow(stopFailure).doNothing().when(oldCleaner).stop();
+        when(storageBindings.createPublishCompactTaskRunner()).thenReturn(newPublisher);
+        when(storageBindings.createCompactedTaskRunner(any(), any())).thenReturn(newCommitter);
+        when(storageBindings.createAsyncCompactedDataCleaner()).thenReturn(newCleaner);
+        setField(scheduler, "config", config);
+        setField(scheduler, "storageBindings", storageBindings);
+        setField(scheduler, "streamCompactTaskRunner", oldPublisher);
+        setField(scheduler, "commitParquetFileRunner", oldCommitter);
+        setField(scheduler, "asyncCompactedDataCleaner", oldCleaner);
+
+        assertSame(stopFailure, assertThrows(AssertionError.class, scheduler::stopLeaderRunners));
+
+        InOrder demotion = inOrder(oldCleaner, oldCommitter, oldPublisher);
+        demotion.verify(oldCleaner).stop();
+        demotion.verify(oldCommitter).stop();
+        demotion.verify(oldPublisher).stop();
+
+        scheduler.startLeaderRunners();
+
+        verify(oldCleaner, times(2)).stop();
+        verify(newPublisher).start();
+        verify(newCommitter).start();
+        verify(storageBindings).createAsyncCompactedDataCleaner();
+    }
+
+    @Test
+    public void closeFencesLeaderElectionBeforeStoppingRunners() throws Exception {
+        CompactionScheduler scheduler = mock(CompactionScheduler.class, Answers.CALLS_REAL_METHODS);
+        LeaderElectionService election = mock(LeaderElectionService.class);
+        StartStopRunner publisher = mock(StartStopRunner.class);
+        StartStopRunner committer = mock(StartStopRunner.class);
+        StartStopRunner cleaner = mock(StartStopRunner.class);
+        setField(scheduler, "leaderElectionService", election);
+        setField(scheduler, "streamCompactTaskRunner", publisher);
+        setField(scheduler, "commitParquetFileRunner", committer);
+        setField(scheduler, "asyncCompactedDataCleaner", cleaner);
+
+        scheduler.close();
+
+        InOrder shutdown = inOrder(election, cleaner, committer, publisher);
+        shutdown.verify(election).close();
+        shutdown.verify(cleaner).stop();
+        shutdown.verify(committer).stop();
+        shutdown.verify(publisher).stop();
     }
 
     @Test

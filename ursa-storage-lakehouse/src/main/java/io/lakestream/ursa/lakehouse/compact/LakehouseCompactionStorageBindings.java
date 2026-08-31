@@ -24,6 +24,7 @@ import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 import javax.annotation.Nullable;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
@@ -47,6 +48,7 @@ public final class LakehouseCompactionStorageBindings implements CompactionStora
 
     private final Dependencies deps;
     private final CompactionManager compactionManager;
+    private final PublishCompactTaskRunner.PublicationCoordinator publicationCoordinator;
     @Getter
     private final SchemaRegistry schemaRegistry;
     private volatile KafkaSchemaService schemaService;
@@ -55,6 +57,8 @@ public final class LakehouseCompactionStorageBindings implements CompactionStora
         this.deps = Objects.requireNonNull(deps, "deps");
         this.compactionManager = new CompactionManager(
                 deps.compactTaskManager, deps.compactionMetrics);
+        this.publicationCoordinator = new PublishCompactTaskRunner.PublicationCoordinator(
+                deps.config.getPublishThreadNum());
         this.schemaRegistry = deps.schemaRegistry != null
                 ? deps.schemaRegistry
                 : new KafkaSchemaRegistry(deps.config.getProperties());
@@ -69,13 +73,21 @@ public final class LakehouseCompactionStorageBindings implements CompactionStora
                 streamCatalog,
                 compactionManager,
                 deps.scanTopicExecutor,
-                deps.publishTaskExecutor,
+                deps.publicationControlExecutor,
+                deps.publicationWorkerExecutor,
                 deps.config,
-                deps.compactionMetrics);
+                deps.compactionMetrics,
+                publicationCoordinator);
     }
 
     @Override
     public StartStopRunner createCompactedTaskRunner(BooleanSupplier isLeader) {
+        return createCompactedTaskRunner(isLeader, failure -> { });
+    }
+
+    @Override
+    public StartStopRunner createCompactedTaskRunner(
+            BooleanSupplier isLeader, Consumer<Throwable> fatalErrorHandler) {
         return new CompactedTaskRunner(
                 deps.storageApi,
                 deps.commitTaskProvider,
@@ -84,7 +96,8 @@ public final class LakehouseCompactionStorageBindings implements CompactionStora
                 deps.commitParquetFileExecutor,
                 deps.config,
                 deps.compactionMetrics,
-                isLeader);
+                isLeader,
+                fatalErrorHandler);
     }
 
     @Override
@@ -155,7 +168,8 @@ public final class LakehouseCompactionStorageBindings implements CompactionStora
         private final CommitTaskProvider commitTaskProvider;
         private final SchemaRegistry schemaRegistry;
         private final ExecutorService scanTopicExecutor;
-        private final ScheduledExecutorService publishTaskExecutor;
+        private final ScheduledExecutorService publicationControlExecutor;
+        private final ExecutorService publicationWorkerExecutor;
         private final ExecutorService compactedTaskExecutor;
         private final ExecutorService commitParquetFileExecutor;
 
@@ -169,7 +183,8 @@ public final class LakehouseCompactionStorageBindings implements CompactionStora
                             CommitTaskProvider commitTaskProvider,
                             SchemaRegistry schemaRegistry,
                             ExecutorService scanTopicExecutor,
-                            ScheduledExecutorService publishTaskExecutor,
+                            ScheduledExecutorService publicationControlExecutor,
+                            ExecutorService publicationWorkerExecutor,
                             ExecutorService compactedTaskExecutor,
                             ExecutorService commitParquetFileExecutor) {
             this.config = Objects.requireNonNull(config, "config");
@@ -181,7 +196,10 @@ public final class LakehouseCompactionStorageBindings implements CompactionStora
             this.commitTaskProvider = Objects.requireNonNull(commitTaskProvider, "commitTaskProvider");
             this.schemaRegistry = schemaRegistry;
             this.scanTopicExecutor = Objects.requireNonNull(scanTopicExecutor, "scanTopicExecutor");
-            this.publishTaskExecutor = Objects.requireNonNull(publishTaskExecutor, "publishTaskExecutor");
+            this.publicationControlExecutor =
+                    Objects.requireNonNull(publicationControlExecutor, "publicationControlExecutor");
+            this.publicationWorkerExecutor =
+                    Objects.requireNonNull(publicationWorkerExecutor, "publicationWorkerExecutor");
             this.compactedTaskExecutor = Objects.requireNonNull(compactedTaskExecutor, "compactedTaskExecutor");
             this.commitParquetFileExecutor =
                     Objects.requireNonNull(commitParquetFileExecutor, "commitParquetFileExecutor");

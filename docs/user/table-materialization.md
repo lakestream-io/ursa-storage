@@ -121,24 +121,62 @@ Operator-side keys read on `CompactionScheduler` startup:
 | `compactionStorageBindingsClass` | `io.lakestream.ursa.lakehouse.compact.LakehouseCompactionStorageBindings` | Wires the publish / commit / cleanup runners. |
 | `compactionServiceClass` | _(deprecated alias)_ | Honoured for one release. The scheduler logs a WARN when set without `materializationServiceClass`. |
 | `blackTopicOfCompact` | _(none)_ | Comma-separated logical stream names. A `-partition-N` suffix is normalized to the logical stream, so per-partition exclusion is not supported. |
+| `commitTimeoutInSeconds` | `1800` | Upper bound for a lakehouse commit round and for draining an in-flight commit during leader demotion. Exceeding it fail-stops the compaction process so an unfenced old commit cannot overlap a successor. |
 | `iceberg.catalog.<name>.*` / `delta.catalog.<name>.*` / `unityCatalog*` | _(none)_ | Per-catalog connection settings. Translated into `TableCatalog` records on startup by `TableCatalogBootstrap`. |
 | `clickhouse.catalog.<name>.dsn` / `…user` / `…password-ref` | _(none)_ | ClickHouse catalog connection bootstrap. |
 
 See [ursa-storage-compact/CLAUDE.md](../../ursa-storage-compact/CLAUDE.md#configuration-keys-operator-surface)
 for the full table.
 
-## Version 1.0 Metadata Boundary
+## Version 1.0 Upgrade Notes
 
-The 1.0 catalog-based task publisher is a clean metadata boundary. It discovers streams from
-Lakestream namespace indexes and stores publication cursors under each canonical
-`namespace/stream-partition-N` name. It does not migrate metadata written by the earlier
-stream-ID-based publisher.
+The 1.0 catalog-based task publisher discovers streams from Lakestream namespace indexes and stores
+publication cursors under each canonical `namespace/stream-partition-N` name. Stop every old
+publisher before starting the 1.0 publisher; rolling old and new publishers against the same
+compaction metadata is not supported.
 
-Before moving a pre-1.0 deployment to this publisher, stop every old publisher and either use a
-fresh catalog/compaction metadata namespace or run an explicit offline migration. Reusing an old
+Pre-1.0 named cursors could contain a non-negative offset with a cumulative byte size of zero. The
+1.0 publisher never treats zero as a valid size for a published offset:
+
+- If a durable prepared task proves the missing cumulative size, the publisher repairs the cursor
+  atomically while holding its publication lease.
+- If the value cannot be proved, publication for that partition is quarantined and the lease is
+  released. Use `update-publish-task-offset` to record the verified cumulative bytes through the
+  published offset. Do not estimate this value: a wrong baseline can replay or skip data.
+- A durable prepared task whose range, identity, or byte totals cannot be reconciled with the
+  cursor follows the same lease-release and quarantine path instead of retrying on every scan.
+- `--offset=-1` must use `--cumulative-size=0`; every non-negative offset must use a positive
+  cumulative size.
+
+The compaction integration also has source-incompatible API and configuration changes:
+
+- `CompactTaskManager.updatePublishedOffset(String, long, long, long)` now requires the cumulative
+  size argument.
+- Third-party `CompactTaskManager` implementations must implement
+  `releasePublicationLeaseAsync(PublicationLease)`. It must return immediately and use the
+  implementation's native asynchronous metadata-store API; performing blocking remote I/O before
+  returning prevents lease-release timeouts from supervising that request.
+- `CompactionStorageBindings.createTopicManager()` was removed. The publisher discovers streams
+  through `StreamCatalog`.
+- `LakehouseCompactionStorageBindings.Dependencies` now accepts a `StreamCatalog`, a dedicated
+  scheduled `publicationControlExecutor`, and a separate `publicationWorkerExecutor`; it no longer
+  accepts `TopicProvider`, `TopicManager`, or `AsyncOxiaClient`. Custom reflective bindings must
+  update their `Dependencies` constructor to the new 13-argument signature.
+- The built-in publication worker uses daemon threads. A publication that exceeds its deadline is
+  fenced and remains identity-tracked until its callable returns, but an interrupt-ignoring
+  callable cannot hold process shutdown open after bounded dependency cleanup completes.
+- A lakehouse commit that is already executing cannot be safely cancelled. Leader demotion retains
+  the Oxia leader record while waiting up to `commitTimeoutInSeconds` for such work to return. If it
+  does not drain, the service logs the failure, increments
+  `ursa.storage.compact.commit.drain.timeout.count`, and fail-stops the process; process termination
+  prevents the old callable from overlapping the successor before the ephemeral record is released.
+- `update-publish-task-offset` now requires `--cumulative-size`.
+- `refreshLocalTopicInternalInSeconds` was removed because it was not used. There is no replacement.
+
+If an older deployment used stream-ID-only metadata rather than the canonical named cursor, use a
+fresh catalog/compaction metadata namespace or perform an explicit offline migration. Reusing an old
 materialized table with a fresh cursor can replay the stream from offset zero, so reset or migrate
-the table and cursor together. Rolling old and new publishers against the same metadata is not
-supported.
+the table and cursor together.
 
 ## Supported Sinks
 
