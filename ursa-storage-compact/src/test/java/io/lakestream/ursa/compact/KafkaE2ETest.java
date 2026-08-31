@@ -110,6 +110,7 @@ public class KafkaE2ETest {
         var producer = new KafkaProducer<String, byte[]>(producerProps);
 
         LinkedList<Long> offsets = new LinkedList<>();
+        long publishedBytes = 0L;
         for (int i = 0; i < numberOfMessages; i++) {
             var key = "key-" + i;
             var value = ("message-" + i).getBytes(StandardCharsets.UTF_8);
@@ -117,6 +118,9 @@ public class KafkaE2ETest {
             var future = producer.send(record);
             var metadata = future.get();
             offsets.add(metadata.offset());
+            publishedBytes = Math.addExact(publishedBytes, 2L * Integer.BYTES);
+            publishedBytes = Math.addExact(publishedBytes, metadata.serializedKeySize());
+            publishedBytes = Math.addExact(publishedBytes, metadata.serializedValueSize());
         }
         producer.flush();
 
@@ -134,6 +138,8 @@ public class KafkaE2ETest {
         task.setTopic(canonicalTopic);
         task.setStartOffset(offsets.getFirst());
         task.setEndOffset(Math.addExact(offsets.getLast(), 1L));
+        task.setTotalSize(publishedBytes);
+        task.setCumulativeSize(publishedBytes);
         task.setProperties(Map.of(
                 "entryFormat", "KAFKA",
                 "entrySerDeType", "KAFKA_BATCHED_RAW_PARQUET",
