@@ -7,19 +7,9 @@ package io.lakestream.ursa.kafka.runtime;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import io.lakestream.api.CatalogPaths;
-import io.lakestream.api.ExternalStreamRegistry;
 import io.lakestream.api.StreamCatalogProvider;
-import io.lakestream.api.StreamIdentifier;
-import io.lakestream.ursa.lakestream.impl.ExternalStreamRegistryService;
-import io.lakestream.ursa.lakestream.impl.StreamCatalogService;
-import io.opentelemetry.api.OpenTelemetry;
-import java.util.List;
-import java.util.Map;
 import java.util.Properties;
 import java.util.ServiceLoader;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 class UrsaKafkaStreamCatalogProviderTest {
@@ -29,53 +19,6 @@ class UrsaKafkaStreamCatalogProviderTest {
         assertThat(ServiceLoader.load(StreamCatalogProvider.class).stream()
             .map(ServiceLoader.Provider::type))
             .containsExactly(UrsaKafkaStreamCatalogProvider.class);
-    }
-
-    @Test
-    void shouldOpenExternalRegistryThroughMetadataOnlyService() throws Exception {
-        AtomicReference<Properties> capturedProperties = new AtomicReference<>();
-        ExternalStreamRegistry expected = new ExternalStreamRegistry() {
-            @Override
-            public CompletableFuture<Void> registerExternalStream(
-                    StreamIdentifier id, int partitionCount, Map<String, String> properties) {
-                return CompletableFuture.completedFuture(null);
-            }
-
-            @Override
-            public CompletableFuture<Void> unregisterExternalStream(StreamIdentifier id) {
-                return CompletableFuture.completedFuture(null);
-            }
-
-            @Override
-            public CompletableFuture<Void> permanentlyDeleteExternalStream(StreamIdentifier id) {
-                return CompletableFuture.completedFuture(null);
-            }
-
-            @Override
-            public void close() {
-            }
-        };
-        ExternalStreamRegistryService registryService = new ExternalStreamRegistryService() {
-            @Override
-            public ExternalStreamRegistry open(
-                    String oxiaUri, CatalogPaths catalogPaths, Properties properties,
-                    OpenTelemetry otel, List<? extends AutoCloseable> additionalOwnedResources)
-                    throws Exception {
-                capturedProperties.set(properties);
-                for (AutoCloseable resource : additionalOwnedResources) {
-                    resource.close();
-                }
-                return expected;
-            }
-        };
-        UrsaKafkaStreamCatalogProvider provider = new UrsaKafkaStreamCatalogProvider(
-            new StreamCatalogService(), registryService);
-        Properties properties = new Properties();
-        properties.setProperty("backendStorageType", "must-not-bootstrap-storage");
-
-        assertThat(provider.openExternalStreamRegistry("oxia://localhost/catalog", properties))
-            .isSameAs(expected);
-        assertThat(capturedProperties.get()).isSameAs(properties);
     }
 
     @Test

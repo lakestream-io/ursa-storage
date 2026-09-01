@@ -33,7 +33,7 @@ CompactionScheduler.start()
   │     spins up N CompactionWorker threads, each holding:
   │       - CompactionService (legacy WAL → CO path)
   │       - MaterializationService (new sink dispatch)
-  │       - StreamCatalog (loadStream + effectiveMaterialization)
+  │       - StreamCatalog (loadStream + resolveMaterialization)
   └── startLeaderElectionService()
         when elected leader:
           - storageBindings.createPublishCompactTaskRunner().start()
@@ -42,8 +42,8 @@ CompactionScheduler.start()
 
 CompactionWorker.run() loop, per task:
   1. CompactionService.compactStream(task)        (internal WAL → CO)
-  2. Stream stream = streamCatalog.loadStream(id)
-  3. if (stream.effectiveMaterialization().isPresent())
+  2. StreamMetadata metadata = streamCatalog.loadStream(id)
+  3. if (streamCatalog.resolveMaterialization(id).join().isPresent())
         materializationService.materialize(MaterializationTask)
   4. on MaterializationException with non-retryable code:
         materializationService.invalidate(streamId)
@@ -69,8 +69,8 @@ must return empty.
 This module integrates the heaviest dependency set in the project:
 - **ursa-storage-core** — StorageApi, compaction task providers, the
   `CompactionStorageBindings` + `MaterializationService` SPIs
-- **ursa-storage-lakestream** — `IndexedStreamCatalog` (resolution of
-  `effectiveMaterialization()`)
+- **ursa-storage-lakestream** — `IndexedStreamCatalog` (metadata loading and
+  `resolveMaterialization()`)
 - **ursa-storage-materialization** — SPI + serde, runtime
 - **ursa-storage-lakehouse** (provided) — concrete bindings + materialization
   service, all loaded reflectively

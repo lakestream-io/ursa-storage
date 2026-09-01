@@ -4,12 +4,10 @@
  */
 package io.lakestream.ursa.kafka.runtime;
 
-import io.lakestream.api.ExternalStreamRegistry;
 import io.lakestream.api.StreamCatalog;
 import io.lakestream.api.StreamCatalogProvider;
 import io.lakestream.ursa.kafka.reader.KafkaLakehouseReaderFactory;
 import io.lakestream.ursa.lakestream.impl.DefaultCatalogPaths;
-import io.lakestream.ursa.lakestream.impl.ExternalStreamRegistryService;
 import io.lakestream.ursa.lakestream.impl.StreamCatalogService;
 import io.opentelemetry.sdk.OpenTelemetrySdk;
 import io.opentelemetry.sdk.autoconfigure.AutoConfiguredOpenTelemetrySdk;
@@ -25,19 +23,14 @@ public final class UrsaKafkaStreamCatalogProvider implements StreamCatalogProvid
 
     private static final String SERVICE_NAME = "kafka-diskless-storage";
     private final StreamCatalogService streamCatalogService;
-    private final ExternalStreamRegistryService externalStreamRegistryService;
 
     public UrsaKafkaStreamCatalogProvider() {
-        this(new StreamCatalogService(), new ExternalStreamRegistryService());
+        this(new StreamCatalogService());
     }
 
-    UrsaKafkaStreamCatalogProvider(
-            StreamCatalogService streamCatalogService,
-            ExternalStreamRegistryService externalStreamRegistryService) {
+    UrsaKafkaStreamCatalogProvider(StreamCatalogService streamCatalogService) {
         this.streamCatalogService = Objects.requireNonNull(
             streamCatalogService, "streamCatalogService");
-        this.externalStreamRegistryService = Objects.requireNonNull(
-            externalStreamRegistryService, "externalStreamRegistryService");
     }
 
     @Override
@@ -50,18 +43,6 @@ public final class UrsaKafkaStreamCatalogProvider implements StreamCatalogProvid
             runtimeProperties,
             openTelemetrySdk,
             new KafkaLakehouseReaderFactory(),
-            List.of(openTelemetrySdk));
-    }
-
-    @Override
-    public ExternalStreamRegistry openExternalStreamRegistry(
-            String catalogMetadataUri, Properties properties) throws Exception {
-        OpenTelemetrySdk openTelemetrySdk = createOpenTelemetrySdk();
-        return externalStreamRegistryService.open(
-            catalogMetadataUri,
-            new DefaultCatalogPaths(),
-            properties,
-            openTelemetrySdk,
             List.of(openTelemetrySdk));
     }
 

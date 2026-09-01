@@ -31,7 +31,6 @@ import java.util.Properties;
 public class StreamCatalogService {
 
     private static final String COMPACTED_READER_FACTORY_CLASS = "compactedObjectReaderFactoryClass";
-    private static final String LEGACY_EXTERNAL_READER_FACTORY_CLASS = "externalReaderFactoryClass";
 
     @FunctionalInterface
     interface UrsaStorageFactory {
@@ -261,9 +260,6 @@ public class StreamCatalogService {
         }
         if (properties.containsKey(COMPACTED_READER_FACTORY_CLASS)) {
             return String.valueOf(properties.get(COMPACTED_READER_FACTORY_CLASS));
-        }
-        if (properties.containsKey(LEGACY_EXTERNAL_READER_FACTORY_CLASS)) {
-            return String.valueOf(properties.get(LEGACY_EXTERNAL_READER_FACTORY_CLASS));
         }
         return null;
     }

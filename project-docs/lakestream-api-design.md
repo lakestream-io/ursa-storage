@@ -22,7 +22,7 @@ metadata, or position types.
 
 ```text
 lakestream-api
-  StreamCatalog, Stream, StreamLayout
+  StreamCatalog, StreamMetadata, StreamLayout
   Log, LogCursor, LogStorage
   StreamReader, StreamWriter
   CompactedObjectReader, CompactedObjectReaderFactory
@@ -57,11 +57,13 @@ A `LogCursor` is named progress over a log. It tracks the read position,
 acknowledged ranges, and durable mark-delete state. Cursor state is a storage
 concept rather than a broker subscription type.
 
-### Stream
+### Stream metadata and data-plane access
 
-A `Stream` is a logical data set identified by
-`StreamIdentifier(namespace, name)`. Its `StreamLayout` maps routing keys or
-partitions to one or more logs.
+A logical stream is identified by `StreamIdentifier(namespace, name)`.
+`StreamMetadata` is its immutable, resource-free catalog snapshot, and its
+`StreamLayout` maps routing keys or partitions to one or more logs. Callers
+open closeable data-plane resources explicitly through `StreamCatalog.openLog`,
+`StreamCatalog.openReader`, or `StreamCatalog.openWriter`.
 
 ### StreamCatalog
 
@@ -111,7 +113,7 @@ versions rather than guess another system's layout.
 
 ## Implementation status
 
-The repository contains the public API, Oxia-backed catalog, log and cursor
-implementations, layouts, stream readers/writers, and compacted-object reader
-extension points. Kafka record decoding and Kafka compacted reads live in
-their dedicated modules.
+The repository contains the public API, Oxia-backed catalog, metadata snapshots,
+log and cursor implementations, layouts, stream readers/writers, and
+compacted-object reader extension points. Kafka record decoding and Kafka
+compacted reads live in their dedicated modules.

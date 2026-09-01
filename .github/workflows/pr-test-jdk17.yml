@@ -100,37 +100,37 @@ jobs:
       matrix:
         include:
           - name: Unit Tests
-            test_type: unit
             stress_ng: false
-            group_arg: -DexcludeGroups='gcs-group1,aws-group1,aws-group2,lakehouse,test-base'
+            fail_if_no_tests: false
+            group_arg: -DexcludeGroups='docker,clickhouse,lakehouse,test-base'
           - name: Unit Tests (Lakehouse)
-            test_type: unit
             stress_ng: false
-            group_arg: -Dgroups=lakehouse -pl ursa-storage-lakehouse
-          - name: Integration Tests (S3 group1)
-            test_type: s3
+            fail_if_no_tests: true
+            group_arg: -Dgroups=lakehouse -DexcludeGroups=docker -pl ursa-storage-lakehouse
+          - name: Integration Tests (S3)
             stress_ng: false
-            group_arg: -Dgroups=aws-group1 -pl ursa-storage-test
-          - name: Integration Tests (S3 group2)
-            test_type: s3
-            stress_ng: false
-            group_arg: -Dgroups=aws-group2 -pl ursa-storage-test
+            fail_if_no_tests: true
+            group_arg: -Dgroups=docker -Dtest=KafkaS3BackendIntegrationTest -pl ursa-storage-test
           - name: Integration Tests (GCS)
-            test_type: gcs
             stress_ng: false
-            group_arg: -Dgroups=gcs-group1 -pl ursa-storage-test
+            fail_if_no_tests: true
+            group_arg: -Dgroups=docker -Dtest=KafkaGcsBackendIntegrationTest -pl ursa-storage-test
+          - name: Integration Tests (ClickHouse)
+            stress_ng: false
+            fail_if_no_tests: true
+            group_arg: -Dgroups=clickhouse -DexcludeGroups= -pl ursa-storage-clickhouse
           - name: Unit Tests (stress-ng)
-            test_type: unit
             stress_ng: true
-            group_arg: -DexcludeGroups='gcs-group1,aws-group1,aws-group2,lakehouse,test-base'
+            fail_if_no_tests: false
+            group_arg: -DexcludeGroups='docker,clickhouse,lakehouse,test-base'
           - name: Integration Tests (S3 stress-ng)
-            test_type: s3
             stress_ng: true
-            group_arg: -Dgroups=aws-group1 -pl ursa-storage-test
+            fail_if_no_tests: true
+            group_arg: -Dgroups=docker -Dtest=KafkaS3BackendIntegrationTest -pl ursa-storage-test
           - name: Integration Tests (GCS stress-ng)
-            test_type: gcs
             stress_ng: true
-            group_arg: -Dgroups=gcs-group1 -pl ursa-storage-test
+            fail_if_no_tests: true
+            group_arg: -Dgroups=docker -Dtest=KafkaGcsBackendIntegrationTest -pl ursa-storage-test
 
     steps:
       - uses: actions/checkout@v4
@@ -192,7 +192,7 @@ jobs:
 
       - name: "Run tests (${{ matrix.name }})"
         run: |
-          mvn -B -ntp test -DfailIfNoTests=false ${{ matrix.group_arg }} ${{ env.EXTRA_OPTS }}
+          mvn -B -ntp test -DfailIfNoTests=${{ matrix.fail_if_no_tests }} ${{ matrix.group_arg }} ${{ env.EXTRA_OPTS }}
 
       - name: print dstat
         if: always() && matrix.stress_ng == true

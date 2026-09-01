@@ -4,11 +4,11 @@
  */
 package io.lakestream.ursa.compact;
 
-import io.lakestream.api.Stream;
+import io.lakestream.api.LogId;
 import io.lakestream.api.StreamCatalog;
 import io.lakestream.api.StreamIdentifier;
-import io.lakestream.api.exception.PartitionLifecycleFencedException;
-import io.lakestream.api.exception.StreamPermanentlyDeletedException;
+import io.lakestream.api.StreamMetadata;
+import io.lakestream.api.exception.NoSuchStreamException;
 import io.lakestream.api.materialization.ResolvedMaterialization;
 import io.lakestream.api.materialization.TableCatalog;
 import io.lakestream.ursa.compaction.CompactTaskManager;
@@ -299,85 +299,60 @@ public class CompactionWorker implements Runnable {
             throw new MaterializationException(ExceptionCode.INTERNAL_ERROR,
                 "Skipping materialization for unparsable topic " + task.getTopic(), re);
         }
-        // Broker-created streams might not pass through StreamCatalog.createStream(). Register this
-        // partition idempotently from the task's streamId so loadStream() resolves the stream
-        // regardless of source.
         Map<String, String> props = task.getProperties() == null ? Map.of() : task.getProperties();
+        StreamMetadata streamMetadata;
         try {
-            int partitionIndex = partitionIndexOf(task.getTopic());
-            // The catalog uses streamId to distinguish the stream from any other stream with the
-            // same namespace + name.
-            // The partition index is used to distinguish the partition from any other partition of the same stream.
-            // This bridge makes externally-created stream metadata visible to Lakestream.
-            streamCatalog.registerExternalPartition(id, partitionIndex, task.getStreamId(), props).join();
-        } catch (RuntimeException re) {
-            throw catalogFailure(
-                "Failed to register stream " + id.fullName() + " for materialization", re);
-        }
-        Stream stream;
-        try {
-            stream = streamCatalog.loadStream(id).join();
+            streamMetadata = streamCatalog.loadStream(id).join();
         } catch (RuntimeException re) {
             // Do not silently skip: a transient load failure would drop the range. Retry.
             throw catalogFailure(
                 "Failed to load stream " + id.fullName() + " for materialization", re);
         }
-        boolean ownershipTransferred = false;
-        Throwable materializationFailure = null;
+        LogId taskLogId = LogId.of(task.getStreamId());
         try {
-            Optional<ResolvedMaterialization> resolved = stream.effectiveMaterialization();
-            if (resolved.isEmpty()) {
-                // Back-compat: no stream/namespace/cluster policy resolved. Deployments that drive
-                // materialization through compaction task properties (legacy DynamicConfigs + catalog
-                // config) carry the config on the task, so fall back to resolving from the task properties.
-                // TODO: This is current task property resolution, which is deprecated in favor of the
-                //  stream/namespace/cluster policy. Remove this fallback once all deployments have migrated
-                //  to the new policy resolution.
-                resolved = materializationService.resolveFromTaskProperties(id, task.getTopic(), props)
-                        .map(this::withRegisteredCatalog);
+            if (!streamMetadata.layout().logIds().join().contains(taskLogId)) {
+                throw new MaterializationException(ExceptionCode.NO_SUCH_LOG,
+                        "Compaction task log " + taskLogId.id() + " does not belong to stream "
+                                + id.fullName());
             }
-            if (resolved.isEmpty()) {
-                log.warn("Stream {} has no effective materialization policy and no materialization task "
-                        + "properties; skipping materialization for task {}", task.getTopic(), task.getTaskName());
-                throw new MaterializationException(ExceptionCode.INTERNAL_ERROR,
-                    "No effective materialization policy for stream " + id.fullName());
-            }
-            // Hand ownership of the opened Stream handle to the materialization service so the
-            // factory can build sink-specific materializers. Until registration succeeds, this
-            // method remains responsible for closing the handle on every exit path.
-            materializationService.registerActiveStream(id, stream);
-            ownershipTransferred = true;
-            // The service reads source entries for the offset range through StorageApi and decodes
-            // and writes them. The compaction module does not read or carry entries.
-            MaterializationTask mt = new MaterializationTask(
-                    id,
-                    resolved.get(),
-                    task.getTopic(),
-                    task.getStreamId(),
-                    task.getStartOffset(),
-                    task.getEndOffset(),
-                    task);
-            // The Lakehouse service records write results onto the task and persists it as COMPACTED
-            // for the group-commit runner; ClickHouse commits inline. The returned CommitResult is not
-            // needed by the worker today (metrics are recorded sink-side).
-            materializationService.materialize(mt);
-        } catch (RuntimeException | Error failure) {
-            materializationFailure = failure;
-            throw failure;
-        } finally {
-            if (!ownershipTransferred) {
-                try {
-                    stream.close();
-                } catch (Exception closeFailure) {
-                    if (materializationFailure != null) {
-                        materializationFailure.addSuppressed(closeFailure);
-                    } else {
-                        throw new MaterializationException(ExceptionCode.INTERNAL_ERROR,
-                                "Failed to close unregistered stream " + id.fullName(), closeFailure);
-                    }
-                }
-            }
+        } catch (MaterializationException e) {
+            throw e;
+        } catch (RuntimeException re) {
+            throw catalogFailure(
+                    "Failed to validate log " + taskLogId.id() + " for stream " + id.fullName(), re);
         }
+        Optional<ResolvedMaterialization> resolved;
+        try {
+            resolved = streamCatalog.resolveMaterialization(id).join();
+        } catch (RuntimeException re) {
+            throw catalogFailure(
+                    "Failed to resolve materialization for stream " + id.fullName(), re);
+        }
+        if (resolved.isEmpty()) {
+            // Back-compat: no stream/namespace/cluster policy resolved. Deployments that drive
+            // materialization through compaction task properties (legacy DynamicConfigs + catalog
+            // config) carry the config on the task, so fall back to resolving from the task properties.
+            // TODO: Remove this fallback once all deployments have migrated to catalog policies.
+            resolved = materializationService.resolveFromTaskProperties(id, task.getTopic(), props)
+                    .map(this::withRegisteredCatalog);
+        }
+        if (resolved.isEmpty()) {
+            log.warn("Stream {} has no effective materialization policy and no materialization task "
+                    + "properties; skipping materialization for task {}", task.getTopic(), task.getTaskName());
+            throw new MaterializationException(ExceptionCode.INTERNAL_ERROR,
+                "No effective materialization policy for stream " + id.fullName());
+        }
+        // The service reads source entries for the offset range through StorageApi and decodes
+        // and writes them. StreamMetadata is immutable and carries no closeable data-plane handle.
+        MaterializationTask mt = new MaterializationTask(
+                streamMetadata,
+                resolved.get(),
+                task.getTopic(),
+                task.getStreamId(),
+                task.getStartOffset(),
+                task.getEndOffset(),
+                task);
+        materializationService.materialize(mt);
     }
 
     /**
@@ -423,8 +398,7 @@ public class CompactionWorker implements Runnable {
 
     private static MaterializationException catalogFailure(
             String message, RuntimeException failure) {
-        ExceptionCode code = hasCause(failure, StreamPermanentlyDeletedException.class)
-                || hasCause(failure, PartitionLifecycleFencedException.class)
+        ExceptionCode code = hasCause(failure, NoSuchStreamException.class)
             ? ExceptionCode.NO_SUCH_STREAM
             : ExceptionCode.INTERNAL_ERROR;
         return new MaterializationException(code, message, failure);

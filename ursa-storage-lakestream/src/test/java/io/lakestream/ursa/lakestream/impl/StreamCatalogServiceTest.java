@@ -9,8 +9,6 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyLong;
-import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
@@ -28,7 +26,6 @@ import io.lakestream.api.LogId;
 import io.lakestream.api.LogStateManager;
 import io.lakestream.api.LogStorage;
 import io.lakestream.api.Position;
-import io.lakestream.api.StreamIdentifier;
 import io.lakestream.ursa.lakestream.reader.CompactedObjectReader;
 import io.lakestream.ursa.lakestream.reader.CompactedObjectReaderFactory;
 import io.lakestream.ursa.lakestream.reader.NoopCompactedObjectReaderFactory;
@@ -41,19 +38,11 @@ import io.lakestream.ursa.storage.impl.StorageConfig;
 import io.netty.buffer.Unpooled;
 import io.opentelemetry.api.OpenTelemetry;
 import io.oxia.client.api.AsyncOxiaClient;
-import io.oxia.client.api.GetResult;
-import io.oxia.client.api.PutResult;
-import io.oxia.client.api.Version;
-import io.oxia.client.api.options.PutOption;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
 
@@ -216,56 +205,6 @@ class StreamCatalogServiceTest {
         closeOrder.verify(storage).close();
         closeOrder.verify(oxiaClient).close();
         closeOrder.verify(telemetry).close();
-    }
-
-    @Test
-    void missingFencedMappingCapabilityAllowsMetadataRegistrationButFencesDeletion()
-            throws Exception {
-        Properties properties = localProperties();
-        UrsaStorage storage = mock(UrsaStorage.class);
-        StorageApi storageApi = mock(StorageApi.class);
-        AsyncOxiaClient oxiaClient = mock(AsyncOxiaClient.class);
-        String configPath = "/admin/streams/public/default/topic";
-        String partitionPath = "/streams/public/default/topic-partition-0";
-        Version version = new Version(1, 0, 0, 0, Optional.empty(), Optional.empty());
-        AtomicReference<byte[]> storedConfig = new AtomicReference<>();
-        when(storageApi.supportsFencedStreamIdMappings()).thenReturn(false);
-        when(oxiaClient.get(partitionPath))
-            .thenReturn(CompletableFuture.completedFuture(null));
-        when(oxiaClient.get(configPath)).thenAnswer(ignored ->
-            CompletableFuture.completedFuture(storedConfig.get() == null ? null
-                : new GetResult(configPath, storedConfig.get(), version)));
-        when(oxiaClient.put(eq(configPath), any(byte[].class),
-                eq(Set.of(PutOption.IfRecordDoesNotExist))))
-            .thenAnswer(invocation -> {
-                storedConfig.set(invocation.getArgument(1, byte[].class));
-                return CompletableFuture.completedFuture(new PutResult(configPath, version));
-            });
-        when(oxiaClient.put(eq(configPath), any(byte[].class),
-                eq(Set.of(PutOption.IfVersionIdEquals(version.versionId())))))
-            .thenAnswer(invocation -> {
-                storedConfig.set(invocation.getArgument(1, byte[].class));
-                return CompletableFuture.completedFuture(new PutResult(configPath, version));
-            });
-        StreamCatalogService service = bootstrapService(storage, storageApi, oxiaClient);
-        IndexedStreamCatalog catalog = service.open("oxia://unused/catalog", properties);
-        StreamIdentifier stream = new StreamIdentifier("public/default", "topic");
-
-        catalog.registerExternalStream(stream, 1, Map.of()).join();
-
-        assertInstanceOf(UnsupportedOperationException.class,
-            assertThrows(CompletionException.class,
-                () -> catalog.deleteExternalPartition(stream, 0).join()).getCause());
-        assertInstanceOf(UnsupportedOperationException.class,
-            assertThrows(CompletionException.class,
-                () -> catalog.dropStream(stream, true).join()).getCause());
-
-        verify(oxiaClient).put(eq(configPath), any(byte[].class),
-            eq(Set.of(PutOption.IfRecordDoesNotExist)));
-        verify(oxiaClient).put(eq(configPath), any(byte[].class),
-            eq(Set.of(PutOption.IfVersionIdEquals(version.versionId()))));
-        verify(storageApi, never()).deleteStreamIdMapping(anyString(), anyLong());
-        catalog.close();
     }
 
     @Test

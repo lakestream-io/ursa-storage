@@ -26,7 +26,7 @@ public final class StreamLayoutFactory {
      * @return the appropriate StreamLayout implementation
      */
     public static StreamLayout create(Partitioning partitioning, List<LogId> logIds) {
-        if (partitioning.strategy() == PartitioningStrategy.INDEXED || logIds.size() == 1) {
+        if (partitioning.strategy() == PartitioningStrategy.INDEXED) {
             return new IndexedLayout(logIds);
         }
         throw new UnsupportedOperationException(

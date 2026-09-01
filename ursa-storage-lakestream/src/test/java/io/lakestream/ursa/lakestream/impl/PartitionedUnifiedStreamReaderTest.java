@@ -97,7 +97,7 @@ class PartitionedUnifiedStreamReaderTest {
         Log firstLog = emptyLog();
         Log secondLog = emptyLog();
         Exception firstFailure = new Exception("first close failed");
-        doThrow(firstFailure).when(firstLog).close();
+        doThrow(firstFailure).doNothing().when(firstLog).close();
         Map<LogId, Log> availableLogs = Map.of(firstId, firstLog, secondId, secondLog);
         PartitionedUnifiedStreamReader reader =
             new PartitionedUnifiedStreamReader(availableLogs::get);
@@ -111,7 +111,7 @@ class PartitionedUnifiedStreamReaderTest {
         verify(secondLog).close();
 
         reader.close();
-        verify(firstLog, times(1)).close();
+        verify(firstLog, times(2)).close();
         verify(secondLog, times(1)).close();
     }
 

@@ -77,21 +77,14 @@ final class PartitionedUnifiedStreamReader implements UnifiedStreamReader {
     }
 
     @Override
-    public void close() throws Exception {
-        List<Log> openedLogs;
-        synchronized (this) {
-            if (closed) {
-                return;
-            }
-            closed = true;
-            openedLogs = new ArrayList<>(logs.values());
-            logs.clear();
-        }
-
+    public synchronized void close() throws Exception {
+        closed = true;
+        List<Map.Entry<LogId, Log>> openedLogs = new ArrayList<>(logs.entrySet());
         Throwable firstFailure = null;
-        for (Log log : openedLogs) {
+        for (Map.Entry<LogId, Log> opened : openedLogs) {
             try {
-                log.close();
+                opened.getValue().close();
+                logs.remove(opened.getKey(), opened.getValue());
             } catch (Exception | Error closeFailure) {
                 if (firstFailure == null) {
                     firstFailure = closeFailure;

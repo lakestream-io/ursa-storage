@@ -4,7 +4,6 @@
  */
 package io.lakestream.ursa.materialization;
 
-import io.lakestream.api.Stream;
 import io.lakestream.api.StreamIdentifier;
 import io.lakestream.api.materialization.ResolvedMaterialization;
 import java.util.Map;
@@ -43,18 +42,6 @@ public interface MaterializationService extends AutoCloseable {
     void materialize(MaterializationTask task);
 
     /**
-     * Registers the {@link Stream} handle for a stream so the service can build sink materializers that
-     * need it. The orchestrator ({@code CompactionWorker}) calls this once per task before
-     * {@link #materialize(MaterializationTask)}. The default is a no-op for services that do not need
-     * the handle.
-     *
-     * @param id     the stream identifier
-     * @param stream the opened stream handle
-     */
-    default void registerActiveStream(StreamIdentifier id, Stream stream) {
-    }
-
-    /**
      * Drops any cached state for {@code id} (e.g., releases sink connections,
      * invalidates compiled schema converters). Called on failure or stream
      * delete.
@@ -67,8 +54,8 @@ public interface MaterializationService extends AutoCloseable {
      * Resolves a {@link ResolvedMaterialization} for a stream directly from the compaction task's
      * properties, for backward compatibility with deployments that drove materialization through task
      * properties (legacy {@code DynamicConfigs} + catalog config) rather than a stream/namespace/cluster
-     * policy. {@code CompactionWorker} calls this as a fallback when
-     * {@code Stream.effectiveMaterialization()} resolves nothing.
+     * policy. {@code CompactionWorker} calls this as a fallback when the catalog resolves no
+     * effective materialization from the stream metadata.
      *
      * <p>The default returns {@link Optional#empty()} (no task-property-based materialization).
      *

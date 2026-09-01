@@ -145,11 +145,11 @@ See `ursa-storage-clickhouse` for a worked example.
 
 - **`MaterializationException(MESSAGE_SCHEMA_INCOMPATIBLE)`** — schema
   evolution request was outside the sink's allowed policy. Check
-  `EvolutionPolicy` and the stream's source schema (`Stream.schema()`).
+  `EvolutionPolicy` and the stream's source schema (`StreamMetadata.schema()`).
 - **`MaterializationException` with `LAKEHOUSE_*` codes** — sink-side commit
   failure. Check the underlying catalog (Iceberg/Delta/Unity) status.
 - **No materialization happening** — verify
-  `stream.effectiveMaterialization().isPresent()`. Common causes:
+  `streamCatalog.resolveMaterialization(streamId).join().isPresent()`. Common causes:
   `catalogRef` doesn't resolve to a registered `TableCatalog`; namespace
   policy missing `tableNaming` template; stream policy set
   `enabled = false`.

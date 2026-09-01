@@ -10,9 +10,9 @@ import io.lakestream.api.PartitioningStrategy;
 import io.lakestream.api.RoutingKey;
 import io.lakestream.api.StreamLayout;
 import io.lakestream.api.StreamPosition;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -34,7 +34,11 @@ public class IndexedLayout implements StreamLayout {
      * @param logIds the ordered list of log IDs (index = partition number)
      */
     public IndexedLayout(List<LogId> logIds) {
-        this.logIds = Collections.unmodifiableList(logIds);
+        Objects.requireNonNull(logIds, "logIds");
+        if (logIds.isEmpty()) {
+            throw new IllegalArgumentException("An indexed layout must contain at least one log");
+        }
+        this.logIds = List.copyOf(logIds);
         this.partitioning = new Partitioning(
             PartitioningStrategy.INDEXED,
             Map.of("numPartitions", String.valueOf(logIds.size()))

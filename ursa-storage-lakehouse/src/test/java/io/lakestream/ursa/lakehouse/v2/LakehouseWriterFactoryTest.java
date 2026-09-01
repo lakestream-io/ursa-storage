@@ -9,8 +9,8 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import io.confluent.kafka.schemaregistry.client.SchemaRegistryClient;
-import io.lakestream.api.Stream;
 import io.lakestream.api.StreamIdentifier;
+import io.lakestream.api.StreamMetadata;
 import io.lakestream.api.materialization.TableCatalog;
 import io.lakestream.api.materialization.TableCatalogType;
 import io.lakestream.api.materialization.TableConf;
@@ -29,7 +29,7 @@ class LakehouseWriterFactoryTest {
 
     @Test
     void partitionedStorageStreamDerivesUnpartitionedSchemaSubject() {
-        Stream stream = mock(Stream.class);
+        StreamMetadata stream = mock(StreamMetadata.class);
         when(stream.identifier()).thenReturn(StreamIdentifier.of("default", "orders-partition-3"));
 
         String schemaTopic = LakehouseWriterFactory.schemaTopic(stream, Map.of());
@@ -41,7 +41,7 @@ class LakehouseWriterFactoryTest {
 
     @Test
     void uuidQualifiedStorageStreamUsesRegisteredKafkaTopicForSchemaLookup() {
-        Stream stream = mock(Stream.class);
+        StreamMetadata stream = mock(StreamMetadata.class);
         when(stream.identifier()).thenReturn(StreamIdentifier.of(
                 "default", "orders-topic-id-65WMNfybQpCDVulYOxMCTw"));
 
@@ -58,7 +58,7 @@ class LakehouseWriterFactoryTest {
                 TableCatalogType.DELTA,
                 Map.of("warehouse", "/tmp/ursa-test-delta"),
                 Map.of("directExternalStoragePath", "/tmp/ursa-test-delta"));
-        Stream stream = mock(Stream.class);
+        StreamMetadata stream = mock(StreamMetadata.class);
         when(stream.identifier()).thenReturn(StreamIdentifier.of("default", "delta-topic"));
 
         var dltWriter = LakehouseWriterFactory.externalDltWriter(

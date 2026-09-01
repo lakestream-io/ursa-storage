@@ -18,7 +18,7 @@ import org.slf4j.Logger;
  * Bag of services the materialization framework injects into sinks at
  * {@link TableMaterializerFactory#create(io.lakestream.api.materialization.TableMaterializationPolicy,
  * io.lakestream.api.materialization.TableCatalog,
- * io.lakestream.api.Stream, MaterializationRuntime) create-time}.
+ * io.lakestream.api.StreamMetadata, MaterializationRuntime) create-time}.
  *
  * <p>All fields are required; the canonical constructor enforces non-null on
  * each one. Use {@link MaterializationMetrics#noop()} and

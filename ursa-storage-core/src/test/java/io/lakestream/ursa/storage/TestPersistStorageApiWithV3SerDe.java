@@ -35,7 +35,7 @@ public class TestPersistStorageApiWithV3SerDe extends TestPersistStorageApi {
 
     @AfterEach
     public void cleanup() {
-        ursaStorageTestBase.cleanup();
+        super.cleanup();
     }
 
 }

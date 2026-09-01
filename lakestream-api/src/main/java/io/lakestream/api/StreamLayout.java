@@ -20,6 +20,11 @@ import java.util.concurrent.CompletableFuture;
  * <p>Per-log metadata (offsets, size, state) is accessed via {@link LogStorage},
  * not through this interface.
  *
+ * <p>A committed layout is exposed by {@link StreamMetadata#layout()} and
+ * {@link StreamCatalog#getLayout(StreamIdentifier)}. Data-plane resources using the layout are
+ * opened explicitly through {@link StreamCatalog#openLog}, {@link StreamCatalog#openReader}, or
+ * {@link StreamCatalog#openWriter}.
+ *
  * <p>Thread safety: implementations must be safe for concurrent use.
  */
 public interface StreamLayout {
@@ -65,8 +70,8 @@ public interface StreamLayout {
     /**
      * Creates a {@link StreamPosition} for the given log and offset.
      *
-     * <p>The returned position is interpreted by the layout when passed to
-     * {@link Stream#softTrim(StreamPosition)} or {@link Stream#hardTrim(StreamPosition)}.
+     * <p>The returned value preserves the layout-specific interpretation of the log and offset for
+     * layout-aware callers.
      *
      * @param logId the log within the stream
      * @param offset the offset within the log

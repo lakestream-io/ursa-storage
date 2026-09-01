@@ -4,8 +4,8 @@
  */
 package io.lakestream.ursa.lakehouse.v2;
 
-import io.lakestream.api.Stream;
 import io.lakestream.api.StreamIdentifier;
+import io.lakestream.api.StreamMetadata;
 import io.lakestream.api.materialization.TableCatalog;
 import io.lakestream.api.materialization.TableCatalogType;
 import io.lakestream.api.materialization.TableMaterializationPolicy;
@@ -57,9 +57,9 @@ final class LakehouseWriterFactory {
      */
     static AbstractLakehouseWriter iceberg(TableMaterializationPolicy policy,
                                            TableCatalog catalog,
-                                           Stream stream,
+                                           StreamMetadata streamMetadata,
                                            MaterializationRuntime runtime) {
-        requireNonNullArgs(policy, catalog, stream, runtime);
+        requireNonNullArgs(policy, catalog, streamMetadata, runtime);
         if (catalog.type() != TableCatalogType.ICEBERG) {
             throw new MaterializationException(
                     io.lakestream.ursa.exception.ExceptionCode.LAKEHOUSE_CREATE_TABLE_WRITER_ERROR,
@@ -69,8 +69,8 @@ final class LakehouseWriterFactory {
                 buildConfiguration(catalog, policy, "iceberg", runtime.taskProperties());
         EntrySerdeFactory serdeFactory = new EntrySerdeFactory((SchemaService) runtime.schemaService());
         InstrumentProvider provider = InstrumentProvider.NOOP;
-        String topic = destinationTopic(stream);
-        String schemaTopic = schemaTopic(stream, runtime.taskProperties());
+        String topic = destinationTopic(streamMetadata);
+        String schemaTopic = schemaTopic(streamMetadata, runtime.taskProperties());
 
         TableMode mode = effectiveMode(policy);
         return switch (mode) {
@@ -88,9 +88,9 @@ final class LakehouseWriterFactory {
      */
     static AbstractLakehouseWriter delta(TableMaterializationPolicy policy,
                                          TableCatalog catalog,
-                                         Stream stream,
+                                         StreamMetadata streamMetadata,
                                          MaterializationRuntime runtime) {
-        requireNonNullArgs(policy, catalog, stream, runtime);
+        requireNonNullArgs(policy, catalog, streamMetadata, runtime);
         if (catalog.type() != TableCatalogType.DELTA) {
             throw new MaterializationException(
                     io.lakestream.ursa.exception.ExceptionCode.LAKEHOUSE_CREATE_TABLE_WRITER_ERROR,
@@ -99,19 +99,19 @@ final class LakehouseWriterFactory {
         LakehouseConfiguration config =
                 buildConfiguration(catalog, policy, "delta", runtime.taskProperties());
         EntrySerdeFactory serdeFactory = new EntrySerdeFactory((SchemaService) runtime.schemaService());
-        String destinationTopic = destinationTopic(stream);
+        String destinationTopic = destinationTopic(streamMetadata);
         return new DeltaExternalTableWriter(
                 destinationTopic,
-                schemaTopic(stream, runtime.taskProperties()),
+                schemaTopic(streamMetadata, runtime.taskProperties()),
                 serdeFactory, config, InstrumentProvider.NOOP);
     }
 
     /** Builds a Delta-on-Unity-Catalog writer ({@link DeltaExternalTableWriter}). */
     static AbstractLakehouseWriter deltaUc(TableMaterializationPolicy policy,
                                            TableCatalog catalog,
-                                           Stream stream,
+                                           StreamMetadata streamMetadata,
                                            MaterializationRuntime runtime) {
-        requireNonNullArgs(policy, catalog, stream, runtime);
+        requireNonNullArgs(policy, catalog, streamMetadata, runtime);
         if (catalog.type() != TableCatalogType.DELTA_UC) {
             throw new MaterializationException(
                     io.lakestream.ursa.exception.ExceptionCode.LAKEHOUSE_CREATE_TABLE_WRITER_ERROR,
@@ -120,10 +120,10 @@ final class LakehouseWriterFactory {
         LakehouseConfiguration config =
                 buildConfiguration(catalog, policy, "delta", runtime.taskProperties());
         EntrySerdeFactory serdeFactory = new EntrySerdeFactory((SchemaService) runtime.schemaService());
-        String destinationTopic = destinationTopic(stream);
+        String destinationTopic = destinationTopic(streamMetadata);
         return new DeltaExternalTableWriter(
                 destinationTopic,
-                schemaTopic(stream, runtime.taskProperties()),
+                schemaTopic(streamMetadata, runtime.taskProperties()),
                 serdeFactory, config, InstrumentProvider.NOOP);
     }
 
@@ -136,14 +136,14 @@ final class LakehouseWriterFactory {
      */
     static Optional<LakehouseRecordWriter<FailureMessage>> externalDltWriter(TableMaterializationPolicy policy,
                                                                        TableCatalog catalog,
-                                                                       Stream stream,
+                                                                       StreamMetadata streamMetadata,
                                                                        String prefix,
                                                                        Map<String, String> taskProperties) {
         if (effectiveMode(policy) != TableMode.EXTERNAL) {
             return Optional.empty();
         }
         LakehouseConfiguration config = buildConfiguration(catalog, policy, prefix, taskProperties);
-        String topic = destinationTopic(stream);
+        String topic = destinationTopic(streamMetadata);
         InstrumentProvider provider = InstrumentProvider.NOOP;
         return switch (config.getLakehouseType()) {
             case ICEBERG -> Optional.of(new IcebergExternalDLTTableWriter(topic, config, provider));
@@ -251,22 +251,22 @@ final class LakehouseWriterFactory {
                 .orElse(TableMode.MANAGED);
     }
 
-    static String destinationTopic(Stream stream) {
-        StreamIdentifier id = stream.identifier();
+    static String destinationTopic(StreamMetadata streamMetadata) {
+        StreamIdentifier id = streamMetadata.identifier();
         return id.fullName();
     }
 
-    static String schemaTopic(Stream stream, Map<String, String> streamProperties) {
-        return KafkaSourceMetadata.topicName(destinationTopic(stream), streamProperties);
+    static String schemaTopic(StreamMetadata streamMetadata, Map<String, String> streamProperties) {
+        return KafkaSourceMetadata.topicName(destinationTopic(streamMetadata), streamProperties);
     }
 
     private static void requireNonNullArgs(TableMaterializationPolicy policy,
                                            TableCatalog catalog,
-                                           Stream stream,
+                                           StreamMetadata streamMetadata,
                                            MaterializationRuntime runtime) {
         Objects.requireNonNull(policy, "policy");
         Objects.requireNonNull(catalog, "catalog");
-        Objects.requireNonNull(stream, "stream");
+        Objects.requireNonNull(streamMetadata, "streamMetadata");
         Objects.requireNonNull(runtime, "runtime");
     }
 }

@@ -502,8 +502,9 @@ public class ObjectWalStorageImplTest {
         if (addResult.position() == null) {
             return persistStorageApi.readEntryIndex(streamId, addResult.header().offset()).join();
         } else {
-            var indexResult = persistStorageApi.writeNonCompactedIndex(streamId, numberOfMessages, entrySize,
-                    addResult.position()).join();
+            var indexResult = persistStorageApi.withStreamWriteLease(streamId, ignoredLease ->
+                persistStorageApi.writeNonCompactedIndex(
+                    streamId, numberOfMessages, entrySize, addResult.position())).join();
             // single entry index
             Key k = Key.parse(indexResult.key());
             return persistStorageApi.readEntryIndex(streamId, k.offset() - numberOfMessages).join();

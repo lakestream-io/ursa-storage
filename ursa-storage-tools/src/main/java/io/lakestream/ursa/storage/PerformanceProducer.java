@@ -15,7 +15,9 @@ import io.lakestream.ursa.metrics.InstrumentProvider;
 import io.lakestream.ursa.storage.impl.LocalFileStorage;
 import io.lakestream.ursa.storage.impl.S3FileStorage;
 import io.lakestream.ursa.storage.impl.StorageConfig;
+import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.DefaultThreadFactory;
 import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.exporter.prometheus.PrometheusHttpServer;
@@ -288,59 +290,72 @@ public class PerformanceProducer {
         long warmupEndTime = startTime + (long) (arguments.warmupTimeSeconds * 1e9);
         long testEndTime = startTime + (long) (arguments.testTime * 1e9);
 
-        while (true) {
-            if (produceEnough) {
-                break;
-            }
-
+        List<StorageApi.StreamWriteLease> leases = new ArrayList<>();
+        try {
             for (long streamId : streamIds) {
-                if (arguments.testTime > 0 && System.nanoTime() - testEndTime > 0) {
-                    log.info("------------- DONE (reached the maximum duration: [{} seconds] of producing) "
-                        + "--------------", arguments.testTime);
-                    doneLatch.countDown();
-                    produceEnough = true;
+                leases.add(storageApi.acquireStreamWriteLease(streamId).join());
+            }
+            while (true) {
+                if (produceEnough) {
                     break;
                 }
 
-                if (numMessages > 0 && totalSent.get() >= numMessages) {
-                    log.info("------------- DONE (reached the maximum number: {} of production) --------------"
-                        , numMessages);
-                    doneLatch.countDown();
-                    produceEnough = true;
-                    break;
-                }
+                for (long streamId : streamIds) {
+                    if (arguments.testTime > 0 && System.nanoTime() - testEndTime > 0) {
+                        log.info("------------- DONE (reached the maximum duration: [{} seconds] of producing) "
+                            + "--------------", arguments.testTime);
+                        doneLatch.countDown();
+                        produceEnough = true;
+                        break;
+                    }
 
-                if (rateLimiter != null) {
-                    rateLimiter.acquire();
-                }
+                    if (numMessages > 0 && totalSent.get() >= numMessages) {
+                        log.info("------------- DONE (reached the maximum number: {} of production) --------------"
+                            , numMessages);
+                        doneLatch.countDown();
+                        produceEnough = true;
+                        break;
+                    }
 
-                final long sendTime = System.nanoTime();
-                storageApi.append(streamId, 1, Unpooled.wrappedBuffer(payload))
-                    .thenRun(() -> {
-                        bytesSent.add(payload.length);
-                        messagesSent.increment();
-                        totalSent.incrementAndGet();
-                        totalMessagesSent.increment();
-                        totalBytesSent.add(payload.length);
+                    if (rateLimiter != null) {
+                        rateLimiter.acquire();
+                    }
 
-                        long now = System.nanoTime();
-                        if (now > warmupEndTime) {
-                            long latencyMicros = NANOSECONDS.toMicros(now - sendTime);
-                            recorder.recordValue(latencyMicros);
-                            cumulativeRecorder.recordValue(latencyMicros);
-                        }
+                    final long sendTime = System.nanoTime();
+                    ByteBuf writePayload = Unpooled.wrappedBuffer(payload);
+                    storageApi.append(streamId, 1, writePayload)
+                        .whenComplete((ignored, failure) ->
+                            ReferenceCountUtil.safeRelease(writePayload))
+                        .thenRun(() -> {
+                            bytesSent.add(payload.length);
+                            messagesSent.increment();
+                            totalSent.incrementAndGet();
+                            totalMessagesSent.increment();
+                            totalBytesSent.add(payload.length);
 
-                    }).exceptionally(ex -> {
-                        if (ex.getCause() instanceof ArrayIndexOutOfBoundsException) {
+                            long now = System.nanoTime();
+                            if (now > warmupEndTime) {
+                                long latencyMicros = NANOSECONDS.toMicros(now - sendTime);
+                                recorder.recordValue(latencyMicros);
+                                cumulativeRecorder.recordValue(latencyMicros);
+                            }
+
+                        }).exceptionally(ex -> {
+                            if (ex.getCause() instanceof ArrayIndexOutOfBoundsException) {
+                                return null;
+                            }
+                            log.warn("Write message error with exception ", ex);
+                            messagesFailed.increment();
+                            if (arguments.exitOnFailure) {
+                                System.exit(1);
+                            }
                             return null;
-                        }
-                        log.warn("Write message error with exception ", ex);
-                        messagesFailed.increment();
-                        if (arguments.exitOnFailure) {
-                            System.exit(1);
-                        }
-                        return null;
-                    });
+                        });
+                }
+            }
+        } finally {
+            for (int index = leases.size() - 1; index >= 0; index--) {
+                leases.get(index).close();
             }
         }
     }

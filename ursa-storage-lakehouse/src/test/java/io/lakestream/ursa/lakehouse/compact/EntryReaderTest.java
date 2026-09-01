@@ -60,10 +60,14 @@ public class EntryReaderTest {
         int streamId = 1;
 
         List<CompletableFuture<AddResult>> futures = new ArrayList<>();
-        for (int i = 0; i < 30; i++) {
-            futures.add(storageApi.append(streamId, 10, Unpooled.wrappedBuffer(("test-" + i).getBytes())));
+        try (StorageApi.StreamWriteLease ignoredLease =
+                storageApi.acquireStreamWriteLease(streamId).join()) {
+            for (int i = 0; i < 30; i++) {
+                futures.add(storageApi.append(
+                    streamId, 10, Unpooled.wrappedBuffer(("test-" + i).getBytes())));
+            }
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
         }
-        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
 
 
         try (var reader = new EntryReader(storageApi, streamId, 0, 100, 1000, CompactionMetrics.NOOP)) {
@@ -90,11 +94,14 @@ public class EntryReaderTest {
         ExecutionException {
         int streamId = 1;
 
-        for (int i = 0; i < 30; i++) {
-            storageApi.append(streamId, 10, Unpooled.wrappedBuffer(("test-" + i).getBytes())).get();
+        try (StorageApi.StreamWriteLease ignoredLease =
+                storageApi.acquireStreamWriteLease(streamId).join()) {
+            for (int i = 0; i < 30; i++) {
+                storageApi.append(streamId, 10,
+                    Unpooled.wrappedBuffer(("test-" + i).getBytes())).get();
+            }
+            storageApi.softTrimStream(streamId, 50).get();
         }
-
-        storageApi.softTrimStream(streamId, 50).get();
 
         try (var reader = new EntryReader(storageApi, streamId, 0, 100, 1000, CompactionMetrics.NOOP)) {
             Entry entry;
@@ -120,11 +127,14 @@ public class EntryReaderTest {
         ExecutionException {
         int streamId = 1;
 
-        for (int i = 0; i < 30; i++) {
-            storageApi.append(streamId, 10, Unpooled.wrappedBuffer(("test-" + i).getBytes())).get();
+        try (StorageApi.StreamWriteLease ignoredLease =
+                storageApi.acquireStreamWriteLease(streamId).join()) {
+            for (int i = 0; i < 30; i++) {
+                storageApi.append(streamId, 10,
+                    Unpooled.wrappedBuffer(("test-" + i).getBytes())).get();
+            }
+            storageApi.softTrimStream(streamId, 100).get();
         }
-
-        storageApi.softTrimStream(streamId, 100).get();
 
         try (var reader = new EntryReader(storageApi, streamId, 0, 100, 1000, CompactionMetrics.NOOP)) {
             try {
@@ -142,11 +152,14 @@ public class EntryReaderTest {
         ExecutionException {
         int streamId = 1;
 
-        for (int i = 0; i < 30; i++) {
-            storageApi.append(streamId, 10, Unpooled.wrappedBuffer(("test-" + i).getBytes())).get();
+        try (StorageApi.StreamWriteLease ignoredLease =
+                storageApi.acquireStreamWriteLease(streamId).join()) {
+            for (int i = 0; i < 30; i++) {
+                storageApi.append(streamId, 10,
+                    Unpooled.wrappedBuffer(("test-" + i).getBytes())).get();
+            }
+            storageApi.softTrimStream(streamId, 100).get();
         }
-
-        storageApi.softTrimStream(streamId, 100).get();
 
         try (var reader = new EntryReader(storageApi, streamId, 0, 100, 1000, CompactionMetrics.NOOP)) {
             try {
@@ -163,11 +176,14 @@ public class EntryReaderTest {
     public void testFillEntriesWithHardDeleteAllCase() throws Exception {
         int streamId = 2;
 
-        for (int i = 0; i < 30; i++) {
-            storageApi.append(streamId, 10, Unpooled.wrappedBuffer(("test-" + i).getBytes())).get();
+        try (StorageApi.StreamWriteLease ignoredLease =
+                storageApi.acquireStreamWriteLease(streamId).join()) {
+            for (int i = 0; i < 30; i++) {
+                storageApi.append(streamId, 10,
+                    Unpooled.wrappedBuffer(("test-" + i).getBytes())).get();
+            }
+            storageApi.hardTrimStream(streamId, 300).get();
         }
-
-        storageApi.hardTrimStream(streamId, 300).get();
 
         try (var reader = new EntryReader(storageApi, streamId, 0, 100, 1000, CompactionMetrics.NOOP)) {
             try {

@@ -209,7 +209,8 @@ public class Perf {
         ByteBuf valueBuf = Unpooled.buffer(arguments.valueSize);
         valueBuf.writeBytes(value);
 
-        try {
+        try (StorageApi.StreamWriteLease ignoredLease =
+                storageApi.acquireStreamWriteLease(streamId).join()) {
 
             while (true) {
                 limiter.acquire();

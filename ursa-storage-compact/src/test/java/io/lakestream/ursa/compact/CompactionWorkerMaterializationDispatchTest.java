@@ -6,17 +6,14 @@ package io.lakestream.ursa.compact;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyInt;
-import static org.mockito.ArgumentMatchers.anyLong;
-import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-import io.lakestream.api.Stream;
+import io.lakestream.api.LogId;
 import io.lakestream.api.StreamCatalog;
+import io.lakestream.api.StreamLayout;
+import io.lakestream.api.StreamMetadata;
 import io.lakestream.api.materialization.ResolvedMaterialization;
 import io.lakestream.api.materialization.TableCatalog;
 import io.lakestream.api.materialization.TableCatalogType;
@@ -36,8 +33,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
@@ -51,7 +46,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
  * <ul>
  *   <li>When the stream resolves a {@link ResolvedMaterialization}, the worker hands the task
  *       to {@link MaterializationService#materialize(MaterializationTask)}.</li>
- *   <li>When {@link Stream#effectiveMaterialization()} returns empty, the worker skips the
+ *   <li>When {@link StreamCatalog#resolveMaterialization} returns empty, the worker skips the
  *       materialize call entirely.</li>
  * </ul>
  */
@@ -74,7 +69,10 @@ public class CompactionWorkerMaterializationDispatchTest {
     private StreamCatalog streamCatalog;
 
     @Mock
-    private Stream stream;
+    private StreamMetadata streamMetadata;
+
+    @Mock
+    private StreamLayout streamLayout;
 
     private CompactionWorker createWorker() {
         StorageConfig config = StorageConfig.builder()
@@ -118,10 +116,7 @@ public class CompactionWorkerMaterializationDispatchTest {
                 catalog,
                 new TableIdentifier("ns", "table"),
                 effective);
-        when(streamCatalog.registerExternalPartition(any(), anyInt(), anyLong(), any()))
-                .thenReturn(CompletableFuture.completedFuture(null));
-        when(streamCatalog.loadStream(any())).thenReturn(CompletableFuture.completedFuture(stream));
-        when(stream.effectiveMaterialization()).thenReturn(Optional.of(resolved));
+        stubStream(task, Optional.of(resolved));
         // The worker no longer reads entries — it submits the offset range and the
         // MaterializationService reads + decodes. We only assert the dispatch happens here.
 
@@ -132,10 +127,6 @@ public class CompactionWorkerMaterializationDispatchTest {
         thread.join(2000);
 
         verify(materializationService).materialize(any(MaterializationTask.class));
-        // The worker lazily registers the (broker-created) stream before loading it, so loadStream
-        // resolves regardless of source. Partition 0 of "dispatch-topic-partition-0".
-        verify(streamCatalog).registerExternalPartition(any(), anyInt(), anyLong(), any());
-        verify(stream, never()).close();
     }
 
     @Test
@@ -165,10 +156,7 @@ public class CompactionWorkerMaterializationDispatchTest {
                 .thenReturn(CompletableFuture.completedFuture(task));
         when(compactionTaskProvider.getQuarantinedTopic(topic)).thenReturn(null);
         when(compactTaskManager.tryLockTask(packagedTask.getTaskName())).thenReturn(true);
-        when(streamCatalog.registerExternalPartition(any(), anyInt(), anyLong(), any()))
-                .thenReturn(CompletableFuture.completedFuture(null));
-        when(streamCatalog.loadStream(any())).thenReturn(CompletableFuture.completedFuture(stream));
-        when(stream.effectiveMaterialization()).thenReturn(Optional.empty());
+        stubStream(task, Optional.empty());
 
         // Task-property fallback resolves the catalog NAME ("ch") but no connection — a placeholder.
         TableCatalog synthesized = new TableCatalog("ch", TableCatalogType.CLICKHOUSE, Map.of(), Map.of());
@@ -222,10 +210,7 @@ public class CompactionWorkerMaterializationDispatchTest {
                 .thenReturn(CompletableFuture.completedFuture(task));
         when(compactionTaskProvider.getQuarantinedTopic(topic)).thenReturn(null);
         when(compactTaskManager.tryLockTask(packagedTask.getTaskName())).thenReturn(true);
-        when(streamCatalog.registerExternalPartition(any(), anyInt(), anyLong(), any()))
-                .thenReturn(CompletableFuture.completedFuture(null));
-        when(streamCatalog.loadStream(any())).thenReturn(CompletableFuture.completedFuture(stream));
-        when(stream.effectiveMaterialization()).thenReturn(Optional.empty());
+        stubStream(task, Optional.empty());
 
         Thread thread = new Thread(worker);
         thread.start();
@@ -234,11 +219,10 @@ public class CompactionWorkerMaterializationDispatchTest {
         thread.join(2000);
 
         verify(materializationService, never()).materialize(any());
-        verify(stream).close();
     }
 
     @Test
-    public void failedStreamRegistrationLeavesWorkerToCloseHandleExactlyOnce() throws Exception {
+    public void taskLogOutsideMetadataLayoutIsRejectedWithoutCatalogMutation() throws Exception {
         CompactionWorker worker = createWorker();
         String topic = "default/closed-service-partition-0";
         CompactStreamTask task = new CompactStreamTask();
@@ -252,29 +236,19 @@ public class CompactionWorkerMaterializationDispatchTest {
                 .thenReturn(CompletableFuture.completedFuture(task));
         when(compactionTaskProvider.getQuarantinedTopic(topic)).thenReturn(null);
         when(compactTaskManager.tryLockTask(packagedTask.getTaskName())).thenReturn(true);
-        when(streamCatalog.registerExternalPartition(any(), anyInt(), anyLong(), any()))
-                .thenReturn(CompletableFuture.completedFuture(null));
-        when(streamCatalog.loadStream(any())).thenReturn(CompletableFuture.completedFuture(stream));
-        when(stream.effectiveMaterialization()).thenReturn(Optional.of(new ResolvedMaterialization(
-                new TableCatalog("delta-cat", TableCatalogType.DELTA, Map.of(), Map.of()),
-                new TableIdentifier("ns", "table"),
-                TableMaterializationPolicy.empty())));
-        doThrow(new IllegalStateException("Materialization service is closed"))
-                .when(materializationService).registerActiveStream(any(), any());
-        CountDownLatch streamClosed = new CountDownLatch(1);
-        doAnswer(invocation -> {
-            streamClosed.countDown();
-            return null;
-        }).when(stream).close();
+        when(streamCatalog.loadStream(any()))
+                .thenReturn(CompletableFuture.completedFuture(streamMetadata));
+        when(streamMetadata.layout()).thenReturn(streamLayout);
+        when(streamLayout.logIds()).thenReturn(CompletableFuture.completedFuture(List.of()));
 
         Thread thread = new Thread(worker);
         thread.start();
-        org.junit.jupiter.api.Assertions.assertTrue(streamClosed.await(10, TimeUnit.SECONDS));
+        Thread.sleep(500);
         thread.interrupt();
         thread.join(2000);
 
-        verify(stream, times(1)).close();
         verify(materializationService, never()).materialize(any());
+        verify(streamCatalog, never()).resolveMaterialization(any());
     }
 
     @Test
@@ -317,5 +291,15 @@ public class CompactionWorkerMaterializationDispatchTest {
 
         verify(compactionService).compactStream(task);
         verify(materializationService, never()).materialize(any());
+    }
+
+    private void stubStream(CompactStreamTask task, Optional<ResolvedMaterialization> resolved) {
+        when(streamCatalog.loadStream(any()))
+                .thenReturn(CompletableFuture.completedFuture(streamMetadata));
+        when(streamMetadata.layout()).thenReturn(streamLayout);
+        when(streamLayout.logIds()).thenReturn(CompletableFuture.completedFuture(
+                List.of(LogId.of(task.getStreamId()))));
+        when(streamCatalog.resolveMaterialization(any()))
+                .thenReturn(CompletableFuture.completedFuture(resolved));
     }
 }

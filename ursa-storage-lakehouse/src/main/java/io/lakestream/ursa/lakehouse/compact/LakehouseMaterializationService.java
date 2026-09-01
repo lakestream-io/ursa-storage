@@ -4,8 +4,8 @@
  */
 package io.lakestream.ursa.lakehouse.compact;
 
-import io.lakestream.api.Stream;
 import io.lakestream.api.StreamIdentifier;
+import io.lakestream.api.StreamMetadata;
 import io.lakestream.api.materialization.EvolutionPolicy;
 import io.lakestream.api.materialization.ResolvedMaterialization;
 import io.lakestream.api.materialization.TableCatalog;
@@ -49,14 +49,8 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.ServiceLoader;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executors;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import lombok.extern.slf4j.Slf4j;
 
 /**
@@ -77,35 +71,14 @@ import lombok.extern.slf4j.Slf4j;
  *       {@link LakehouseEntryMetadata} when present.</li>
  *   <li>{@link TableMaterializer#commit()} runs at the end of every task; the compaction task is then
  *       persisted (group commit) or retired from the committed materializers' write results.</li>
- *   <li>Opened stream handles are retained while a materializer uses them and closed after
- *       replacement, invalidation, or service shutdown.</li>
  * </ul>
- *
- * <p>The "stream handle" the factory needs is now supplied via
- * {@link #registerActiveStream(StreamIdentifier, Stream)}; the orchestrator
- * (T10's {@code CompactionWorker}) calls this once per stream before submitting
- * the first task. When the orchestrator does not supply a handle the service
- * raises {@link MaterializationException} so the failure surfaces through the
- * code-aware retry pipeline.
  */
 @Slf4j
 public class LakehouseMaterializationService implements MaterializationService {
 
-    private static final long RETAINED_STREAM_CLOSE_RETRY_INITIAL_DELAY_MILLIS = 10L;
-    private static final long RETAINED_STREAM_CLOSE_RETRY_MAX_DELAY_MILLIS = 1_000L;
-
     private MaterializationRuntime runtime;
     private MaterializationServiceConfig config;
     private final Map<TableCatalogType, TableMaterializerFactory> factories = new ConcurrentHashMap<>();
-    private final Map<StreamIdentifier, RetainedStream> activeStreams = new ConcurrentHashMap<>();
-    private final Set<RetainedStream> retiredStreams = ConcurrentHashMap.newKeySet();
-    private final Object activeStreamsLifecycleLock = new Object();
-    private final ScheduledExecutorService retainedStreamCloseRetryExecutor =
-            Executors.newSingleThreadScheduledExecutor(runnable -> {
-                Thread thread = new Thread(runnable, "lakehouse-retained-stream-close-retry");
-                thread.setDaemon(true);
-                return thread;
-            });
     private volatile boolean closed;
 
     /** Supplies Ursa WAL readers; tests may inject a stub reader for the read loop. */
@@ -182,6 +155,8 @@ public class LakehouseMaterializationService implements MaterializationService {
         }
 
         ResolvedMaterialization resolved = task.resolvedMaterialization();
+        StreamMetadata streamMetadata = task.streamMetadata();
+        StreamIdentifier streamId = streamMetadata.identifier();
         TableCatalog catalog = resolved.catalog();
         TableCatalogType catalogType = catalog.type();
         // A NONE catalog marks a managed-only (SBT / Ursa-protocol) materialization: SDT is disabled and
@@ -193,12 +168,12 @@ public class LakehouseMaterializationService implements MaterializationService {
         if (externalSink && factory == null) {
             String reason = "No TableMaterializerFactory registered for catalog type " + catalogType;
             runtime.metrics().recordSchemaEvolutionRejected(
-                    catalog.name(), catalogType, task.stream(), reason);
+                    catalog.name(), catalogType, streamId, reason);
             throw new MaterializationException(ExceptionCode.INTERNAL_ERROR, reason);
         }
 
         log.info("Materializing [{},{}) of stream {} into catalog {} ({}) table {}.{}",
-            task.startOffset(), task.endOffset(), task.stream().fullName(), catalog.name(), catalogType,
+            task.startOffset(), task.endOffset(), streamId.fullName(), catalog.name(), catalogType,
             resolved.tableIdentifier().namespace(), resolved.tableIdentifier().name());
 
         // Carry the task's properties (legacy DynamicConfigs: sdtCatalogName, identifierFields,
@@ -217,28 +192,15 @@ public class LakehouseMaterializationService implements MaterializationService {
         // multiple destinations at once; task completion is driven from their write results afterwards.
         // A managed-only (NONE) task has no external sink, so only the managed writer is built.
         List<TableMaterializer<?>> materializers = new ArrayList<>();
-        ActiveStreamLease streamLease = null;
         boolean committed = false;
         try {
-            if (externalSink || task.sourceTask() != null) {
-                streamLease = acquireActiveStream(task.stream());
-                if (streamLease == null) {
-                    throw new MaterializationException(ExceptionCode.INTERNAL_ERROR,
-                            "No active Stream handle registered for " + task.stream().fullName()
-                                    + "; call registerActiveStream() before materialize()");
-                }
-            }
-            Map<String, String> effectiveWriterProperties = streamLease == null
-                    ? sourceTaskProperties
-                    : writerProperties(sourceTaskProperties, streamLease.stream());
+            Map<String, String> effectiveWriterProperties =
+                    writerProperties(sourceTaskProperties, streamMetadata);
             if (externalSink) {
-                // Hold a lease for the entire materialization. Replacing or invalidating the
-                // registered handle retires it immediately, but cannot close it under an in-flight
-                // materializer.
                 MaterializationRuntime writerRuntime = runtime.withTaskProperties(
                         effectiveWriterProperties);
                 TableMaterializer<?> materializer = factory.create(
-                        resolved.effectivePolicy(), catalog, streamLease.stream(), writerRuntime);
+                        resolved.effectivePolicy(), catalog, streamMetadata, writerRuntime);
                 materializers.add(materializer);
                 // factory.create() may perform remote setup. If shutdown won the race while it was
                 // in flight, keep the result in the local list so finally closes it, then stop before
@@ -250,25 +212,25 @@ public class LakehouseMaterializationService implements MaterializationService {
             ensureOpen();
             if (materializers.isEmpty()) {
                 throw new MaterializationException(ExceptionCode.INTERNAL_ERROR,
-                        "No materializer available for stream " + task.stream().fullName()
+                        "No materializer available for stream " + streamId.fullName()
                                 + " (managed-only catalog but the managed writer was disabled or skipped)");
             }
             CommitResult result = writeAndCommit(materializers, task, task.sourceTopic());
             committed = true;
-            runtime.metrics().recordWritten(catalog.name(), catalogType, task.stream());
+            runtime.metrics().recordWritten(catalog.name(), catalogType, streamId);
             log.info("Committed task {} in MaterializationService for stream {}: {}",
-                task.sourceTopic(), task.stream().fullName(), result);
+                task.sourceTopic(), streamId.fullName(), result);
             // Persist (group-commit) or retire the compaction task from the committed materializers' write results.
             completeTask(materializers, task);
         } catch (MaterializationException e) {
             runtime.metrics().recordSchemaEvolutionRejected(
-                    catalog.name(), catalogType, task.stream(), e.getMessage());
+                    catalog.name(), catalogType, streamId, e.getMessage());
             throw e;
         } catch (RuntimeException e) {
             runtime.metrics().recordSchemaEvolutionRejected(
-                    catalog.name(), catalogType, task.stream(), e.getMessage());
+                    catalog.name(), catalogType, streamId, e.getMessage());
             throw new MaterializationException(ExceptionCode.INTERNAL_ERROR,
-                    "Materialization failed for stream " + task.stream().fullName(), e);
+                    "Materialization failed for stream " + streamId.fullName(), e);
         } finally {
             // Single-use materializers, not shared. On success writeAndCommit already committed (and
             // closed) them; on the failure path close any still-open to release resources. close()
@@ -279,12 +241,9 @@ public class LakehouseMaterializationService implements MaterializationService {
                         m.close();
                     } catch (RuntimeException ex) {
                         log.warn("Failed to close materializer for stream {} after a failed task",
-                                task.stream().fullName(), ex);
+                                streamId.fullName(), ex);
                     }
                 }
-            }
-            if (streamLease != null) {
-                streamLease.close();
             }
         }
     }
@@ -333,7 +292,7 @@ public class LakehouseMaterializationService implements MaterializationService {
                     ensureOpen();
                     long timestamp = extractTimestamp(entry);
                     MaterializationContext ctx = new MaterializationContext(
-                            task.stream(),
+                            task.streamMetadata().identifier(),
                             offset++,
                             timestamp,
                             Optional.empty(),
@@ -496,7 +455,7 @@ public class LakehouseMaterializationService implements MaterializationService {
         if (managedResults.isEmpty() && externalResults.isEmpty() && dltResults.isEmpty()) {
             // Inline-commit sink (e.g. ClickHouse) with SBT disabled: nothing to group-commit.
             log.info("Retiring inline-committed task {} for stream {}: no managed or external write results",
-                    sourceTask.getTaskName(), task.stream().fullName());
+                    sourceTask.getTaskName(), task.streamMetadata().identifier().fullName());
             retireInlineCommittedTask(task);
             return;
         }
@@ -580,8 +539,8 @@ public class LakehouseMaterializationService implements MaterializationService {
 
     private static Map<String, String> writerProperties(
             Map<String, String> taskProperties,
-            Stream stream) {
-        Map<String, String> streamProperties = stream.properties();
+            StreamMetadata streamMetadata) {
+        Map<String, String> streamProperties = streamMetadata.properties();
         if (streamProperties == null || streamProperties.isEmpty()) {
             return taskProperties;
         }
@@ -683,30 +642,13 @@ public class LakehouseMaterializationService implements MaterializationService {
     @Override
     public void invalidate(StreamIdentifier id) {
         Objects.requireNonNull(id, "id");
-        RetainedStream removed;
-        synchronized (activeStreamsLifecycleLock) {
-            removed = activeStreams.remove(id);
-            if (removed != null) {
-                removed.markRetired();
-            }
-        }
-        if (removed != null) {
-            removed.tryClose();
-        }
-        retryRetiredStreams();
+        // Materializers are task-scoped and StreamMetadata is immutable; there is no per-stream
+        // handle or sink state to release.
     }
 
     @Override
     public void close() {
-        List<RetainedStream> streamsToClose;
-        synchronized (activeStreamsLifecycleLock) {
-            closed = true;
-            streamsToClose = new ArrayList<>(activeStreams.values());
-            activeStreams.clear();
-            streamsToClose.forEach(RetainedStream::markRetired);
-        }
-        streamsToClose.forEach(RetainedStream::tryClose);
-        retryRetiredStreams();
+        closed = true;
         EntryProcessFactory sourceFactory;
         LakehouseFactory managedFactory;
         synchronized (this) {
@@ -731,7 +673,6 @@ public class LakehouseMaterializationService implements MaterializationService {
                 log.warn("Failed to close lakehouse factory during shutdown", e);
             }
         }
-        shutdownRetainedStreamCloseRetryExecutorIfDrained();
     }
 
     /**
@@ -770,207 +711,10 @@ public class LakehouseMaterializationService implements MaterializationService {
         factories.put(Objects.requireNonNull(type, "type"), Objects.requireNonNull(factory, "factory"));
     }
 
-    /**
-     * Registers the {@link Stream} handle the {@link TableMaterializerFactory} needs when it
-     * builds the materializer. The orchestrator is expected to call this once per stream before
-     * the first {@link #materialize(MaterializationTask)} invocation.
-     */
-    @Override
-    public void registerActiveStream(StreamIdentifier id, Stream stream) {
-        Objects.requireNonNull(id, "id");
-        Objects.requireNonNull(stream, "stream");
-        RetainedStream previous;
-        boolean reject;
-        synchronized (activeStreamsLifecycleLock) {
-            reject = closed;
-            if (reject) {
-                previous = null;
-            } else {
-                RetainedStream current = activeStreams.get(id);
-                if (current != null && current.stream() == stream) {
-                    return;
-                }
-                previous = activeStreams.put(id, new RetainedStream(stream));
-                if (previous != null) {
-                    previous.markRetired();
-                }
-            }
-        }
-        if (reject) {
-            throw new IllegalStateException("Materialization service is closed");
-        }
-        if (previous != null) {
-            previous.tryClose();
-        }
-        retryRetiredStreams();
-    }
-
-    private ActiveStreamLease acquireActiveStream(StreamIdentifier id) {
-        while (true) {
-            synchronized (activeStreamsLifecycleLock) {
-                if (closed) {
-                    return null;
-                }
-                RetainedStream retained = activeStreams.get(id);
-                if (retained == null) {
-                    return null;
-                }
-                ActiveStreamLease lease = retained.acquire();
-                if (lease != null) {
-                    return lease;
-                }
-                if (activeStreams.get(id) == retained) {
-                    return null;
-                }
-            }
-        }
-    }
-
-    private void retryRetiredStreams() {
-        for (RetainedStream retained : retiredStreams) {
-            retained.tryClose();
-        }
-    }
-
-    private void shutdownRetainedStreamCloseRetryExecutorIfDrained() {
-        if (closed && retiredStreams.isEmpty()) {
-            retainedStreamCloseRetryExecutor.shutdownNow();
-        }
-    }
-
-    private static boolean closeStream(Stream stream) {
-        try {
-            stream.close();
-            return true;
-        } catch (Exception | Error e) {
-            if (e instanceof InterruptedException) {
-                Thread.currentThread().interrupt();
-            }
-            log.warn("Failed to close active stream {}", stream, e);
-            return false;
-        }
-    }
-
     private void ensureOpen() {
         if (closed) {
             throw new MaterializationException(ExceptionCode.INTERNAL_ERROR,
                     "LakehouseMaterializationService is closed");
-        }
-    }
-
-    private final class RetainedStream {
-        private final Stream stream;
-        private int leases;
-        private boolean retired;
-        private boolean closing;
-        private boolean streamClosed;
-        private boolean retryScheduled;
-        private int closeFailures;
-
-        private RetainedStream(Stream stream) {
-            this.stream = stream;
-        }
-
-        private Stream stream() {
-            return stream;
-        }
-
-        private synchronized ActiveStreamLease acquire() {
-            if (retired) {
-                return null;
-            }
-            leases++;
-            return new ActiveStreamLease(this, stream);
-        }
-
-        private void markRetired() {
-            synchronized (this) {
-                retired = true;
-            }
-            retiredStreams.add(this);
-        }
-
-        private void release() {
-            synchronized (this) {
-                if (leases <= 0) {
-                    throw new IllegalStateException("Active stream lease released more than once");
-                }
-                leases--;
-            }
-            tryClose();
-        }
-
-        private void tryClose() {
-            synchronized (this) {
-                if (!retired || leases != 0 || closing || streamClosed) {
-                    return;
-                }
-                closing = true;
-            }
-            boolean closeSucceeded = closeStream(stream);
-            synchronized (this) {
-                closing = false;
-                if (closeSucceeded) {
-                    streamClosed = true;
-                } else {
-                    closeFailures++;
-                }
-            }
-            if (closeSucceeded) {
-                retiredStreams.remove(this);
-                shutdownRetainedStreamCloseRetryExecutorIfDrained();
-            } else {
-                scheduleRetry();
-            }
-        }
-
-        private void scheduleRetry() {
-            long retryDelayMillis;
-            synchronized (this) {
-                if (!retired || leases != 0 || closing || streamClosed || retryScheduled) {
-                    return;
-                }
-                retryScheduled = true;
-                int backoffShift = Math.min(Math.max(closeFailures - 1, 0), 10);
-                retryDelayMillis = Math.min(
-                        RETAINED_STREAM_CLOSE_RETRY_INITIAL_DELAY_MILLIS << backoffShift,
-                        RETAINED_STREAM_CLOSE_RETRY_MAX_DELAY_MILLIS);
-            }
-            try {
-                retainedStreamCloseRetryExecutor.schedule(() -> {
-                    synchronized (RetainedStream.this) {
-                        retryScheduled = false;
-                    }
-                    tryClose();
-                }, retryDelayMillis, TimeUnit.MILLISECONDS);
-            } catch (RejectedExecutionException rejected) {
-                synchronized (this) {
-                    retryScheduled = false;
-                }
-                log.error("Retained stream close retry executor rejected stream {}", stream, rejected);
-            }
-        }
-    }
-
-    private static final class ActiveStreamLease implements AutoCloseable {
-        private final RetainedStream retained;
-        private final Stream stream;
-        private final AtomicBoolean closed = new AtomicBoolean();
-
-        private ActiveStreamLease(RetainedStream retained, Stream stream) {
-            this.retained = retained;
-            this.stream = stream;
-        }
-
-        private Stream stream() {
-            return stream;
-        }
-
-        @Override
-        public void close() {
-            if (closed.compareAndSet(false, true)) {
-                retained.release();
-            }
         }
     }
 

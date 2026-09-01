@@ -11,8 +11,8 @@ Package: `io.lakestream.api`
 ### Level 2: Stream Catalog
 | Type | Kind | Purpose |
 |------|------|---------|
-| `StreamCatalog` | interface | Namespace + stream CRUD, `TableCatalog` CRUD, namespace/stream materialization policy CRUD, layout resolution, reader/writer factory |
-| `Stream` | interface | Opened stream handle: identifier, config, partitioning, schema, properties, materialization (override + effective), layout, writer, reader |
+| `StreamCatalog` | interface | Namespace + stream CRUD, `TableCatalog` CRUD, materialization resolution, layout resolution, and explicit log/reader/writer factories |
+| `StreamMetadata` | record | Immutable catalog snapshot: identity, config, partitioning, schema, properties, policy override, state, committed layout, and metadata version |
 | `StreamIdentifier` | record | Logical stream identity: `(namespace, name)` — use `fullName()` for display |
 | `Namespace` | record | Namespace metadata: name, properties, optional namespace-level materialization policy |
 
@@ -82,11 +82,13 @@ Package: `io.lakestream.api`
 - **All async**: operations return `CompletableFuture`
 - **Netty ByteBuf**: payloads use `io.netty.buffer.ByteBuf` to avoid conversion overhead with the internal storage engine
 - **Identity separate from operations**: `LogId` identifies a log; `LogStorage`/`Log` operates on it. `StreamIdentifier` identifies a stream; `StreamCatalog` operates on it
+- **Metadata is resource-free**: `createStream`/`loadStream` return `StreamMetadata`; use `openLog`, `openReader`, or `openWriter` for closeable data-plane resources
 - **No Partition type**: partitioning expressed through `StreamLayout` → `LogId` list
 - **Minimal dependencies**: only the API's small, explicitly declared runtime surface
 
 ## Pitfalls
 
 - `LogId.id()` maps directly to core's `long streamId` — they are the same value
+- `Log` handles come from `StreamCatalog.openLog(...)` and must be closed by their owner
 - `Log` and `LogCursor` are Level 0+ APIs that evolved beyond the original two-level design; they provide per-log managed operations directly
 - `StreamCatalog` API differs from the original design doc — check the actual interface, not `project-docs/lakestream-api-design.md`

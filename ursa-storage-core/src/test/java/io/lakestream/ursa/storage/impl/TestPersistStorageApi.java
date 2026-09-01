@@ -27,6 +27,7 @@ import io.lakestream.ursa.storage.EntryList;
 import io.lakestream.ursa.storage.FailureInjectedOxiaClient;
 import io.lakestream.ursa.storage.FailureInjectedStorage;
 import io.lakestream.ursa.storage.Key;
+import io.lakestream.ursa.storage.StorageApi.StreamWriteLease;
 import io.lakestream.ursa.storage.StreamProperties;
 import io.lakestream.ursa.storage.UrsaStorageTestBase;
 import io.lakestream.ursa.storage.Value;
@@ -47,6 +48,7 @@ import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -68,6 +70,7 @@ public class TestPersistStorageApi {
     protected PersistStorageApi storage;
     protected FailureInjectedStorage failureInjectedStorage;
     protected FailureInjectedOxiaClient client;
+    private final Map<Long, StreamWriteLease> writeLeases = new ConcurrentHashMap<>();
 
     @BeforeEach
     public void setup() throws Exception {
@@ -88,7 +91,61 @@ public class TestPersistStorageApi {
 
     @AfterEach
     public void cleanup() {
-        ursaStorageTestBase.cleanup();
+        if (client != null) {
+            client.setFailureMode(false);
+        }
+        if (failureInjectedStorage != null) {
+            failureInjectedStorage.setFailureMode(false);
+            failureInjectedStorage.setPartReadFailureMode(false);
+            failureInjectedStorage.resumePutOperations();
+        }
+        try {
+            writeLeases.values().forEach(StreamWriteLease::close);
+            writeLeases.clear();
+        } finally {
+            ursaStorageTestBase.cleanup();
+        }
+    }
+
+    private StreamWriteLease writeLease(long streamId) {
+        return writeLeases.computeIfAbsent(
+            streamId, id -> storage.acquireStreamWriteLease(id).join());
+    }
+
+    private void closeWriteLease(long streamId) {
+        StreamWriteLease lease = writeLeases.get(streamId);
+        if (lease != null) {
+            lease.close();
+            writeLeases.remove(streamId, lease);
+        }
+    }
+
+    private CompletableFuture<AddResult> appendWithLease(
+            long streamId, int numberOfMessages, ByteBuf data) {
+        writeLease(streamId);
+        return storage.append(streamId, numberOfMessages, data);
+    }
+
+    private CompletableFuture<AddResult> writeWithLease(
+            long streamId, int numberOfMessages, long initialOffset,
+            long cumulativeSize, ByteBuf data) {
+        writeLease(streamId);
+        return storage.write(
+            streamId, numberOfMessages, initialOffset, cumulativeSize, data);
+    }
+
+    private CompletableFuture<Long> softTrimWithLease(
+            long streamId, long offsetIncluded) {
+        writeLease(streamId);
+        return storage.softTrimStream(streamId, offsetIncluded);
+    }
+
+    private CompletableFuture<Void> compactIndexWithLease(
+            long streamId, long startOffset, long endOffset,
+            long endCumulativeSize, Value value) {
+        writeLease(streamId);
+        return storage.compactEntryIndex(
+            streamId, startOffset, endOffset, endCumulativeSize, value);
     }
 
     private String randomString() {
@@ -103,7 +160,7 @@ public class TestPersistStorageApi {
         for (int i = 0; i < 100; i++) {
             ByteBuf byteBuf = Unpooled.wrappedBuffer(("entry-" + i).getBytes());
             list.add(byteBuf);
-            ehs.add(storage.append(streamId, 1, byteBuf));
+            ehs.add(appendWithLease(streamId, 1, byteBuf));
         }
         CompletableFuture.allOf(ehs.toArray(new CompletableFuture[0])).join();
         for (ByteBuf byteBuf : list) {
@@ -141,7 +198,7 @@ public class TestPersistStorageApi {
             AtomicLong entryCounter = counter.computeIfAbsent(streamId, k -> new AtomicLong(0));
             List<CompletableFuture<AddResult>> result =
                     futures.computeIfAbsent(streamId, k -> new ArrayList<>());
-            result.add(storage.append(streamId, 1,
+            result.add(appendWithLease(streamId, 1,
                     Unpooled.wrappedBuffer(("entry-" + entryCounter.getAndIncrement()).getBytes())));
         }
         List<CompletableFuture<AddResult>> list = new ArrayList<>();
@@ -181,12 +238,12 @@ public class TestPersistStorageApi {
         eh = storage.getLastEntry(1).join().header();
         assertEquals(EntryHeader.NOT_FOUND, eh);
 
-        EntryHeader eh1 = storage.append(1, 1, Unpooled.wrappedBuffer("entry-1".getBytes())).join().header();
+        EntryHeader eh1 = appendWithLease(1, 1, Unpooled.wrappedBuffer("entry-1".getBytes())).join().header();
         assertEquals(0, eh1.offset());
         assertEquals(7, eh1.cumulativeSize());
         assertEquals(1, eh1.numberOfMessages());
 
-        EntryHeader eh2 = storage.append(1, 3, Unpooled.wrappedBuffer("entry-2".getBytes())).join().header();
+        EntryHeader eh2 = appendWithLease(1, 3, Unpooled.wrappedBuffer("entry-2".getBytes())).join().header();
         assertEquals(1, eh2.offset());
         assertEquals(14, eh2.cumulativeSize());
         assertEquals(3, eh2.numberOfMessages());
@@ -229,10 +286,11 @@ public class TestPersistStorageApi {
         eh = storage.getLastEntry(6).join().header();
         assertEquals(EntryHeader.NOT_FOUND, eh);
 
-        storage.softTrimStream(1, 0).join();
+        softTrimWithLease(1, 0).join();
         eh = storage.getFirstEntry(1).join().header();
         assertEquals(eh2, eh);
 
+        closeWriteLease(1);
         storage.deleteStream(1).join();
         eh = storage.getFirstEntry(1).join().header();
         assertEquals(EntryHeader.NOT_FOUND, eh);
@@ -278,10 +336,10 @@ public class TestPersistStorageApi {
                 int numMessages = 1;
                 ByteBuf payload =
                         Unpooled.wrappedBuffer(("message-" + (partitionIndex * partitionSize + i)).getBytes());
-                appendResults.add(storage.append(streamId, numMessages, payload));
+                appendResults.add(appendWithLease(streamId, numMessages, payload));
                 if (partitionIndex % 2 == 0) {
                     ByteBuf payload2 = Unpooled.wrappedBuffer(("message-" + differentEntryIndex++).getBytes());
-                    appendResults.add(storage.append(differentStreamId, numMessages, payload2));
+                    appendResults.add(appendWithLease(differentStreamId, numMessages, payload2));
                 }
             }
             CompletableFuture.allOf(appendResults.toArray(new CompletableFuture[0])).get();
@@ -310,12 +368,14 @@ public class TestPersistStorageApi {
         int dataSet = 1000;
         generateData(streamId, dataSet);
 
-        client.setFailureMode(true);
         try {
+            client.setFailureMode(true);
             storage.readEntries(streamId, 0, 10, 1000).get();
             fail();
         } catch (Exception e) {
             // expected
+        } finally {
+            client.setFailureMode(false);
         }
     }
 
@@ -327,12 +387,14 @@ public class TestPersistStorageApi {
         int dataSet = 1000;
         generateData(streamId, dataSet);
 
-        failureInjectedStorage.setFailureMode(true);
         try {
+            failureInjectedStorage.setFailureMode(true);
             storage.readEntries(streamId, 0, 10, 1000).get();
             fail();
         } catch (Exception e) {
             // expected
+        } finally {
+            failureInjectedStorage.setFailureMode(false);
         }
     }
 
@@ -345,8 +407,8 @@ public class TestPersistStorageApi {
         generateData(streamId, dataSet);
 
         // part read failure, it will return the success part
-        failureInjectedStorage.setPartReadFailureMode(true);
         try {
+            failureInjectedStorage.setPartReadFailureMode(true);
             List<Entry> entries = storage.readEntries(streamId, 0, 10, 1000).get();
             verifyResult(entries, 0, entries.size());
         } catch (Exception e) {
@@ -358,6 +420,8 @@ public class TestPersistStorageApi {
             verifyResult(entries, 20, entries.size());
         } catch (Exception e) {
             fail(e);
+        } finally {
+            failureInjectedStorage.setPartReadFailureMode(false);
         }
     }
 
@@ -366,11 +430,11 @@ public class TestPersistStorageApi {
         final long streamId = 1;
 
         ByteBuf data = Unpooled.wrappedBuffer("entry-1".getBytes());
-        EntryHeader firstAppendedEntry = storage.append(streamId, 1, data).join().header();
+        EntryHeader firstAppendedEntry = appendWithLease(streamId, 1, data).join().header();
         assertEquals(0, firstAppendedEntry.offset());
 
         ByteBuf data2 = Unpooled.wrappedBuffer("entry-2".getBytes());
-        EntryHeader secondAppendedEntry = storage.append(streamId, 1, data2).join().header();
+        EntryHeader secondAppendedEntry = appendWithLease(streamId, 1, data2).join().header();
         assertEquals(1, secondAppendedEntry.offset());
 
         Entry firstEntry = storage.read(streamId, firstAppendedEntry.offset()).join();
@@ -399,7 +463,7 @@ public class TestPersistStorageApi {
         for (int i = 0; i < numEntries; i++) {
             ByteBuf data = Unpooled.wrappedBuffer(("entry-" + i).getBytes(StandardCharsets.UTF_8));
             dataList.add(data);
-            EntryHeader header = storage.append(streamId, 1, data).join().header();
+            EntryHeader header = appendWithLease(streamId, 1, data).join().header();
             entryHeaders.add(header);
             assertEquals(i, header.offset());
         }
@@ -494,19 +558,19 @@ public class TestPersistStorageApi {
         long streamId = storage.generateStreamId().get();
 
         for (int i = 0; i < 10; i++) {
-            storage.append(streamId, 1, Unpooled.wrappedBuffer(("entry-" + i).getBytes())).get();
+            appendWithLease(streamId, 1, Unpooled.wrappedBuffer(("entry-" + i).getBytes())).get();
         }
 
         Position position = storage.getFirstUnCompactedPosition(streamId).get();
 
-        storage.compactEntryIndex(streamId, 0, 5, 10,
+        compactIndexWithLease(streamId, 0, 5, 10,
                 new Value(1, 1, 1, NORMAL, new Position("test"))).get();
         Position p1 = storage.getFirstUnCompactedPosition(streamId).get();
         assertNotEquals(position, p1);
         Position p2 = storage.readEntryIndex(streamId, 6).get().position();
         assertEquals(p1, p2);
 
-        storage.compactEntryIndex(streamId, 5, 10, 10,
+        compactIndexWithLease(streamId, 5, 10, 10,
                 new Value(1, 1, 1, NORMAL, new Position("test"))).get();
         Position p3 = storage.getFirstUnCompactedPosition(streamId).get();
         assertEquals(Position.NOT_FOUND, p3);
@@ -574,7 +638,7 @@ public class TestPersistStorageApi {
         eh = storage.getLastEntry(1).join().header();
         assertEquals(EntryHeader.NOT_FOUND, eh);
 
-        EntryHeader eh1 = storage.append(1, 1, Unpooled.wrappedBuffer("entry-1".getBytes())).join().header();
+        EntryHeader eh1 = appendWithLease(1, 1, Unpooled.wrappedBuffer("entry-1".getBytes())).join().header();
         assertEquals(0, eh1.offset());
         assertEquals(7, eh1.cumulativeSize());
         assertEquals(1, eh1.numberOfMessages());
@@ -585,7 +649,7 @@ public class TestPersistStorageApi {
         assertEquals("entry-1", entries.get(0).payload().toString(StandardCharsets.UTF_8));
         entries.forEach(e -> e.payload().release());
 
-        EntryHeader eh2 = storage.append(1, 100, Unpooled.wrappedBuffer("entry-2-100".getBytes())).join().header();
+        EntryHeader eh2 = appendWithLease(1, 100, Unpooled.wrappedBuffer("entry-2-100".getBytes())).join().header();
         assertEquals(1, eh2.offset());
         assertEquals(18, eh2.cumulativeSize());
         assertEquals(100, eh2.numberOfMessages());
@@ -691,7 +755,7 @@ public class TestPersistStorageApi {
 
         long lastEntryOffset = 10L; // lastEntryOffset represents the first offset of the last entry in the stream
         long cumulativeSize = data.readableBytes();
-        storage.write(streamId, numberOfMessages, lastEntryOffset, cumulativeSize, data).join();
+        writeWithLease(streamId, numberOfMessages, lastEntryOffset, cumulativeSize, data).join();
         // After this write: {streamId}-00000000000000000020-00000000000000000012
         assertEquals(10, storage.getFirstEntry(streamId).join().header().offset());
         assertEquals(10, storage.getLastEntry(streamId).join().header().offset());
@@ -705,7 +769,7 @@ public class TestPersistStorageApi {
         // Write another message to make sure the cumulativeSize works correctly
         lastEntryOffset += numberOfMessages;
         cumulativeSize += data.readableBytes();
-        storage.write(streamId, numberOfMessages, lastEntryOffset, cumulativeSize, data).join();
+        writeWithLease(streamId, numberOfMessages, lastEntryOffset, cumulativeSize, data).join();
         // After this write: {streamId}-00000000000000000030-00000000000000000024
         assertEquals(20, storage.getLastEntry(streamId).join().header().offset());
         assertEquals(numberOfMessages, storage.getLastEntry(streamId).join().header().numberOfMessages());
@@ -719,7 +783,7 @@ public class TestPersistStorageApi {
         // Make sure that we can continue to append entries after the initial offset
         testMsg = "test-entry-2";
         lastEntryOffset += numberOfMessages;
-        storage.append(streamId, 1, Unpooled.wrappedBuffer(testMsg.getBytes())).get();
+        appendWithLease(streamId, 1, Unpooled.wrappedBuffer(testMsg.getBytes())).get();
         // After this append: {streamId}-00000000000000000031-00000000000000000036
         cumulativeSize += testMsg.getBytes().length;
         assertEquals(30, storage.getLastEntry(streamId).join().header().offset());
@@ -735,24 +799,24 @@ public class TestPersistStorageApi {
         data = Unpooled.wrappedBuffer(testMsg.getBytes());
         cumulativeSize += data.readableBytes();
         lastEntryOffset += 1;
-        storage.write(streamId, numberOfMessages, lastEntryOffset, cumulativeSize, data);
+        writeWithLease(streamId, numberOfMessages, lastEntryOffset, cumulativeSize, data);
         // After this write: {streamId}-00000000000000000041-00000000000000000048 (inflight)
         final var finalData = Unpooled.wrappedBuffer("test".getBytes());
 
         if (ursaStorageTestBase.getConfig().getUrsaConfig().getIndexSerializeFormatVersion() > 2) {
-            var future = storage.write(streamId, numberOfMessages, 100, finalData.readableBytes(), finalData);
+            var future = writeWithLease(streamId, numberOfMessages, 100, finalData.readableBytes(), finalData);
             var exception = assertThrows(CompletionException.class, () -> future.join());
             assertInstanceOf(IllegalArgumentException.class, exception.getCause());
             assertEquals("Invalid initial offset 100, expected 41", exception.getCause().getMessage());
         } else {
-            var future = storage.write(streamId, numberOfMessages, 20, 24, finalData);
+            var future = writeWithLease(streamId, numberOfMessages, 20, 24, finalData);
             var exception = assertThrows(CompletionException.class, () -> future.join());
             assertInstanceOf(io.oxia.client.api.exceptions.KeyAlreadyExistsException.class, exception.getCause());
         }
 
         var exception = assertThrows(
                 CompletionException.class,
-                () -> storage.write(streamId, numberOfMessages, 100, -1, finalData)
+                () -> writeWithLease(streamId, numberOfMessages, 100, -1, finalData)
                         .join());
         assertInstanceOf(IllegalArgumentException.class, exception.getCause());
         assertEquals("cumulativeSize must be set if initialOffset is set", exception.getCause().getMessage());
@@ -766,31 +830,49 @@ public class TestPersistStorageApi {
         final var key1 = Optional.of("streams/testFence1/partition-0");
         final var streamId1 = storage.generateStreamId(key1).get();
 
-        final Function<Long, CompletableFuture<AddResult>> append = streamId -> storage.append(streamId, 1,
-                Unpooled.wrappedBuffer("msg".getBytes()));
+        final Function<Long, CompletableFuture<AddResult>> append = streamId -> {
+            final var payload = Unpooled.wrappedBuffer("msg".getBytes());
+            final CompletableFuture<AddResult> appendFuture;
+            try {
+                appendFuture = appendWithLease(streamId, 1, payload);
+            } catch (RuntimeException | Error failure) {
+                payload.release();
+                throw failure;
+            }
+            appendFuture.whenComplete((__, ___) -> payload.release());
+            return appendFuture;
+        };
 
-        // the next flush will happen after WRITE_BUFFER_FLUSH_MS ms
+        writeLease(streamId0);
+        writeLease(streamId1);
         assertEquals(append.apply(streamId0).get(3, TimeUnit.SECONDS).header().offset(), 0L);
         final var appendFutures = new ArrayList<CompletableFuture<AddResult>>();
-        for (int i = 0; i < 5; i++) {
-            appendFutures.add(append.apply(streamId0));
-            appendFutures.add(append.apply(streamId1));
+        failureInjectedStorage.pausePutOperations();
+        try {
+            for (int i = 0; i < 5; i++) {
+                appendFutures.add(append.apply(streamId0));
+                appendFutures.add(append.apply(streamId1));
+            }
+            assertTrue(appendFutures.stream().noneMatch(CompletableFuture::isDone));
+            storage.getStreamStateManager().setState(streamId0, LogState.FENCED);
+        } finally {
+            failureInjectedStorage.resumePutOperations();
         }
-        Thread.sleep(WRITE_BUFFER_FLUSH_MS / 2);
-        storage.getStreamStateManager().setState(streamId0, LogState.FENCED);
+
         // Pending append operations will eventually fail
         for (int i = 0; i < appendFutures.size(); i++) {
-            try {
-                final var result = appendFutures.get(i).get();
-                if (i % 2 == 0) {
-                    fail("future " + i + " succeeded");
-                } else {
-                    assertEquals(result.header().offset(), i / 2);
-                }
-            } catch (ExecutionException e) {
-                assertInstanceOf(LogFencedException.class, e.getCause());
+            final var appendFuture = appendFutures.get(i);
+            if (i % 2 == 0) {
+                final var failure = assertThrows(
+                        ExecutionException.class,
+                        () -> appendFuture.get(3, TimeUnit.SECONDS));
+                assertInstanceOf(LogFencedException.class, failure.getCause());
+            } else {
+                final var result = appendFuture.get(3, TimeUnit.SECONDS);
+                assertEquals(i / 2, result.header().offset());
             }
         }
+        assertEquals(0L, storage.getLastEntry(streamId0).get(3, TimeUnit.SECONDS).header().offset());
         // The new append operation will fail immediately
         try {
             append.apply(streamId0).getNow(null);
@@ -800,9 +882,12 @@ public class TestPersistStorageApi {
         }
 
         assertEquals(streamId0, storage.generateStreamId(key0).get());
-        assertEquals(LogState.NORMAL, storage.getStreamStateManager().getState(streamId0));
-        // Append will succeed and the previous failed operations didn't modify the Oxia
-        assertEquals(1L, append.apply(streamId0).get(3, TimeUnit.SECONDS).header().offset());
+        assertEquals(LogState.FENCED, storage.getStreamStateManager().getState(streamId0));
+        // A numeric stream ID is terminal once fenced, even if its keyed mapping is resolved again.
+        ExecutionException fenced = assertThrows(
+            ExecutionException.class,
+            () -> append.apply(streamId0).get(3, TimeUnit.SECONDS));
+        assertInstanceOf(LogFencedException.class, fenced.getCause());
     }
 
     @Test
@@ -812,21 +897,21 @@ public class TestPersistStorageApi {
         assertEquals(-1L, storage.getMarkDeletedOffsetWithVersion(streamId).get().getLeft());
         ByteBuf byteBuf = Unpooled.wrappedBuffer(("entry").getBytes());
         for (int i = 0; i < 3; i++) {
-            storage.append(streamId, 100, byteBuf).get();
+            appendWithLease(streamId, 100, byteBuf).get();
         }
         // Update to 100
-        assertEquals(100L, storage.softTrimStream(streamId, 99L).get());
+        assertEquals(100L, softTrimWithLease(streamId, 99L).get());
         assertEquals(100L, storage.getMarkDeletedOffsetWithVersion(streamId).get().getLeft());
         // Should only move forward, not backward
-        storage.softTrimStream(streamId, 199L).get();
+        softTrimWithLease(streamId, 199L).get();
         assertEquals(200L, storage.getMarkDeletedOffsetWithVersion(streamId).get().getLeft());
-        storage.softTrimStream(streamId, 150L).get();
+        softTrimWithLease(streamId, 150L).get();
         assertEquals(200L, storage.getMarkDeletedOffsetWithVersion(streamId).get().getLeft());
 
         // Currently there are 3 entries in the stream: [0,99], [100,199], [200,299]
         // Ensure that truncateStreamHead will leave at least one entry in the stream. So truncate to the [299], the
         // markDeletedOffset will still be pointed to 200L to avoid cleaning the last entry [200,299].
-        storage.softTrimStream(streamId, 299L).get();
+        softTrimWithLease(streamId, 299L).get();
         assertEquals(200L, storage.getMarkDeletedOffsetWithVersion(streamId).get().getLeft());
     }
 
@@ -836,10 +921,10 @@ public class TestPersistStorageApi {
         List<CompletableFuture<Long>> updates = new ArrayList<>();
         ByteBuf byteBuf = Unpooled.wrappedBuffer(("entry").getBytes());
         for (int i = 0; i < 5; i++) {// [0,99] [100,199] [200, 299] [300,399] [400,499]
-            storage.append(streamId, 100, byteBuf).get();
+            appendWithLease(streamId, 100, byteBuf).get();
         }
         for (int i = 0; i < 3; i++) {
-            updates.add(storage.softTrimStream(streamId, i * 100L));
+            updates.add(softTrimWithLease(streamId, i * 100L));
         }
         CompletableFuture.allOf(updates.toArray(new CompletableFuture[0])).get();
         // The final offset should be the highest one
@@ -857,10 +942,10 @@ public class TestPersistStorageApi {
         long streamId = storage.generateStreamId().get();
         ByteBuf byteBuf = Unpooled.wrappedBuffer(("entry").getBytes());
         for (int i = 0; i < 4; i++) {
-            storage.append(streamId, 100, byteBuf).get();
+            appendWithLease(streamId, 100, byteBuf).get();
         }
         // Set markDeletedOffset to 100
-        assertEquals(100L, storage.softTrimStream(streamId, 99L).get());
+        assertEquals(100L, softTrimWithLease(streamId, 99L).get());
         // Manually update the markDeletedOffset to simulate a concurrent update (simulate version conflict)
         storage.getStorageOxiaClient().put(
                 io.lakestream.ursa.storage.impl.StorageFormat.MARK_DELETED_OFFSET_PATH + "/" + streamId,
@@ -868,13 +953,13 @@ public class TestPersistStorageApi {
                 Set.of(PutOption.PartitionKey(String.valueOf(streamId)))
         ).get();
         // Now try to set it back to 100, should not move backward
-        assertEquals(150L, storage.softTrimStream(streamId, 99L).get());
+        assertEquals(150L, softTrimWithLease(streamId, 99L).get());
         assertEquals(150L, storage.getMarkDeletedOffsetWithVersion(streamId).get().getLeft());
         // Try to set it to 200, should succeed
-        assertEquals(200L, storage.softTrimStream(streamId, 199L).get());
+        assertEquals(200L, softTrimWithLease(streamId, 199L).get());
         assertEquals(200L, storage.getMarkDeletedOffsetWithVersion(streamId).get().getLeft());
         // Idempotency: set to 200 again
-        assertEquals(200L, storage.softTrimStream(streamId, 199L).get());
+        assertEquals(200L, softTrimWithLease(streamId, 199L).get());
         assertEquals(200L, storage.getMarkDeletedOffsetWithVersion(streamId).get().getLeft());
     }
 
@@ -883,10 +968,10 @@ public class TestPersistStorageApi {
         long streamId = storage.generateStreamId().get();
         ByteBuf byteBuf = Unpooled.wrappedBuffer(("entry").getBytes());
         for (int i = 0; i < 5; i++) {
-            storage.append(streamId, 100, byteBuf).get();
+            appendWithLease(streamId, 100, byteBuf).get();
         }
         // Set markDeletedOffset to 200
-        storage.softTrimStream(streamId, 199L).get();
+        softTrimWithLease(streamId, 199L).get();
 
         // Get first entry including trimmed offset
         var firstEntry = storage.getFirstEntry(streamId, true).get();
@@ -915,10 +1000,10 @@ public class TestPersistStorageApi {
         final var entry1 = "entry-1";
         final var entry2 = "entry-2";
         final var entry3 = "entry-3";
-        storage.append(streamId, 100, Unpooled.wrappedBuffer(entry1.getBytes())).get();
-        storage.append(streamId, 100, Unpooled.wrappedBuffer(entry2.getBytes())).get();
-        storage.append(streamId, 100, Unpooled.wrappedBuffer(entry3.getBytes())).get();
-        storage.softTrimStream(streamId, 99L).get();
+        appendWithLease(streamId, 100, Unpooled.wrappedBuffer(entry1.getBytes())).get();
+        appendWithLease(streamId, 100, Unpooled.wrappedBuffer(entry2.getBytes())).get();
+        appendWithLease(streamId, 100, Unpooled.wrappedBuffer(entry3.getBytes())).get();
+        softTrimWithLease(streamId, 99L).get();
 
         var entry = storage.read(streamId, 0).join();
         assertEntry(entry, 100L, entry2);

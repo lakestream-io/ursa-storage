@@ -289,8 +289,10 @@ public class AbstractCommitRunner {
                 }
                 extraMetadata.put(ManagedTableFileIndex.NAME, fileIndex.serializeToString());
             }
-            storageApi.compactEntryIndex(streamId, realStartOffset + 1, realEndOffset,
-                cumulativeSize, value).get();
+            storageApi.withStreamWriteLease(streamId, ignoredLease ->
+                storageApi.compactEntryIndex(
+                    streamId, realStartOffset + 1, realEndOffset,
+                    cumulativeSize, value)).get();
         } catch (Exception e) {
             String msg = String.format("Failed to update oxia location for stream %d "
                                        + "startOffset %d endOffset %d to %s",
