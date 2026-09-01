@@ -97,6 +97,7 @@ public class TestPersistStorageApi {
         if (failureInjectedStorage != null) {
             failureInjectedStorage.setFailureMode(false);
             failureInjectedStorage.setPartReadFailureMode(false);
+            failureInjectedStorage.resumePutOperations();
         }
         try {
             writeLeases.values().forEach(StreamWriteLease::close);
@@ -829,31 +830,49 @@ public class TestPersistStorageApi {
         final var key1 = Optional.of("streams/testFence1/partition-0");
         final var streamId1 = storage.generateStreamId(key1).get();
 
-        final Function<Long, CompletableFuture<AddResult>> append = streamId -> appendWithLease(streamId, 1,
-                Unpooled.wrappedBuffer("msg".getBytes()));
+        final Function<Long, CompletableFuture<AddResult>> append = streamId -> {
+            final var payload = Unpooled.wrappedBuffer("msg".getBytes());
+            final CompletableFuture<AddResult> appendFuture;
+            try {
+                appendFuture = appendWithLease(streamId, 1, payload);
+            } catch (RuntimeException | Error failure) {
+                payload.release();
+                throw failure;
+            }
+            appendFuture.whenComplete((__, ___) -> payload.release());
+            return appendFuture;
+        };
 
-        // the next flush will happen after WRITE_BUFFER_FLUSH_MS ms
+        writeLease(streamId0);
+        writeLease(streamId1);
         assertEquals(append.apply(streamId0).get(3, TimeUnit.SECONDS).header().offset(), 0L);
         final var appendFutures = new ArrayList<CompletableFuture<AddResult>>();
-        for (int i = 0; i < 5; i++) {
-            appendFutures.add(append.apply(streamId0));
-            appendFutures.add(append.apply(streamId1));
+        failureInjectedStorage.pausePutOperations();
+        try {
+            for (int i = 0; i < 5; i++) {
+                appendFutures.add(append.apply(streamId0));
+                appendFutures.add(append.apply(streamId1));
+            }
+            assertTrue(appendFutures.stream().noneMatch(CompletableFuture::isDone));
+            storage.getStreamStateManager().setState(streamId0, LogState.FENCED);
+        } finally {
+            failureInjectedStorage.resumePutOperations();
         }
-        Thread.sleep(WRITE_BUFFER_FLUSH_MS / 2);
-        storage.getStreamStateManager().setState(streamId0, LogState.FENCED);
+
         // Pending append operations will eventually fail
         for (int i = 0; i < appendFutures.size(); i++) {
-            try {
-                final var result = appendFutures.get(i).get();
-                if (i % 2 == 0) {
-                    fail("future " + i + " succeeded");
-                } else {
-                    assertEquals(result.header().offset(), i / 2);
-                }
-            } catch (ExecutionException e) {
-                assertInstanceOf(LogFencedException.class, e.getCause());
+            final var appendFuture = appendFutures.get(i);
+            if (i % 2 == 0) {
+                final var failure = assertThrows(
+                        ExecutionException.class,
+                        () -> appendFuture.get(3, TimeUnit.SECONDS));
+                assertInstanceOf(LogFencedException.class, failure.getCause());
+            } else {
+                final var result = appendFuture.get(3, TimeUnit.SECONDS);
+                assertEquals(i / 2, result.header().offset());
             }
         }
+        assertEquals(0L, storage.getLastEntry(streamId0).get(3, TimeUnit.SECONDS).header().offset());
         // The new append operation will fail immediately
         try {
             append.apply(streamId0).getNow(null);
