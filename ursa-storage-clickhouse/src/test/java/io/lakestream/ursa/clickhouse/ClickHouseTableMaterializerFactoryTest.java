@@ -10,8 +10,8 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-import io.lakestream.api.Stream;
 import io.lakestream.api.StreamIdentifier;
+import io.lakestream.api.StreamMetadata;
 import io.lakestream.api.materialization.CommitConfig;
 import io.lakestream.api.materialization.FrameworkConf;
 import io.lakestream.api.materialization.TableCatalog;
@@ -172,8 +172,8 @@ class ClickHouseTableMaterializerFactoryTest {
 
     @Test
     void recreatedKafkaStreamsUseLogicalTopicOnlyForSchemaLookup() {
-        Stream oldStream = fakeStream("default", "orders-old-topic-id");
-        Stream newStream = fakeStream("default", "orders-new-topic-id");
+        StreamMetadata oldStream = fakeStream("default", "orders-old-topic-id");
+        StreamMetadata newStream = fakeStream("default", "orders-new-topic-id");
         MaterializationRuntime kafkaRuntime = runtimeWith(mock(KafkaSchemaService.class))
                 .withTaskProperties(Map.of(KafkaSourceMetadata.TOPIC_NAME_PROPERTY, "orders"));
 
@@ -186,7 +186,7 @@ class ClickHouseTableMaterializerFactoryTest {
 
     @Test
     void storagePartitionFallbackDerivesLogicalSchemaTopic() {
-        Stream stream = fakeStream("default", "orders-partition-3");
+        StreamMetadata stream = fakeStream("default", "orders-partition-3");
         MaterializationRuntime kafkaRuntime = runtimeWith(mock(KafkaSchemaService.class));
 
         assertThat(ClickHouseTableMaterializerFactory.sourceTopic(stream, kafkaRuntime))
@@ -289,10 +289,10 @@ class ClickHouseTableMaterializerFactoryTest {
                 Map.of());
     }
 
-    private static Stream fakeStream(String namespace, String name) {
-        Stream stream = mock(Stream.class);
-        when(stream.identifier()).thenReturn(StreamIdentifier.of(namespace, name));
-        return stream;
+    private static StreamMetadata fakeStream(String namespace, String name) {
+        StreamMetadata metadata = mock(StreamMetadata.class);
+        when(metadata.identifier()).thenReturn(StreamIdentifier.of(namespace, name));
+        return metadata;
     }
 
     @SuppressWarnings("unchecked")

@@ -16,7 +16,8 @@ import java.util.function.Predicate;
  * Internally uses {@link LogStorage} for data operations, a shared entry index cache
  * for metadata queries, and {@code UnifiedStreamReader} for transparent RAW/PARQUET reads.
  *
- * <p>Obtained via {@link Stream#getLog(LogId)}.
+ * <p>Obtained via {@link StreamCatalog#openLog(StreamIdentifier, LogId)}. The returned handle owns
+ * its data-plane resources and must be closed when no longer needed.
  *
  * <p>Thread safety: implementations must be safe for concurrent use.
  */
@@ -33,7 +34,8 @@ public interface Log extends AutoCloseable {
      * Appends one entry containing the given number of records to the log.
      *
      * @param numberOfRecords the number of records in the entry being written (&ge; 1)
-     * @param data the entry payload
+     * @param data the entry payload; the caller retains ownership of its reference until the
+     *             returned future completes and must then release that reference exactly once
      * @return a future resolving to the header of the written entry
      */
     CompletableFuture<LogEntryHeader> append(int numberOfRecords, ByteBuf data);
@@ -137,13 +139,6 @@ public interface Log extends AutoCloseable {
     CompletableFuture<Long> softTrim(long offsetIncluded);
 
     /**
-     * Deletes the entire log.
-     *
-     * @return a future that completes when the log is deleted
-     */
-    CompletableFuture<Void> delete();
-
-    /**
      * Returns the underlying {@link LogStorage} for advanced operations.
      * Callers should prefer the higher-level methods on {@code Log} when possible.
      *
@@ -178,11 +173,6 @@ public interface Log extends AutoCloseable {
      * @return the message count, or -1 if not available
      */
     long getMessageCount(long startOffset, long endOffset);
-
-    /**
-     * Sets this log's stream state to NORMAL (complement of {@link #fence()}).
-     */
-    void activate();
 
     /**
      * Fences this log — subsequent append operations will fail.

@@ -24,7 +24,8 @@ public interface StreamWriter extends AutoCloseable {
      *
      * @param key routing context for selecting the target log
      * @param numberOfRecords the number of records in the entry being written (≥ 1)
-     * @param data the entry payload
+     * @param data the entry payload; the caller retains ownership of its reference until the
+     *             returned future completes and must then release that reference exactly once
      * @return a future resolving to the write result (target log ID and offset)
      */
     CompletableFuture<WriteResult> write(RoutingKey key, int numberOfRecords, ByteBuf data);

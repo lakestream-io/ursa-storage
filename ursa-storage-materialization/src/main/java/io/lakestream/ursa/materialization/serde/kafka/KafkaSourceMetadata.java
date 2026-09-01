@@ -9,7 +9,7 @@ import java.util.Map;
 /** Metadata that connects a UUID-qualified storage stream to its logical Kafka topic. */
 public final class KafkaSourceMetadata {
 
-    /** Stream property written by the Kafka integration during external-stream registration. */
+    /** Stream property supplied by the Kafka integration for logical topic resolution. */
     public static final String TOPIC_NAME_PROPERTY = "lakestream.kafka.topic.name";
 
     private KafkaSourceMetadata() {

@@ -8,6 +8,8 @@ import static io.lakestream.ursa.storage.impl.StorageFormat.FIRST_UNCOMPACTED_OF
 import static io.lakestream.ursa.storage.impl.StorageFormat.STREAM_ID_GENERATOR_PATH;
 import static io.lakestream.ursa.storage.impl.StorageFormat.STREAM_ID_GENERATOR_VALUE;
 import static io.lakestream.ursa.storage.impl.StorageFormat.STREAM_REGISTER_PATH;
+import static io.lakestream.ursa.storage.impl.StorageFormat.STREAM_WRITE_FENCE_PATH;
+import static io.lakestream.ursa.storage.impl.StorageFormat.STREAM_WRITE_LEASE_PATH;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.ObjectReader;
@@ -26,8 +28,12 @@ import io.lakestream.ursa.metrics.Unit;
 import io.lakestream.ursa.storage.AddResult;
 import io.lakestream.ursa.storage.Entry;
 import io.lakestream.ursa.storage.EntryList;
+import io.lakestream.ursa.storage.FileStorage;
 import io.lakestream.ursa.storage.Key;
+import io.lakestream.ursa.storage.OwnedResultFutures;
 import io.lakestream.ursa.storage.StorageApi;
+import io.lakestream.ursa.storage.StorageApi.StreamWriteLease;
+import io.lakestream.ursa.storage.StorageApi.StreamWriteLeaseDrainTimeoutException;
 import io.lakestream.ursa.storage.StreamProperties;
 import io.lakestream.ursa.storage.Value;
 import io.lakestream.ursa.storage.WalStorage;
@@ -46,22 +52,28 @@ import io.oxia.client.api.PutResult;
 import io.oxia.client.api.RangeScanConsumer;
 import io.oxia.client.api.exceptions.KeyAlreadyExistsException;
 import io.oxia.client.api.exceptions.UnexpectedVersionIdException;
+import io.oxia.client.api.options.DeleteOption;
 import io.oxia.client.api.options.DeleteRangeOption;
 import io.oxia.client.api.options.GetOption;
+import io.oxia.client.api.options.ListOption;
 import io.oxia.client.api.options.PutOption;
 import io.oxia.client.api.options.RangeScanOption;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.collections4.map.HashedMap;
@@ -74,6 +86,11 @@ public class PersistStorageApi implements StorageApi {
     private static final long CONDITIONAL_MAPPING_DELETE_RETRY_DELAY_MS = 10L;
     private static final int MAX_KEYED_ALLOCATION_RETRIES = 3;
     private static final long KEYED_ALLOCATION_RETRY_DELAY_MS = 10L;
+    private static final Duration DEFAULT_STREAM_WRITE_LEASE_DRAIN_TIMEOUT = Duration.ofSeconds(30);
+    private static final long STREAM_WRITE_LEASE_DRAIN_POLL_INTERVAL_MS = 25L;
+    private static final long STREAM_WRITE_LEASE_RELEASE_INITIAL_RETRY_DELAY_MS = 10L;
+    private static final long STREAM_WRITE_LEASE_RELEASE_MAX_RETRY_DELAY_MS = 1_000L;
+    private static final byte[] STREAM_WRITE_LIFECYCLE_MARKER = new byte[] {1};
 
     private final StorageFormat storageFormat;
     private final AsyncOxiaClient oxiaClient;
@@ -96,6 +113,82 @@ public class PersistStorageApi implements StorageApi {
     private final Counter readEntrySizeCounter;
     private final Counter lessThanBatchSizeReadCounter;
     private final LogStateManager streamStateManager;
+    private final ConcurrentHashMap<Long, LocalWriteGate> localWriteGates =
+            new ConcurrentHashMap<>();
+
+    /**
+     * Process-local side of the durable lease protocol.
+     *
+     * <p>The Oxia lease protects a process from a remote purge. This gate additionally makes lease
+     * close atomic with accepting and draining mutations in this process, so the durable lease is
+     * never removed while a mutation it protects can still publish storage state.
+     */
+    private static final class LocalWriteGate {
+
+        private int openLeases;
+        private int inFlightMutations;
+        private CompletableFuture<Void> lastLeaseDrain;
+
+        synchronized void openLease() {
+            openLeases++;
+            if (lastLeaseDrain != null) {
+                CompletableFuture<Void> drain = lastLeaseDrain;
+                lastLeaseDrain = null;
+                drain.complete(null);
+            }
+        }
+
+        synchronized CompletableFuture<Void> closeLease() {
+            if (openLeases <= 0) {
+                throw new IllegalStateException("Local write lease is already closed");
+            }
+            openLeases--;
+            if (openLeases > 0 || inFlightMutations == 0) {
+                return CompletableFuture.completedFuture(null);
+            }
+            if (lastLeaseDrain == null) {
+                lastLeaseDrain = new CompletableFuture<>();
+            }
+            return lastLeaseDrain;
+        }
+
+        synchronized boolean enterMutation() {
+            if (openLeases <= 0) {
+                return false;
+            }
+            inFlightMutations++;
+            return true;
+        }
+
+        synchronized void exitMutation() {
+            if (inFlightMutations <= 0) {
+                throw new IllegalStateException("No local write mutation is active");
+            }
+            inFlightMutations--;
+            if (inFlightMutations == 0 && openLeases == 0 && lastLeaseDrain != null) {
+                CompletableFuture<Void> drain = lastLeaseDrain;
+                lastLeaseDrain = null;
+                drain.complete(null);
+            }
+        }
+
+        synchronized boolean isIdle() {
+            return openLeases == 0 && inFlightMutations == 0 && lastLeaseDrain == null;
+        }
+    }
+
+    private static final class LocalWritePermit {
+
+        private final LocalWriteGate gate;
+
+        private LocalWritePermit(LocalWriteGate gate) {
+            this.gate = gate;
+        }
+
+        void close() {
+            gate.exitMutation();
+        }
+    }
 
     public PersistStorageApi(StorageConfig config, AsyncOxiaClient oxiaClient, WalStorage storage,
                              InstrumentProvider instrumentProvider, StorageFormat storageFormat,
@@ -275,10 +368,7 @@ public class PersistStorageApi implements StorageApi {
 
     @Override
     public CompletableFuture<StreamIdAllocation> allocateStreamId(Optional<String> key) {
-        return internalAllocateStreamId(key, 0).thenApply(allocation -> {
-            streamStateManager.setState(allocation.streamId(), LogState.NORMAL);
-            return allocation;
-        });
+        return internalAllocateStreamId(key, 0);
     }
 
     @Override
@@ -297,11 +387,7 @@ public class PersistStorageApi implements StorageApi {
                 "Legacy mapping owner cannot allocate lifecycle-aware stream IDs"));
         }
         return internalAllocateOwnedStreamId(
-                key, owner, acknowledgedFence, 0)
-            .thenApply(allocation -> {
-                streamStateManager.setState(allocation.streamId(), LogState.NORMAL);
-                return allocation;
-            });
+                key, owner, acknowledgedFence, 0);
     }
 
     @Override
@@ -325,10 +411,7 @@ public class PersistStorageApi implements StorageApi {
         }
         return internalBindStreamIdMapping(
                 key, streamId, owner, acknowledgedFence, 0)
-            .thenApply(allocation -> {
-                streamStateManager.setState(allocation.streamId(), LogState.NORMAL);
-                return null;
-            });
+            .thenApply(__ -> null);
     }
 
     @Override
@@ -1072,6 +1155,13 @@ public class PersistStorageApi implements StorageApi {
     @Deprecated
     public CompletableFuture<PutResult> writeNonCompactedIndex(long streamId, int numberOfMessages, int entrySize,
                                                  Position position) {
+        return withLocalWritePermit(streamId,
+            () -> writeNonCompactedIndexInternal(
+                streamId, numberOfMessages, entrySize, position));
+    }
+
+    private CompletableFuture<PutResult> writeNonCompactedIndexInternal(
+            long streamId, int numberOfMessages, int entrySize, Position position) {
         return LogStateUtil.toException(streamStateManager.getState(streamId), streamId)
                 .<CompletableFuture<PutResult>>map(CompletableFuture::failedFuture)
                 .orElseGet(() -> oxiaClient.put(getStreamIdKey(streamId),
@@ -1085,6 +1175,15 @@ public class PersistStorageApi implements StorageApi {
     public CompletableFuture<PutResult> writeNonCompactedIndex(long streamId, int numberOfMessages, int entrySize,
                                                                long initialOffset, long cumulativeSize,
                                                                Position position) {
+        return withLocalWritePermit(streamId,
+            () -> writeNonCompactedIndexInternal(
+                streamId, numberOfMessages, entrySize,
+                initialOffset, cumulativeSize, position));
+    }
+
+    private CompletableFuture<PutResult> writeNonCompactedIndexInternal(
+            long streamId, int numberOfMessages, int entrySize,
+            long initialOffset, long cumulativeSize, Position position) {
         return LogStateUtil.toException(streamStateManager.getState(streamId), streamId)
                 .<CompletableFuture<PutResult>>map(CompletableFuture::failedFuture)
                 .orElseGet(() -> oxiaClient.put(
@@ -1102,6 +1201,14 @@ public class PersistStorageApi implements StorageApi {
     @Override
     public CompletableFuture<AddResult> write(long streamId, int numberOfMessages, long initialOffset,
                                               long cumulativeSize, ByteBuf data) {
+        return withLocalWritePermit(streamId,
+            () -> writeInternal(
+                streamId, numberOfMessages, initialOffset, cumulativeSize, data));
+    }
+
+    private CompletableFuture<AddResult> writeInternal(
+            long streamId, int numberOfMessages, long initialOffset,
+            long cumulativeSize, ByteBuf data) {
         final var optException = LogStateUtil.toException(streamStateManager.getState(streamId), streamId);
         if (optException.isPresent()) {
             return CompletableFuture.failedFuture(optException.get());
@@ -1115,9 +1222,9 @@ public class PersistStorageApi implements StorageApi {
                             } else {
                                 int entrySize = data.readableBytes();
                                 return (initialOffset != -1 && cumulativeSize != -1
-                                        ? writeNonCompactedIndex(streamId, numberOfMessages, entrySize,
+                                        ? writeNonCompactedIndexInternal(streamId, numberOfMessages, entrySize,
                                         initialOffset, cumulativeSize, putResult.position())
-                                        : writeNonCompactedIndex(streamId, numberOfMessages, entrySize,
+                                        : writeNonCompactedIndexInternal(streamId, numberOfMessages, entrySize,
                                         putResult.position()))
                                         .thenApply(indexResult -> {
                                             long now = System.nanoTime();
@@ -1457,6 +1564,12 @@ public class PersistStorageApi implements StorageApi {
 
     @Override
     public CompletableFuture<Long> softTrimStream(long streamId, long offsetIncluded) {
+        return withLocalWritePermit(streamId,
+            () -> softTrimStreamInternal(streamId, offsetIncluded));
+    }
+
+    private CompletableFuture<Long> softTrimStreamInternal(
+            long streamId, long offsetIncluded) {
         return getLastEntry(streamId).thenApply(lastEntry -> {
             // Avoid trimming all offsets. Otherwise, the next offset will start from 0 again.
             // offsetIncluded =2
@@ -1488,15 +1601,432 @@ public class PersistStorageApi implements StorageApi {
     }
 
     @Override
+    public boolean supportsDurableStreamWriteFencing() {
+        return true;
+    }
+
+    private LocalWriteGate registerLocalWriteLease(long streamId) {
+        AtomicReference<LocalWriteGate> registered = new AtomicReference<>();
+        localWriteGates.compute(streamId, (ignored, current) -> {
+            LocalWriteGate gate = current == null ? new LocalWriteGate() : current;
+            gate.openLease();
+            registered.set(gate);
+            return gate;
+        });
+        return registered.get();
+    }
+
+    private CompletableFuture<Void> beginLocalWriteLeaseClose(
+            long streamId, LocalWriteGate expectedGate) {
+        AtomicReference<CompletableFuture<Void>> drain = new AtomicReference<>();
+        localWriteGates.compute(streamId, (ignored, current) -> {
+            if (current != expectedGate) {
+                throw new IllegalStateException(
+                    "Local write lease state is missing for stream " + streamId);
+            }
+            drain.set(current.closeLease());
+            return current;
+        });
+        return drain.get();
+    }
+
+    private void removeLocalWriteGateIfIdle(
+            long streamId, LocalWriteGate expectedGate) {
+        localWriteGates.compute(streamId, (ignored, current) ->
+            current == expectedGate && current.isIdle() ? null : current);
+    }
+
+    private LocalWritePermit acquireLocalWritePermit(long streamId) {
+        AtomicReference<LocalWritePermit> permit = new AtomicReference<>();
+        localWriteGates.computeIfPresent(streamId, (ignored, gate) -> {
+            if (gate.enterMutation()) {
+                permit.set(new LocalWritePermit(gate));
+            }
+            return gate;
+        });
+        return permit.get();
+    }
+
+    private <T> CompletableFuture<T> withLocalWritePermit(
+            long streamId, Supplier<CompletableFuture<T>> mutation) {
+        LocalWritePermit permit = acquireLocalWritePermit(streamId);
+        if (permit == null) {
+            return CompletableFuture.failedFuture(new IllegalStateException(
+                "Writing stream " + streamId + " requires an active durable write lease"));
+        }
+        final CompletableFuture<T> operation;
+        try {
+            operation = Objects.requireNonNull(mutation.get(), "storage mutation future");
+        } catch (RuntimeException | Error failure) {
+            permit.close();
+            throw failure;
+        }
+        CompletableFuture<T> result = new CompletableFuture<>();
+        operation.whenComplete((value, failure) -> {
+            permit.close();
+            if (failure == null) {
+                result.complete(value);
+            } else {
+                result.completeExceptionally(failure);
+            }
+        });
+        return OwnedResultFutures.nonCancellableCompletion(result);
+    }
+
+    @Override
+    public CompletableFuture<StreamWriteLease> acquireStreamWriteLease(long streamId) {
+        Optional<IllegalArgumentException> invalid = validateStreamId(streamId);
+        if (invalid.isPresent()) {
+            return CompletableFuture.failedFuture(invalid.orElseThrow());
+        }
+        Optional<? extends RuntimeException> localFence = LogStateUtil.toException(
+            streamStateManager.getState(streamId), streamId);
+        if (localFence.isPresent()) {
+            return CompletableFuture.failedFuture(localFence.orElseThrow());
+        }
+
+        String leaseToken = UUID.randomUUID().toString();
+        String leaseKey = streamWriteLeasePrefix(streamId) + leaseToken;
+        byte[] leaseValue = leaseToken.getBytes(StandardCharsets.UTF_8);
+        Set<PutOption> createOptions = Set.of(
+            PutOption.AsEphemeralRecord,
+            PutOption.IfRecordDoesNotExist,
+            PutOption.PartitionKey(streamWriteLifecyclePartitionKey(streamId)));
+        return oxiaClient.put(leaseKey, leaseValue, createOptions)
+            .handle((created, createFailure) -> createFailure == null ? null
+                : FutureUtils.unwrapCompletionException(createFailure))
+            .thenCompose(createFailure -> {
+                if (createFailure != null) {
+                    return CompletableFuture.failedFuture(createFailure);
+                }
+                Set<GetOption> getOptions = Set.of(
+                    GetOption.PartitionKey(streamWriteLifecyclePartitionKey(streamId)));
+                return oxiaClient.get(streamWriteFenceKey(streamId), getOptions)
+                    .handle((fence, readFailure) -> new StreamWriteFenceRead(
+                        fence, readFailure == null ? null
+                            : FutureUtils.unwrapCompletionException(readFailure)))
+                    .thenCompose(read -> {
+                        if (read.failure() != null) {
+                            return rejectStreamWriteLease(
+                                streamId, leaseKey, read.failure());
+                        }
+                        if (read.fence() != null
+                                || streamStateManager.getState(streamId) == LogState.FENCED) {
+                            streamStateManager.setState(streamId, LogState.FENCED);
+                            RuntimeException fenced = LogStateUtil.toException(
+                                LogState.FENCED, streamId).orElseThrow();
+                            return rejectStreamWriteLease(streamId, leaseKey, fenced);
+                        }
+                        LocalWriteGate localGate = registerLocalWriteLease(streamId);
+                        return CompletableFuture.completedFuture(
+                            new OxiaStreamWriteLease(streamId, leaseKey, localGate));
+                    });
+            });
+    }
+
+    private CompletableFuture<StreamWriteLease> rejectStreamWriteLease(
+            long streamId, String leaseKey, Throwable failure) {
+        CompletableFuture<StreamWriteLease> result = new CompletableFuture<>();
+        deleteStreamWriteLeaseEventually(streamId, leaseKey).whenComplete((ignored, cleanupFailure) -> {
+            if (cleanupFailure != null && cleanupFailure != failure) {
+                failure.addSuppressed(FutureUtils.unwrapCompletionException(cleanupFailure));
+            }
+            result.completeExceptionally(failure);
+        });
+        return result;
+    }
+
+    @Override
+    public CompletableFuture<Void> fenceStreamWrites(long streamId) {
+        Optional<? extends RuntimeException> invalid = validateStreamId(streamId);
+        if (invalid.isPresent()) {
+            return CompletableFuture.failedFuture(invalid.orElseThrow());
+        }
+        Set<PutOption> options = Set.of(
+            PutOption.IfRecordDoesNotExist,
+            PutOption.PartitionKey(streamWriteLifecyclePartitionKey(streamId)));
+        return oxiaClient.put(
+                streamWriteFenceKey(streamId), STREAM_WRITE_LIFECYCLE_MARKER, options)
+            .handle((write, failure) -> failure == null ? null
+                : FutureUtils.unwrapCompletionException(failure))
+            .thenCompose(failure -> {
+                if (failure != null && !(failure instanceof KeyAlreadyExistsException)) {
+                    return CompletableFuture.failedFuture(failure);
+                }
+                streamStateManager.setState(streamId, LogState.FENCED);
+                return CompletableFuture.completedFuture(null);
+            });
+    }
+
+    @Override
     public CompletableFuture<Void> deleteStream(long streamId) {
+        return deleteStream(streamId, DEFAULT_STREAM_WRITE_LEASE_DRAIN_TIMEOUT);
+    }
+
+    @Override
+    public CompletableFuture<Void> deleteStream(long streamId, Duration leaseDrainTimeout) {
+        return fenceAndDrainStreamWrites(streamId, leaseDrainTimeout)
+            .thenCompose(__ -> purgeStream(streamId));
+    }
+
+    @Override
+    public CompletableFuture<Void> fenceAndDrainStreamWrites(
+            long streamId, Duration leaseDrainTimeout) {
+        Objects.requireNonNull(leaseDrainTimeout, "leaseDrainTimeout");
+        Optional<? extends RuntimeException> invalid = validateStreamId(streamId);
+        if (invalid.isPresent()) {
+            return CompletableFuture.failedFuture(invalid.orElseThrow());
+        }
+        if (leaseDrainTimeout.isNegative()) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException(
+                "leaseDrainTimeout must not be negative"));
+        }
+        final long timeoutNanos;
+        try {
+            timeoutNanos = leaseDrainTimeout.toNanos();
+        } catch (ArithmeticException e) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException(
+                "leaseDrainTimeout is too large", e));
+        }
+        return fenceStreamWrites(streamId)
+            .thenCompose(__ -> waitForStreamWriteLeasesToDrain(
+                streamId, leaseDrainTimeout, timeoutNanos, System.nanoTime(),
+                StreamWriteLeaseDrainTimeoutException.UNKNOWN_ACTIVE_LEASE_COUNT, true));
+    }
+
+    private CompletableFuture<Void> waitForStreamWriteLeasesToDrain(
+            long streamId,
+            Duration timeout,
+            long timeoutNanos,
+            long startNanos,
+            int lastObservedActiveLeaseCount,
+            boolean firstPoll) {
+        long remainingNanos = remainingNanos(timeoutNanos, startNanos);
+        if (!firstPoll && remainingNanos <= 0) {
+            return CompletableFuture.failedFuture(
+                new StreamWriteLeaseDrainTimeoutException(
+                    streamId, lastObservedActiveLeaseCount, timeout));
+        }
+        String prefix = streamWriteLeasePrefix(streamId);
+        Set<ListOption> options = Set.of(
+            ListOption.PartitionKey(streamWriteLifecyclePartitionKey(streamId)));
+        final CompletableFuture<List<String>> inventoryRead;
+        try {
+            inventoryRead = Objects.requireNonNull(
+                oxiaClient.list(prefix, prefix + "\uffff", options),
+                "write lease inventory future");
+        } catch (RuntimeException | Error failure) {
+            return CompletableFuture.failedFuture(failure);
+        }
+        return boundLeaseInventoryRead(
+                inventoryRead, streamId, lastObservedActiveLeaseCount, timeout, remainingNanos)
+            .thenCompose(activeLeases -> {
+                if (activeLeases.isEmpty()) {
+                    return CompletableFuture.completedFuture(null);
+                }
+                long remainingAfterRead = remainingNanos(timeoutNanos, startNanos);
+                if (remainingAfterRead <= 0) {
+                    return CompletableFuture.failedFuture(
+                        new StreamWriteLeaseDrainTimeoutException(
+                            streamId, activeLeases.size(), timeout));
+                }
+                long retryDelayNanos = Math.min(
+                    TimeUnit.MILLISECONDS.toNanos(
+                        STREAM_WRITE_LEASE_DRAIN_POLL_INTERVAL_MS),
+                    remainingAfterRead);
+                return CompletableFuture.runAsync(
+                        () -> { }, CompletableFuture.delayedExecutor(
+                            retryDelayNanos, TimeUnit.NANOSECONDS))
+                    .thenCompose(__ -> waitForStreamWriteLeasesToDrain(
+                        streamId, timeout, timeoutNanos, startNanos,
+                        activeLeases.size(), false));
+            });
+    }
+
+    private static CompletableFuture<List<String>> boundLeaseInventoryRead(
+            CompletableFuture<List<String>> source,
+            long streamId,
+            int lastObservedActiveLeaseCount,
+            Duration timeout,
+            long remainingNanos) {
+        CompletableFuture<List<String>> bounded = new CompletableFuture<>();
+        CompletableFuture<Void> deadline = new CompletableFuture<>();
+        source.whenComplete((leases, failure) -> {
+            if (failure == null) {
+                bounded.complete(leases);
+            } else if (source.isCancelled()) {
+                bounded.cancel(false);
+            } else {
+                bounded.completeExceptionally(failure);
+            }
+            deadline.complete(null);
+        });
+        try {
+            deadline.orTimeout(Math.max(remainingNanos, 0L), TimeUnit.NANOSECONDS)
+                .whenComplete((ignored, failure) -> {
+                    if (failure != null) {
+                        bounded.completeExceptionally(
+                            new StreamWriteLeaseDrainTimeoutException(
+                                streamId, lastObservedActiveLeaseCount, timeout));
+                    }
+                });
+        } catch (RuntimeException | Error schedulingFailure) {
+            bounded.completeExceptionally(schedulingFailure);
+        }
+        return bounded;
+    }
+
+    private static long remainingNanos(long timeoutNanos, long startNanos) {
+        long elapsedNanos = System.nanoTime() - startNanos;
+        if (elapsedNanos <= 0) {
+            return timeoutNanos;
+        }
+        return timeoutNanos - Math.min(elapsedNanos, timeoutNanos);
+    }
+
+    private CompletableFuture<Void> purgeStream(long streamId) {
         return oxiaClient.deleteRange(
                 getSmallestStreamIdKey(streamId),
                 getLargestStreamIdKey(streamId),
                 Set.of(DeleteRangeOption.PartitionKey(String.valueOf(streamId))))
             .thenCompose(__ -> removeStream(streamId))
-            .thenRun(() -> {
-                storageFormat.removeCachedKey(streamId);
-            });
+            .thenRun(() -> storageFormat.removeCachedKey(streamId));
+    }
+
+    private CompletableFuture<Void> deleteStreamWriteLease(long streamId, String leaseKey) {
+        return oxiaClient.delete(leaseKey, Set.of(
+                DeleteOption.PartitionKey(streamWriteLifecyclePartitionKey(streamId))))
+            .thenApply(__ -> null);
+    }
+
+    private CompletableFuture<Void> deleteStreamWriteLeaseEventually(
+            long streamId, String leaseKey) {
+        CompletableFuture<Void> release = new CompletableFuture<>();
+        attemptStreamWriteLeaseDelete(streamId, leaseKey, 0, release);
+        return release;
+    }
+
+    private void attemptStreamWriteLeaseDelete(
+            long streamId, String leaseKey, int retryAttempt,
+            CompletableFuture<Void> release) {
+        final CompletableFuture<Void> deletion;
+        try {
+            deletion = Objects.requireNonNull(
+                deleteStreamWriteLease(streamId, leaseKey), "stream write lease delete future");
+        } catch (RuntimeException failure) {
+            scheduleStreamWriteLeaseDeleteRetry(
+                streamId, leaseKey, retryAttempt, release, failure);
+            return;
+        }
+        deletion.whenComplete((ignored, failure) -> {
+            if (failure == null) {
+                release.complete(null);
+                return;
+            }
+            scheduleStreamWriteLeaseDeleteRetry(
+                streamId, leaseKey, retryAttempt, release,
+                FutureUtils.unwrapCompletionException(failure));
+        });
+    }
+
+    private void scheduleStreamWriteLeaseDeleteRetry(
+            long streamId, String leaseKey, int retryAttempt,
+            CompletableFuture<Void> release, Throwable failure) {
+        long delayMillis = streamWriteLeaseReleaseRetryDelayMillis(retryAttempt);
+        int nextAttempt = retryAttempt == Integer.MAX_VALUE
+            ? Integer.MAX_VALUE : retryAttempt + 1;
+        log.warn("Failed to release durable write lease {} for stream {}; retrying in {} ms "
+                + "(attempt {})", leaseKey, streamId, delayMillis, nextAttempt, failure);
+        CompletableFuture.delayedExecutor(delayMillis, TimeUnit.MILLISECONDS).execute(
+            () -> attemptStreamWriteLeaseDelete(
+                streamId, leaseKey, nextAttempt, release));
+    }
+
+    private static long streamWriteLeaseReleaseRetryDelayMillis(int retryAttempt) {
+        int shift = Math.min(Math.max(retryAttempt, 0), 30);
+        long exponentialDelay = STREAM_WRITE_LEASE_RELEASE_INITIAL_RETRY_DELAY_MS << shift;
+        return Math.min(exponentialDelay, STREAM_WRITE_LEASE_RELEASE_MAX_RETRY_DELAY_MS);
+    }
+
+    private static Optional<IllegalArgumentException> validateStreamId(long streamId) {
+        return streamId < 0
+            ? Optional.of(new IllegalArgumentException("streamId must be non-negative"))
+            : Optional.empty();
+    }
+
+    @VisibleForTesting
+    static String streamWriteFenceKey(long streamId) {
+        return STREAM_WRITE_FENCE_PATH + "/" + streamId;
+    }
+
+    @VisibleForTesting
+    static String streamWriteLeasePrefix(long streamId) {
+        return STREAM_WRITE_LEASE_PATH + "/" + streamId + "/";
+    }
+
+    private static String streamWriteLifecyclePartitionKey(long streamId) {
+        return String.valueOf(streamId);
+    }
+
+    private record StreamWriteFenceRead(GetResult fence, Throwable failure) {
+    }
+
+    private final class OxiaStreamWriteLease implements StreamWriteLease {
+
+        private final long streamId;
+        private final String leaseKey;
+        private final LocalWriteGate localGate;
+        private final AtomicReference<CompletableFuture<Void>> closeFuture =
+            new AtomicReference<>();
+        private final AtomicReference<CompletableFuture<Void>> localDrainFuture =
+            new AtomicReference<>();
+
+        private OxiaStreamWriteLease(
+                long streamId, String leaseKey, LocalWriteGate localGate) {
+            this.streamId = streamId;
+            this.leaseKey = leaseKey;
+            this.localGate = localGate;
+        }
+
+        @Override
+        public long streamId() {
+            return streamId;
+        }
+
+        @Override
+        public CompletableFuture<Void> closeAsync() {
+            CompletableFuture<Void> existing = closeFuture.get();
+            if (existing != null) {
+                return existing;
+            }
+            CompletableFuture<Void> source = new CompletableFuture<>();
+            CompletableFuture<Void> exposed =
+                OwnedResultFutures.nonCancellableCompletion(source);
+            if (!closeFuture.compareAndSet(null, exposed)) {
+                return closeFuture.get();
+            }
+            CompletableFuture<Void> drain = localDrainFuture.get();
+            if (drain == null) {
+                try {
+                    drain = beginLocalWriteLeaseClose(streamId, localGate);
+                    localDrainFuture.compareAndSet(null, drain);
+                } catch (RuntimeException | Error failure) {
+                    source.completeExceptionally(failure);
+                    return exposed;
+                }
+            }
+            drain.thenCompose(__ -> deleteStreamWriteLeaseEventually(streamId, leaseKey))
+                .whenComplete((ignored, failure) -> {
+                    if (failure == null) {
+                        removeLocalWriteGateIfIdle(streamId, localGate);
+                        source.complete(null);
+                    } else {
+                        source.completeExceptionally(
+                            FutureUtils.unwrapCompletionException(failure));
+                    }
+                });
+            return exposed;
+        }
     }
 
     @Override
@@ -1514,6 +2044,14 @@ public class PersistStorageApi implements StorageApi {
     @Override
     public CompletableFuture<Void> compactEntryIndex(long streamId, long startOffset, long endOffset,
                                                      long endCumulativeSize, Value value) {
+        return withLocalWritePermit(streamId,
+            () -> compactEntryIndexInternal(
+                streamId, startOffset, endOffset, endCumulativeSize, value));
+    }
+
+    private CompletableFuture<Void> compactEntryIndexInternal(
+            long streamId, long startOffset, long endOffset,
+            long endCumulativeSize, Value value) {
         Key toUpdateKey = new Key(streamId, endOffset, endCumulativeSize);
         log.info("Compact stream {} entry index {}-{}, endCumulativeSize: {} new value: {}", streamId,
                 startOffset, endOffset, endCumulativeSize, value);
@@ -1610,6 +2148,14 @@ public class PersistStorageApi implements StorageApi {
         asyncCleaner.startCleanupTask();
     }
 
+    /**
+     * Makes the initialized WAL data plane available to a previously requested cleanup service.
+     * Marker initialization and retries run asynchronously on the cleaner's supervised executor.
+     */
+    public void onWALDataPlaneAvailable(FileStorage initializedFileStorage) {
+        asyncCleaner.onDataPlaneAvailable(initializedFileStorage);
+    }
+
     @Override
     public CompletableFuture<Set<Long>> listStreams() {
         var pathWithSlash = STREAM_REGISTER_PATH + "/";
@@ -1620,6 +2166,7 @@ public class PersistStorageApi implements StorageApi {
 
     @Override
     public void close() throws IOException {
+        asyncCleaner.stop();
     }
 
     @Override
@@ -1629,8 +2176,9 @@ public class PersistStorageApi implements StorageApi {
 
     @Override
     public CompletableFuture<Void> hardTrimStream(long streamId, long offsetExcluded) {
-        return oxiaClient.deleteRange(Key.smallestKey(streamId).toString(),
+        return withLocalWritePermit(streamId, () -> oxiaClient.deleteRange(
+                        Key.smallestKey(streamId).toString(),
                         Key.largestKey(streamId, offsetExcluded).toString(),
-                        Set.of(DeleteRangeOption.PartitionKey(String.valueOf(streamId))));
+                        Set.of(DeleteRangeOption.PartitionKey(String.valueOf(streamId)))));
     }
 }

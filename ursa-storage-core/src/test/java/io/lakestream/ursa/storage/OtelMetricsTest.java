@@ -8,6 +8,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import io.lakestream.ursa.metrics.InstrumentProvider;
+import io.lakestream.ursa.storage.StorageApi.StreamWriteLease;
 import io.lakestream.ursa.storage.impl.PersistStorageApi;
 import io.lakestream.ursa.storage.impl.StorageConfig;
 import io.netty.buffer.Unpooled;
@@ -68,6 +69,7 @@ public class OtelMetricsTest {
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
     public void testMetrics(boolean enableWriteCache) throws Exception {
+        Map<Long, StreamWriteLease> writeLeases = new HashMap<>();
         try {
             setup(enableWriteCache);
             Random random = new Random();
@@ -77,6 +79,8 @@ public class OtelMetricsTest {
                 long streamId = random.nextInt(10);
                 AtomicLong entryCounter = counter.computeIfAbsent(streamId, k -> new AtomicLong(0));
                 List<CompletableFuture<AddResult>> result = futures.computeIfAbsent(streamId, k -> new ArrayList<>());
+                writeLeases.computeIfAbsent(
+                    streamId, id -> storage.acquireStreamWriteLease(id).join());
                 result.add(storage.append(streamId, 1,
                     Unpooled.wrappedBuffer(("entry-" + entryCounter.getAndIncrement()).getBytes())));
                 if (i == 50) {
@@ -115,6 +119,7 @@ public class OtelMetricsTest {
             }
             storage.read(lastKey, 0).get();
         } finally {
+            writeLeases.values().forEach(StreamWriteLease::close);
             cleanup();
         }
             Collection<MetricData> metrics = inMemoryMetricReader.collectAllMetrics();

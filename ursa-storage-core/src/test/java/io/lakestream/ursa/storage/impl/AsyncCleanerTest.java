@@ -175,12 +175,15 @@ public class AsyncCleanerTest {
         long streamId = storageApi.generateStreamId().get();
 
         List<AddResult> entryHeaders = new ArrayList<>();
-        for (int i = 0; i < 10; i++) {
-            entryHeaders.add(storageApi.append(streamId, 1,
-                Unpooled.wrappedBuffer(("test-" + i).getBytes())).get());
-        }
+        try (StorageApi.StreamWriteLease ignoredLease =
+                storageApi.acquireStreamWriteLease(streamId).join()) {
+            for (int i = 0; i < 10; i++) {
+                entryHeaders.add(storageApi.append(streamId, 1,
+                    Unpooled.wrappedBuffer(("test-" + i).getBytes())).get());
+            }
 
-        storageApi.softTrimStream(streamId, 3).get();
+            storageApi.softTrimStream(streamId, 3).get();
+        }
 
         asyncCleaner.cleanup();
 

@@ -7,12 +7,11 @@ package io.lakestream.api.exception;
 import io.lakestream.api.StreamIdentifier;
 
 /**
- * Signals that a partition operation belongs to a lifecycle fenced by retained metadata.
+ * Signals that a native partition allocation lifecycle is fenced by retained metadata.
  *
- * <p>For an externally managed stream, a partition deleted in the current registration generation
- * cannot be registered again until the logical stream is unregistered and registered again. The
- * new stream registration advances the ownership generation without weakening the deletion fence
- * against delayed writers from the old generation.
+ * <p>The catalog retains retired physical stream IDs and keyed-mapping fences so delayed cleanup
+ * cannot delete an active allocation. This exception indicates that the retained allocation state
+ * cannot be reconciled safely with the partition's current metadata and ownership generation.
  */
 public class PartitionLifecycleFencedException extends LogFencedException {
 
@@ -28,7 +27,7 @@ public class PartitionLifecycleFencedException extends LogFencedException {
 
     private static String message(
             StreamIdentifier identifier, int partitionIndex, String reason) {
-        return "Partition lifecycle is fenced for " + identifier.fullName()
+        return "Partition allocation lifecycle is fenced for " + identifier.fullName()
             + "-partition-" + partitionIndex + ": " + reason;
     }
 }

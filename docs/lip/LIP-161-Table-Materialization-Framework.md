@@ -42,7 +42,7 @@ pipelines, scheduling, and failure handling — none of which are
 lakehouse-specific in any meaningful way.
 
 **lakestream-api** is the protocol-neutral API surface for Ursa streams:
-`StreamCatalog`, `Stream`, `Namespace`, `Log`, `LogCursor`, `StreamReader`,
+`StreamCatalog`, `StreamMetadata`, `Namespace`, `Log`, `LogCursor`, `StreamReader`,
 `StreamWriter`. New code should use lakestream-api, not the core `StorageApi`.
 Before this LIP, lakestream-api had no concept of "where this stream is
 materialised to".
@@ -77,7 +77,7 @@ partition-in-policy, no backfill, no pause).
 
 - Define a typed `TableMaterializationPolicy` in `lakestream-api`, attachable
   at `Namespace` (active — materializes every stream in the namespace) and
-  `Stream` (override + opt-out via `enabled = false`) scope.
+  stream metadata (override + opt-out via `enabled = false`) scope.
 - Lift the schema/encoder pipeline (`SchemaService`, `SchemaEvolutionManager`,
   `EntryEncoder`, `TableSchemaService`) into a new `ursa-storage-materialization`
   module with no lakehouse coupling.
@@ -182,7 +182,7 @@ TableMaterializationPolicy on Stream      (OVERRIDE — partial)
 
 A stream is materialized **iff** the resolved policy has `catalogRef` set
 (from either layer) **and** `enabled` is not explicitly `false` at stream
-level. Source schema declaration stays on the existing `Stream.schema()`
+level. Source schema declaration stays on `StreamMetadata.schema()`
 (`SchemaConfig`) — the policy does not duplicate it.
 
 | Concept | Owner | Lifecycle | Carries |
@@ -278,7 +278,7 @@ New types under `io.lakestream.api.materialization`:
 - **Inside `TableConf`**: `TableMode`, `PartitionSpec`, `PartitionTransform`,
   `SortColumn`, `RetentionConfig`, `Compression`
 
-Source schema declaration stays on the existing `Stream.schema()`
+Source schema declaration stays on `StreamMetadata.schema()`
 (`SchemaConfig`); the policy does not duplicate it. Generic serde types
 (`SchemaService`, `SchemaEvolutionManager`, `EntryEncoder`, etc.) keep their
 existing names — they were moved out of the lakehouse module but **not
@@ -286,10 +286,10 @@ renamed** to maximise reuse and minimise churn in downstream callers.
 
 `Namespace` record gained `Optional<TableMaterializationPolicy> materialization()`
 — the active namespace policy.
-`Stream` interface gained `Optional<TableMaterializationPolicy> materialization()`
-— the override policy — plus `Optional<ResolvedMaterialization> effectiveMaterialization()`
-returning the deep-merged effective policy with the `TableCatalog` already
-resolved (empty if the stream is not materialized).
+`StreamMetadata` exposes `Optional<TableMaterializationPolicy> materialization()`
+as the resource-free override snapshot. `StreamCatalog.resolveMaterialization(...)`
+returns the deep-merged effective policy with the `TableCatalog` already resolved
+(empty if the stream is not materialized).
 
 `StreamCatalog` gained:
 
@@ -311,10 +311,10 @@ CompletableFuture<Void> setStreamMaterialization(StreamIdentifier id,
 CompletableFuture<Void> clearStreamMaterialization(StreamIdentifier id);
 
 // One-click create-with-policy
-CompletableFuture<Stream> createStream(StreamIdentifier id, StreamConfig config,
-                                       Partitioning partitioning, SchemaConfig schema,
-                                       Map<String, String> properties,
-                                       Optional<TableMaterializationPolicy> materialization);
+CompletableFuture<StreamMetadata> createStream(StreamIdentifier id, StreamConfig config,
+                                               Partitioning partitioning, SchemaConfig schema,
+                                               Map<String, String> properties,
+                                               Optional<TableMaterializationPolicy> materialization);
 ```
 
 The previous `createStream(...)` overload (without materialization) stays for
@@ -398,7 +398,7 @@ No new CLI surface in this LIP. Policy management goes through the
   **admin-only** — same RBAC level as cluster operator config edits. Stream
   owners cannot register backends; they only reference them by name.
 - `setStreamMaterialization` / `setNamespaceMaterialization` are subject to
-  the same RBAC checks as the existing `setStreamProperties` /
+  the same RBAC checks as `replaceStreamProperties` /
   `setNamespaceProperties` — namespace owner can set the active namespace
   policy; stream owner can set/override or opt out at stream level only.
 - DLQ topics named in `framework.errorHandling.dlqTopic` are subject to
@@ -536,7 +536,7 @@ branch `ursa-storage-table-materialization-framework`:
 | Task | Commit | Summary |
 |------|--------|---------|
 | T1 | `929397ca5` | `lakestream-api` materialization types |
-| T2 | `a76ed1400` | Materialization policy on `Namespace`, `Stream`, `StreamCatalog` |
+| T2 | `a76ed1400` | Materialization policy on `Namespace`, stream metadata, `StreamCatalog` |
 | T3 | `fec7ac082` | `TableMaterializationPolicy.resolve` + `TableNaming` interpolation |
 | T4 | `b6d74e207` | New `ursa-storage-materialization` module + generic serde moved |
 | T5 | `5364909ea` | Public SPI for stream-to-table sinks |

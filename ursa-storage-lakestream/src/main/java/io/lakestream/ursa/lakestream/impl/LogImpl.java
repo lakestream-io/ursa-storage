@@ -211,11 +211,6 @@ public class LogImpl implements Log {
     }
 
     @Override
-    public CompletableFuture<Void> delete() {
-        return logStorage.deleteLog(logId);
-    }
-
-    @Override
     public void cacheIndex(EntryIndex index) {
         if (entryIndexCache != null) {
             entryIndexCache.put(logId.id(), index);
@@ -242,13 +237,6 @@ public class LogImpl implements Log {
             return entryIndexCache.getMessageCount(logId.id(), startOffset).join();
         }
         return -1;
-    }
-
-    @Override
-    public void activate() {
-        if (streamStateManager != null) {
-            streamStateManager.setState(logId.id(), LogState.NORMAL);
-        }
     }
 
     @Override

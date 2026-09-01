@@ -28,7 +28,7 @@ protocol types into `lakestream-api`, `ursa-storage-common`, `ursa-storage-core`
 
 | Layer | Module | Responsibility |
 |-------|--------|----------------|
-| Public API | `lakestream-api` | Stream, log, cursor, catalog, and materialization contracts |
+| Public API | `lakestream-api` | Stream metadata, log, cursor, catalog, and materialization contracts |
 | Shared code | `ursa-storage-common` | Utilities, configuration helpers, and common exceptions |
 | Storage engine | `ursa-storage-core` | WAL and object-storage implementation; internal `StorageApi` |
 | API implementation | `ursa-storage-lakestream` | Catalogs, layouts, logs, cursors, readers, and writers |
@@ -48,11 +48,13 @@ modules rather than placed in the protocol-neutral layers.
 
 ```text
 StreamCatalog
-  -> Stream
+  -> StreamMetadata
       -> StreamLayout
-          -> Log
-              -> LogCursor
-              -> LogStorage
+          -> LogId
+  -> openLog -> Log
+      -> LogCursor
+      -> LogStorage
+  -> openReader / openWriter
 
 StreamWriter / StreamReader route stream operations through the selected layout.
 UnifiedStreamReader routes reads between raw WAL data and compacted objects.

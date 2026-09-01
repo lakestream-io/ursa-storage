@@ -24,21 +24,4 @@ public interface StreamCatalogProvider {
      */
     StreamCatalog open(String catalogMetadataUri, Properties properties) throws Exception;
 
-    /**
-     * Opens a metadata-only registry for externally controlled streams.
-     *
-     * <p>Providers that support external control planes should override this method without
-     * bootstrapping their data-plane storage runtime. The default keeps existing providers binary
-     * compatible while failing explicitly instead of falling back to a full catalog.
-     *
-     * @param catalogMetadataUri metadata service URI
-     * @param properties catalog metadata configuration
-     * @return a non-null registry that owns its implementation resources
-     * @throws Exception if the registry cannot be opened
-     */
-    default ExternalStreamRegistry openExternalStreamRegistry(
-            String catalogMetadataUri, Properties properties) throws Exception {
-        throw new UnsupportedOperationException(
-            "External stream registration is not supported by " + getClass().getName());
-    }
 }

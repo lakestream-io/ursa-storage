@@ -9,10 +9,10 @@ Implements the Lakestream API on top of `ursa-storage-core`. This is the integra
 | Class | Purpose |
 |-------|---------|
 | `IndexedStreamCatalog` | Oxia-backed `StreamCatalog` implementation — the primary catalog |
-| `StreamImpl` | `Stream` implementation with log management |
 | `LogImpl` | `Log` implementation — wraps `LogStorage` + entry index cache + `UnifiedStreamReader` |
+| `LeasedLog` | Catalog-opened `Log` handle that owns a durable write lease and drains appends on close |
 | `LogCursorImpl` | `LogCursor` implementation — cursor state, mark-delete, individual acks |
-| `StreamWriterImpl` | `StreamWriter` — routes writes via `StreamLayout` to `LogStorage` |
+| `StreamWriterImpl` | `StreamWriter` — routes writes via `StreamLayout` to owned `Log` handles |
 | `StreamReaderImpl` | `StreamReader` — delegates to `UnifiedStreamReader` for transparent reads |
 | `DefaultUnifiedStreamReader` | RAW/PARQUET transparent routing — reads from WAL or compacted objects |
 | `IndividualAcksTracker` | Per-message acknowledgment tracking |
@@ -62,6 +62,7 @@ io.lakestream.ursa.lakestream.reader   — CompactedObjectReader interfaces and 
 ## Pitfalls
 
 - **Layout resolution requires Oxia**: `IndexedStreamCatalog.getLayout()` reads partition metadata from Oxia — tests need Oxia (or mock)
+- **Explicit data-plane ownership**: open logs, readers, and writers through `StreamCatalog` and close every returned handle
 - **Cursor state persistence**: `LogCursorImpl` persists state to Oxia via `CursorStateStore` — understand the write-ahead pattern before modifying
 - **IndividualAcksTracker**: uses bitmap segments for per-message ack tracking. Changes need careful concurrency review
 - **CompactedObjectReader wiring**: `DefaultUnifiedStreamReader` needs a `CompactedObjectReaderFactory` — if compaction is not configured, use `NoopCompactedObjectReaderFactory`

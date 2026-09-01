@@ -9,22 +9,26 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.when;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import io.lakestream.api.CatalogPaths;
 import io.lakestream.api.LogStorage;
 import io.lakestream.api.Partitioning;
 import io.lakestream.api.PartitioningStrategy;
 import io.lakestream.api.SchemaConfig;
-import io.lakestream.api.Stream;
 import io.lakestream.api.StreamConfig;
 import io.lakestream.api.StreamIdentifier;
+import io.lakestream.api.StreamMetadata;
 import io.lakestream.api.exception.NoSuchStreamException;
 import io.lakestream.api.materialization.EvolutionPolicy;
+import io.lakestream.api.materialization.TableCatalog;
+import io.lakestream.api.materialization.TableCatalogType;
 import io.lakestream.api.materialization.TableIdentifier;
 import io.lakestream.api.materialization.TableMaterializationPolicy;
 import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.GetResult;
 import io.oxia.client.api.PutResult;
 import io.oxia.client.api.Version;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -124,18 +128,84 @@ class IndexedStreamCatalogStreamPolicyTest {
             Map.of("warehouse", "s3://override"));
     }
 
+    private void createMaterializedStream() throws Exception {
+        Partitioning partitioning = new Partitioning(PartitioningStrategy.INDEXED,
+            Map.of("numPartitions", "1"));
+        catalog.createStream(streamId, new StreamConfig(), partitioning,
+            new SchemaConfig(), Map.of(), Optional.of(samplePolicy())).get();
+    }
+
     @Test
     void createStream_withMaterialization_persistsPolicy() throws Exception {
         TableMaterializationPolicy policy = samplePolicy();
         Partitioning partitioning = new Partitioning(PartitioningStrategy.INDEXED,
             Map.of("numPartitions", "1"));
 
-        Stream created = catalog.createStream(streamId, new StreamConfig(), partitioning,
+        StreamMetadata created = catalog.createStream(streamId, new StreamConfig(), partitioning,
             new SchemaConfig(), Map.of(), Optional.of(policy)).get();
         assertThat(created.materialization()).contains(policy);
 
-        Stream reloaded = catalog.loadStream(streamId).get();
+        StreamMetadata reloaded = catalog.loadStream(streamId).get();
         assertThat(reloaded.materialization()).contains(policy);
+    }
+
+    @Test
+    void resolveMaterialization_allowsMissingNamespace() throws Exception {
+        createMaterializedStream();
+        catalog.registerTableCatalog(new TableCatalog(
+            "iceberg-prod", TableCatalogType.ICEBERG, Map.of(), Map.of())).get();
+
+        assertThat(catalog.resolveMaterialization(streamId).get()).isPresent();
+    }
+
+    @Test
+    void resolveMaterialization_propagatesNamespaceReadFailure() throws Exception {
+        createMaterializedStream();
+        RuntimeException readFailure = new RuntimeException("namespace read failed");
+        when(oxiaClient.get(catalogPaths.namespacePath(streamId.namespace())))
+            .thenReturn(CompletableFuture.failedFuture(readFailure));
+
+        assertThatThrownBy(() -> catalog.resolveMaterialization(streamId).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCause(readFailure);
+    }
+
+    @Test
+    void resolveMaterialization_propagatesNamespaceDeserializationFailure()
+            throws Exception {
+        createMaterializedStream();
+        store.put(catalogPaths.namespacePath(streamId.namespace()),
+            "not-json".getBytes(StandardCharsets.UTF_8));
+
+        assertThatThrownBy(() -> catalog.resolveMaterialization(streamId).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(RuntimeException.class)
+            .hasRootCauseInstanceOf(JsonProcessingException.class);
+    }
+
+    @Test
+    void resolveMaterialization_propagatesTableCatalogReadFailure() throws Exception {
+        createMaterializedStream();
+        RuntimeException readFailure = new RuntimeException("catalog read failed");
+        when(oxiaClient.get(catalogPaths.tableCatalogPath("iceberg-prod")))
+            .thenReturn(CompletableFuture.failedFuture(readFailure));
+
+        assertThatThrownBy(() -> catalog.resolveMaterialization(streamId).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCause(readFailure);
+    }
+
+    @Test
+    void resolveMaterialization_propagatesTableCatalogDeserializationFailure()
+            throws Exception {
+        createMaterializedStream();
+        store.put(catalogPaths.tableCatalogPath("iceberg-prod"),
+            "not-json".getBytes(StandardCharsets.UTF_8));
+
+        assertThatThrownBy(() -> catalog.resolveMaterialization(streamId).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(RuntimeException.class)
+            .hasRootCauseInstanceOf(JsonProcessingException.class);
     }
 
     @Test
@@ -145,7 +215,7 @@ class IndexedStreamCatalogStreamPolicyTest {
         catalog.createStream(streamId, new StreamConfig(), partitioning,
             new SchemaConfig(), Map.of()).get();
 
-        Stream reloaded = catalog.loadStream(streamId).get();
+        StreamMetadata reloaded = catalog.loadStream(streamId).get();
         assertThat(reloaded.materialization()).isEmpty();
     }
 
@@ -158,7 +228,7 @@ class IndexedStreamCatalogStreamPolicyTest {
 
         catalog.setStreamMaterialization(streamId, samplePolicy()).get();
 
-        Stream reloaded = catalog.loadStream(streamId).get();
+        StreamMetadata reloaded = catalog.loadStream(streamId).get();
         assertThat(reloaded.materialization()).contains(samplePolicy());
     }
 
@@ -171,7 +241,7 @@ class IndexedStreamCatalogStreamPolicyTest {
 
         catalog.clearStreamMaterialization(streamId).get();
 
-        Stream reloaded = catalog.loadStream(streamId).get();
+        StreamMetadata reloaded = catalog.loadStream(streamId).get();
         assertThat(reloaded.materialization()).isEmpty();
     }
 
@@ -190,17 +260,4 @@ class IndexedStreamCatalogStreamPolicyTest {
             .hasCauseInstanceOf(NoSuchStreamException.class);
     }
 
-    @Test
-    void setStreamProperties_preservesMaterialization() throws Exception {
-        Partitioning partitioning = new Partitioning(PartitioningStrategy.INDEXED,
-            Map.of("numPartitions", "1"));
-        catalog.createStream(streamId, new StreamConfig(), partitioning,
-            new SchemaConfig(), Map.of(), Optional.of(samplePolicy())).get();
-
-        catalog.setStreamProperties(streamId, Map.of("env", "prod")).get();
-
-        Stream reloaded = catalog.loadStream(streamId).get();
-        assertThat(reloaded.properties()).isEqualTo(Map.of("env", "prod"));
-        assertThat(reloaded.materialization()).contains(samplePolicy());
-    }
 }

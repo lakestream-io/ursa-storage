@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import io.lakestream.api.EntryHeader;
 import io.lakestream.ursa.metrics.InstrumentProvider;
+import io.lakestream.ursa.storage.StorageApi.StreamWriteLease;
 import io.lakestream.ursa.storage.impl.PersistStorageApi;
 import io.netty.buffer.Unpooled;
 import java.nio.charset.StandardCharsets;
@@ -18,6 +19,7 @@ import java.util.Map;
 import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.AfterEach;
@@ -29,6 +31,7 @@ public class S3BackendPersistStorageApiTest {
 
     private UrsaStorageTestBase ursaStorageTestBase;
     private PersistStorageApi storage;
+    private final Map<Long, StreamWriteLease> writeLeases = new ConcurrentHashMap<>();
 
     @BeforeEach
     public void setup() throws Exception {
@@ -40,7 +43,19 @@ public class S3BackendPersistStorageApiTest {
 
     @AfterEach
     public void cleanup() throws Exception {
-        ursaStorageTestBase.cleanup();
+        try {
+            writeLeases.values().forEach(StreamWriteLease::close);
+            writeLeases.clear();
+        } finally {
+            ursaStorageTestBase.cleanup();
+        }
+    }
+
+    private CompletableFuture<AddResult> appendWithLease(
+            long streamId, int numberOfMessages, io.netty.buffer.ByteBuf data) {
+        writeLeases.computeIfAbsent(
+            streamId, id -> storage.acquireStreamWriteLease(id).join());
+        return storage.append(streamId, numberOfMessages, data);
     }
 
     @Test
@@ -48,7 +63,7 @@ public class S3BackendPersistStorageApiTest {
         final long streamId = 100;
         ArrayList<CompletableFuture<AddResult>> ehs = new ArrayList<>();
         for (int i = 0; i < 100; i++) {
-            ehs.add(storage.append(streamId, 1, Unpooled.wrappedBuffer(("entry-" + i).getBytes())));
+            ehs.add(appendWithLease(streamId, 1, Unpooled.wrappedBuffer(("entry-" + i).getBytes())));
         }
         CompletableFuture.allOf(ehs.toArray(new CompletableFuture[0])).join();
 
@@ -79,7 +94,7 @@ public class S3BackendPersistStorageApiTest {
             long streamId = random.nextInt(2);
             AtomicLong entryCounter = counter.computeIfAbsent(streamId, k -> new AtomicLong(0));
             List<CompletableFuture<AddResult>> result = futures.computeIfAbsent(streamId, k -> new ArrayList<>());
-            result.add(storage.append(streamId, 1,
+            result.add(appendWithLease(streamId, 1,
                 Unpooled.wrappedBuffer(("entry-" + entryCounter.getAndIncrement()).getBytes())));
         }
         List<CompletableFuture<AddResult>> list = new ArrayList<>();
@@ -119,12 +134,12 @@ public class S3BackendPersistStorageApiTest {
         eh = storage.getLastEntry(1).join().header();
         assertEquals(EntryHeader.NOT_FOUND, eh);
 
-        EntryHeader eh1 = storage.append(1, 1, Unpooled.wrappedBuffer("entry-1".getBytes())).join().header();
+        EntryHeader eh1 = appendWithLease(1, 1, Unpooled.wrappedBuffer("entry-1".getBytes())).join().header();
         assertEquals(0, eh1.offset());
         assertEquals(7, eh1.cumulativeSize());
         assertEquals(1, eh1.numberOfMessages());
 
-        EntryHeader eh2 = storage.append(1, 3, Unpooled.wrappedBuffer("entry-2".getBytes())).join().header();
+        EntryHeader eh2 = appendWithLease(1, 3, Unpooled.wrappedBuffer("entry-2".getBytes())).join().header();
         assertEquals(1, eh2.offset());
         assertEquals(14, eh2.cumulativeSize());
         assertEquals(3, eh2.numberOfMessages());

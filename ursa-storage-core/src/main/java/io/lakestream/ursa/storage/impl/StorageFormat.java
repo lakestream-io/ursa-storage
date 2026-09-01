@@ -27,6 +27,10 @@ public class StorageFormat {
     // stream register path
     public static final String STREAM_REGISTER_PATH = "/stream-id";
 
+    // Durable terminal fences and ephemeral opened-handle leases for numeric stream IDs.
+    public static final String STREAM_WRITE_FENCE_PATH = "/stream-write-fences";
+    public static final String STREAM_WRITE_LEASE_PATH = "/stream-write-leases";
+
     public static final String MARK_DELETED_OFFSET_PATH = "/mark-deleted-offsets";
 
     @Getter

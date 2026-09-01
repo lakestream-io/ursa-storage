@@ -48,8 +48,10 @@ public class StorageApiLogStorage implements LogStorage {
 
     @Override
     public CompletableFuture<LogEntryHeader> append(LogId logId, int numberOfRecords, ByteBuf data) {
-        return storageApi.append(logId.id(), numberOfRecords, data)
-            .thenApply(result -> result.header());
+        CompletableFuture<LogEntryHeader> append =
+            storageApi.append(logId.id(), numberOfRecords, data)
+                .thenApply(result -> result.header());
+        return OwnedResultFutures.nonCancellableCompletion(append);
     }
 
     @Override

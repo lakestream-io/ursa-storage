@@ -50,4 +50,12 @@ class StreamLayoutFactoryTest {
         assertThrows(UnsupportedOperationException.class,
             () -> StreamLayoutFactory.create(partitioning, logIds));
     }
+
+    @Test
+    void testSingleLogDoesNotHideUnsupportedStrategy() {
+        Partitioning partitioning = new Partitioning(PartitioningStrategy.RANGE, Map.of());
+
+        assertThrows(UnsupportedOperationException.class,
+            () -> StreamLayoutFactory.create(partitioning, List.of(LogId.of(1))));
+    }
 }

@@ -18,8 +18,11 @@ import java.time.temporal.ChronoUnit;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import lombok.extern.slf4j.Slf4j;
 
@@ -29,47 +32,187 @@ public class AsyncCleaner implements Runnable {
     private static final String deleteMarkerPath  = "ursa-wal-delete-marker";
     private static final String lockPath = "ursa-wal-cleanup-lock";
     private static final byte[] lockValue = new byte[0];
+    private static final long INITIALIZATION_RETRY_DELAY_MILLIS = 1_000L;
+    private static final long STOP_TIMEOUT_SECONDS = 10L;
+
+    enum LifecycleState {
+        NOT_REQUESTED,
+        WAITING_FOR_DATA_PLANE,
+        INITIALIZATION_SCHEDULED,
+        INITIALIZING,
+        RUNNING,
+        STOPPED
+    }
 
     private final StorageConfig config;
     private final StorageApi storageApi;
-    private final FileStorage fileStorage;
+    private final WalStorage walStorage;
     private final ScheduledExecutorService scheduledService;
+    private final long initializationRetryDelayMillis;
+    private FileStorage fileStorage;
+    private boolean startRequested;
+    private LifecycleState lifecycleState = LifecycleState.NOT_REQUESTED;
+    private ScheduledFuture<?> initializationFuture;
+    private ScheduledFuture<?> cleanupFuture;
 
     public AsyncCleaner(StorageApi storageApi, WalStorage walStorage, StorageConfig config) {
+        this(storageApi, walStorage, config,
+            Executors.newSingleThreadScheduledExecutor(
+                new DefaultThreadFactory("ursa-wal-async-cleaner")),
+            INITIALIZATION_RETRY_DELAY_MILLIS);
+    }
+
+    @VisibleForTesting
+    AsyncCleaner(StorageApi storageApi, WalStorage walStorage, StorageConfig config,
+                 ScheduledExecutorService scheduledService,
+                 long initializationRetryDelayMillis) {
+        if (initializationRetryDelayMillis < 0) {
+            throw new IllegalArgumentException("initializationRetryDelayMillis must not be negative");
+        }
         this.config = config;
         this.storageApi = storageApi;
-        if (walStorage != null) {
-            this.fileStorage = walStorage.getFileStorage();
-        } else {
-            this.fileStorage = null;
-        }
-        this.scheduledService = Executors.newSingleThreadScheduledExecutor(
-            new DefaultThreadFactory("ursa-wal-async-cleaner"));
+        this.walStorage = walStorage;
+        this.scheduledService = scheduledService;
+        this.initializationRetryDelayMillis = initializationRetryDelayMillis;
     }
 
     @VisibleForTesting
     AsyncCleaner() {
         this.config = null;
         this.storageApi = null;
+        this.walStorage = null;
         this.fileStorage = null;
         this.scheduledService = Executors.newSingleThreadScheduledExecutor(
             new DefaultThreadFactory("ursa-storage-async-cleaner"));
+        this.initializationRetryDelayMillis = INITIALIZATION_RETRY_DELAY_MILLIS;
     }
 
-    public void startCleanupTask() throws Exception {
-        if (this.fileStorage == null) {
-            log.info("No backend file storage configured, skip the cleanup task.");
+    public synchronized void startCleanupTask() {
+        if (lifecycleState == LifecycleState.STOPPED) {
             return;
         }
-        String lastDeletedPosition = getLastDeletedPosition().get();
-        if (lastDeletedPosition == null) {
-            String dummyDatePrefix = IDGeneratorWithDate.getDummyDatePrefix();
-            updateLastDeletedPosition(dummyDatePrefix).get();
-            log.info("Init dummy date prefix: {} to Oxia. Usually, "
-                    + "it means this is a new cluster or the first time start the cleanup service.", dummyDatePrefix);
+        startRequested = true;
+        if (lifecycleState == LifecycleState.INITIALIZATION_SCHEDULED
+                || lifecycleState == LifecycleState.INITIALIZING
+                || lifecycleState == LifecycleState.RUNNING) {
+            return;
         }
-        int interval = config.getCleanupJobIntervalInHours();
-        scheduledService.scheduleAtFixedRate(this, interval, interval, TimeUnit.HOURS);
+        FileStorage initializedFileStorage =
+            walStorage == null ? null : walStorage.getFileStorage();
+        if (initializedFileStorage == null) {
+            lifecycleState = LifecycleState.WAITING_FOR_DATA_PLANE;
+            log.info("WAL data plane is not initialized; defer starting the cleanup task.");
+            return;
+        }
+        fileStorage = initializedFileStorage;
+        scheduleInitializationLocked(0L);
+    }
+
+    synchronized void onDataPlaneAvailable(FileStorage initializedFileStorage) {
+        if (initializedFileStorage == null
+                || lifecycleState == LifecycleState.STOPPED
+                || !startRequested
+                || lifecycleState == LifecycleState.INITIALIZATION_SCHEDULED
+                || lifecycleState == LifecycleState.INITIALIZING
+                || lifecycleState == LifecycleState.RUNNING) {
+            return;
+        }
+        fileStorage = initializedFileStorage;
+        scheduleInitializationLocked(0L);
+    }
+
+    private void scheduleInitializationLocked(long delayMillis) {
+        if (lifecycleState == LifecycleState.STOPPED || fileStorage == null) {
+            return;
+        }
+        try {
+            lifecycleState = LifecycleState.INITIALIZATION_SCHEDULED;
+            initializationFuture = scheduledService.schedule(
+                this::initializeCleanupTask, delayMillis, TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException failure) {
+            if (lifecycleState != LifecycleState.STOPPED) {
+                lifecycleState = LifecycleState.WAITING_FOR_DATA_PLANE;
+                log.error("Failed to schedule WAL cleanup initialization.", failure);
+            }
+        }
+    }
+
+    private void initializeCleanupTask() {
+        synchronized (this) {
+            initializationFuture = null;
+            if (lifecycleState == LifecycleState.STOPPED
+                    || !startRequested
+                    || fileStorage == null) {
+                return;
+            }
+            lifecycleState = LifecycleState.INITIALIZING;
+        }
+
+        Throwable failure = null;
+        try {
+            initializeDeleteMarker();
+        } catch (Throwable initializationFailure) {
+            failure = initializationFailure;
+        }
+
+        if (failure != null) {
+            handleInitializationFailure(failure);
+            return;
+        }
+
+        synchronized (this) {
+            if (lifecycleState == LifecycleState.STOPPED || fileStorage == null) {
+                return;
+            }
+            try {
+                int interval = config.getCleanupJobIntervalInHours();
+                cleanupFuture = scheduledService.scheduleAtFixedRate(
+                    this, interval, interval, TimeUnit.HOURS);
+                lifecycleState = LifecycleState.RUNNING;
+                log.info("Started the WAL cleanup task.");
+            } catch (Throwable schedulingFailure) {
+                handleInitializationFailure(schedulingFailure);
+            }
+        }
+    }
+
+    private void initializeDeleteMarker() throws Exception {
+        String lastDeletedPosition = getLastDeletedPosition().get();
+        if (lastDeletedPosition != null) {
+            return;
+        }
+        String dummyDatePrefix = IDGeneratorWithDate.getDummyDatePrefix();
+        updateLastDeletedPosition(dummyDatePrefix).get();
+        log.info("Init dummy date prefix: {} to Oxia. Usually, "
+                + "it means this is a new cluster or the first time start the cleanup service.",
+            dummyDatePrefix);
+    }
+
+    private synchronized void handleInitializationFailure(Throwable failure) {
+        if (lifecycleState == LifecycleState.STOPPED) {
+            return;
+        }
+        Throwable cause = unwrapExecutionFailure(failure);
+        log.warn("Failed to initialize the WAL cleanup service; retrying in {} ms.",
+            initializationRetryDelayMillis, cause);
+        scheduleInitializationLocked(initializationRetryDelayMillis);
+    }
+
+    private static Throwable unwrapExecutionFailure(Throwable failure) {
+        if (failure instanceof ExecutionException && failure.getCause() != null) {
+            return failure.getCause();
+        }
+        return failure;
+    }
+
+    @VisibleForTesting
+    synchronized LifecycleState lifecycleState() {
+        return lifecycleState;
+    }
+
+    @VisibleForTesting
+    synchronized FileStorage configuredFileStorage() {
+        return fileStorage;
     }
 
     @Override
@@ -79,6 +222,18 @@ public class AsyncCleaner implements Runnable {
 
     @VisibleForTesting
     void cleanup() {
+        FileStorage initializedFileStorage;
+        synchronized (this) {
+            if (lifecycleState == LifecycleState.STOPPED) {
+                return;
+            }
+            initializedFileStorage = fileStorage != null
+                ? fileStorage : walStorage == null ? null : walStorage.getFileStorage();
+        }
+        if (initializedFileStorage == null) {
+            log.info("No backend file storage configured, skip the cleanup task.");
+            return;
+        }
         log.info("Start to clean up the WAL log files.");
         // lock() uses IfRecordDoesNotExist, so it throws when another node already holds the lock.
         // Only release the lock if this node actually took it - unlocking unconditionally in the
@@ -115,7 +270,8 @@ public class AsyncCleaner implements Runnable {
                 } else {
                     log.info("Start to perform the WAL log clean up from {} to {}.", lastDeleted, nextDelete);
                 }
-                fileStorage.deleteWithDatePrefixes(getPrefixes(lastDeleted, nextDelete)).get();
+                initializedFileStorage.deleteWithDatePrefixes(
+                    getPrefixes(lastDeleted, nextDelete)).get();
                 log.info("Applied the S3 object lifecycle change for prefix between {} and {}.",
                         lastDeleted, nextDelete);
                 updateLastDeletedPosition(nextDelete).get();
@@ -170,8 +326,38 @@ public class AsyncCleaner implements Runnable {
     }
 
     void lock() throws Exception {
-        storageApi.getStorageOxiaClient().put(lockPath, lockValue,
-            Set.of(PutOption.AsEphemeralRecord, PutOption.IfRecordDoesNotExist)).get();
+        CompletableFuture<?> acquisition = storageApi.getStorageOxiaClient().put(
+            lockPath, lockValue,
+            Set.of(PutOption.AsEphemeralRecord, PutOption.IfRecordDoesNotExist));
+        try {
+            acquisition.get();
+        } catch (InterruptedException failure) {
+            superviseLateLockAcquisition(acquisition);
+            Thread.currentThread().interrupt();
+            throw failure;
+        }
+    }
+
+    private void superviseLateLockAcquisition(CompletableFuture<?> acquisition) {
+        acquisition.whenComplete((ignored, acquireFailure) -> {
+            if (acquireFailure != null) {
+                return;
+            }
+            final CompletableFuture<Boolean> release;
+            try {
+                release = storageApi.getStorageOxiaClient().delete(lockPath);
+            } catch (RuntimeException | Error releaseFailure) {
+                log.error("Failed to release the WAL cleanup lock after interrupted acquisition.",
+                    releaseFailure);
+                return;
+            }
+            release.whenComplete((deleted, releaseFailure) -> {
+                if (releaseFailure != null) {
+                    log.error("Failed to release the WAL cleanup lock after interrupted "
+                        + "acquisition.", releaseFailure);
+                }
+            });
+        });
     }
 
     void unlock() {
@@ -185,6 +371,34 @@ public class AsyncCleaner implements Runnable {
     }
 
     public void stop() {
-        scheduledService.shutdown();
+        ScheduledFuture<?> initializationToCancel;
+        ScheduledFuture<?> cleanupToCancel;
+        synchronized (this) {
+            if (lifecycleState == LifecycleState.STOPPED) {
+                return;
+            }
+            lifecycleState = LifecycleState.STOPPED;
+            startRequested = false;
+            fileStorage = null;
+            initializationToCancel = initializationFuture;
+            cleanupToCancel = cleanupFuture;
+            initializationFuture = null;
+            cleanupFuture = null;
+        }
+        if (initializationToCancel != null) {
+            initializationToCancel.cancel(true);
+        }
+        if (cleanupToCancel != null) {
+            cleanupToCancel.cancel(true);
+        }
+        scheduledService.shutdownNow();
+        try {
+            if (!scheduledService.awaitTermination(STOP_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                log.warn("Timed out waiting for the WAL cleanup service to stop.");
+            }
+        } catch (InterruptedException failure) {
+            Thread.currentThread().interrupt();
+            log.warn("Interrupted while waiting for the WAL cleanup service to stop.", failure);
+        }
     }
 }

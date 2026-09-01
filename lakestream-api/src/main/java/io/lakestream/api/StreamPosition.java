@@ -5,7 +5,7 @@
 package io.lakestream.api;
 
 /**
- * Abstract position within a stream — created by and interpreted by the layout.
+ * Abstract position within a stream layout — created by and interpreted by that layout.
  *
  * <p>Different layouts resolve positions differently:
  * <ul>
@@ -13,9 +13,10 @@ package io.lakestream.api;
  *   <li><b>RANGE split/merge</b>: layout-specific resolution (may span logs)</li>
  * </ul>
  *
- * <p>Positions are created via {@link StreamLayout#position(LogId, long)} and
- * consumed by {@link Stream#softTrim(StreamPosition)} and
- * {@link Stream#hardTrim(StreamPosition)}.
+ * <p>Positions are created via {@link StreamLayout#position(LogId, long)}. A layout is available
+ * from {@link StreamMetadata#layout()} or {@link StreamCatalog#getLayout(StreamIdentifier)};
+ * per-log data-plane operations use a {@link Log} opened through
+ * {@link StreamCatalog#openLog(StreamIdentifier, LogId)}.
  *
  * @see StreamLayout#position(LogId, long)
  */

@@ -4,6 +4,7 @@
  */
 package io.lakestream.api;
 
+import io.lakestream.api.materialization.ResolvedMaterialization;
 import io.lakestream.api.materialization.TableCatalog;
 import io.lakestream.api.materialization.TableMaterializationPolicy;
 import java.util.List;
@@ -14,13 +15,14 @@ import java.util.concurrent.CompletableFuture;
 /**
  * Level 2 interface: stream catalog for metadata management.
  *
- * <p>Provides CRUD operations for namespaces and streams, plus factory methods
- * for obtaining {@link StreamLayout}, {@link StreamWriter}, and {@link StreamReader}.
+ * <p>Provides CRUD operations for namespaces and streams. Metadata operations return immutable
+ * snapshots; data-plane handles are opened explicitly through {@link #openLog},
+ * {@link #openWriter}, or {@link #openReader}.
+ * Every returned data-plane handle must be closed before its catalog is closed.
  *
  * <p>Implementations:
  * <ul>
  *   <li>{@code IndexedStreamCatalog} — Oxia-backed catalog using indexed partitions</li>
- *   <li>{@code LakestreamCatalog} — rill-compatible catalog with new metadata format</li>
  * </ul>
  *
  * <p>Thread safety: implementations must be safe for concurrent use.
@@ -159,10 +161,10 @@ public interface StreamCatalog extends AutoCloseable {
 
     /**
      * Sets a cluster-wide default materialization policy. This is the lowest-priority baseline:
-     * {@link Stream#effectiveMaterialization()} resolves a stream policy first, then its namespace
-     * policy, and finally this cluster default. It lets {@code materializationEnabled=true} (with no
-     * {@code materializationDefaultNamespace}) materialize every stream in every namespace without
-     * per-namespace authoring.
+     * {@link #resolveMaterialization(StreamIdentifier)} resolves a stream policy first, then its
+     * namespace policy, and finally this cluster default. It lets
+     * {@code materializationEnabled=true} (with no {@code materializationDefaultNamespace})
+     * materialize every stream in every namespace without per-namespace authoring.
      *
      * @param policy the cluster-wide default policy
      * @return a future that completes when the policy is set
@@ -173,8 +175,9 @@ public interface StreamCatalog extends AutoCloseable {
     }
 
     /**
-     * Returns the cluster-wide default materialization policy, or {@link Optional#empty()} if none is
-     * set. Used as the lowest-priority fallback when resolving {@link Stream#effectiveMaterialization()}.
+     * Returns the cluster-wide default materialization policy, or {@link Optional#empty()} if none
+     * is set. Used as the lowest-priority fallback when resolving
+     * {@link #resolveMaterialization(StreamIdentifier)}.
      *
      * @return the cluster-wide default policy, if any
      */
@@ -193,6 +196,18 @@ public interface StreamCatalog extends AutoCloseable {
     CompletableFuture<List<StreamIdentifier>> listStreams(String namespaceName);
 
     /**
+     * Lists non-terminal stream lifecycle records in a namespace without opening data-plane
+     * resources.
+     *
+     * <p>The result includes streams that are being created, active, or being deleted. Completed
+     * deletion tombstones are not returned.
+     *
+     * @param namespaceName the namespace to inspect
+     * @return a future resolving to metadata-only lifecycle entries
+     */
+    CompletableFuture<List<StreamCatalogEntry>> listStreamEntries(String namespaceName);
+
+    /**
      * Creates a new stream.
      *
      * @param id the stream identifier
@@ -205,11 +220,11 @@ public interface StreamCatalog extends AutoCloseable {
      * @throws io.lakestream.api.exception.StreamPermanentlyDeletedException if the identifier has
      *     a durable permanent-deletion fence and can never be created again
      * @throws UnsupportedOperationException if recovery encounters retired keyed allocations and
-     *     the catalog storage cannot durably fence their mappings
+     *     the catalog storage cannot durably fence their mappings and writes
      */
-    CompletableFuture<Stream> createStream(StreamIdentifier id, StreamConfig config,
-                                            Partitioning partitioning, SchemaConfig schema,
-                                            Map<String, String> properties);
+    CompletableFuture<StreamMetadata> createStream(StreamIdentifier id, StreamConfig config,
+                                                    Partitioning partitioning, SchemaConfig schema,
+                                                    Map<String, String> properties);
 
     /**
      * Creates a new stream with an optional stream-level materialization policy.
@@ -225,12 +240,12 @@ public interface StreamCatalog extends AutoCloseable {
      * @throws io.lakestream.api.exception.StreamPermanentlyDeletedException if the identifier has
      *     a durable permanent-deletion fence and can never be created again
      * @throws UnsupportedOperationException if recovery encounters retired keyed allocations and
-     *     the catalog storage cannot durably fence their mappings
+     *     the catalog storage cannot durably fence their mappings and writes
      */
-    CompletableFuture<Stream> createStream(StreamIdentifier id, StreamConfig config,
-                                            Partitioning partitioning, SchemaConfig schema,
-                                            Map<String, String> properties,
-                                            Optional<TableMaterializationPolicy> materialization);
+    CompletableFuture<StreamMetadata> createStream(
+            StreamIdentifier id, StreamConfig config, Partitioning partitioning,
+            SchemaConfig schema, Map<String, String> properties,
+            Optional<TableMaterializationPolicy> materialization);
 
     /**
      * Loads the full metadata for a stream.
@@ -239,87 +254,60 @@ public interface StreamCatalog extends AutoCloseable {
      * @return a future resolving to the stream metadata
      * @throws io.lakestream.api.exception.NoSuchStreamException if not found
      */
-    CompletableFuture<Stream> loadStream(StreamIdentifier identifier);
+    CompletableFuture<StreamMetadata> loadStream(StreamIdentifier identifier);
 
     /**
-     * Idempotently registers a single partition of a stream whose underlying log was created
-     * outside this catalog (for example, a stream created by an external control plane rather than through
-     * {@link #createStream}). Grows the stream config so its partition count is at least
-     * {@code partitionIndex + 1}, preserving any existing properties and materialization policy,
-     * then creates or ownership-retags the catalog partition metadata for {@code partitionIndex}
-     * using the supplied {@code streamId}.
+     * Idempotently increases the number of committed indexed partitions in a stream.
      *
-     * <p>This lets a consumer (for example, the materialization compaction worker) resolve an
-     * broker-created stream via {@link #loadStream} that would otherwise throw
-     * {@link io.lakestream.api.exception.NoSuchStreamException}.
+     * <p>Existing partitions remain available while the new logs are provisioned. The committed
+     * layout is published atomically only after every new partition has durable log and catalog
+     * metadata.
      *
-     * <p>The operation is safe to call concurrently and repeatedly while the partition belongs to
-     * the same live registration lifecycle. {@link #deleteExternalPartition} retains a partition
-     * tombstone, so that lifecycle cannot register the deleted partition again. To intentionally
-     * recreate it, first call
-     * {@link ExternalStreamRegistry#unregisterExternalStream(StreamIdentifier)}, then register or
-     * open the partition again. That stream-level transition advances the ownership generation and
-     * preserves the fence against delayed writers from the deleted generation.
-     *
-     * @param id             the partition-stripped stream identity
-     * @param partitionIndex the partition being registered (0 for a non-partitioned stream)
-     * @param streamId       the underlying log id for this partition; it must be globally unique
-     *                       and must never be reused after that physical log is retired
-     * @param properties     stream properties to seed when first creating the config (may be empty)
-     * @throws io.lakestream.api.exception.PartitionLifecycleFencedException if retained partition
-     *     metadata fences this registration lifecycle
-     * @throws io.lakestream.api.exception.StreamPermanentlyDeletedException if the stream identity
-     *     has a durable permanent-deletion fence
-     * @throws UnsupportedOperationException if retired keyed allocations require durable mapping
-     *     fencing that the catalog storage does not support
+     * @param identifier the stream to expand
+     * @param targetPartitionCount the desired total partition count
+     * @return a future resolving to the resulting committed stream metadata
      */
-    CompletableFuture<Void> registerExternalPartition(StreamIdentifier id, int partitionIndex,
-                                                      long streamId, Map<String, String> properties);
+    CompletableFuture<StreamMetadata> increasePartitions(
+        StreamIdentifier identifier, int targetPartitionCount);
 
     /**
-     * Opens a partition whose lifecycle is controlled by an external system.
+     * Replaces all stream properties using a monotonically increasing source revision.
      *
-     * <p>The implementation derives the persistent log name, creates or reuses its keyed log ID,
-     * registers the partition in the catalog, and returns a reader-aware log handle.
+     * <p>A revision older than or equal to the last applied revision is an idempotent no-op.
      *
-     * @param id the partition-stripped stream identity
-     * @param partitionIndex the zero-based partition index
-     * @param properties stream properties to seed when first registering the stream
-     * @return a future resolving to the opened log
-     * @throws io.lakestream.api.exception.PartitionLifecycleFencedException if retained partition
-     *     metadata fences this registration lifecycle
-     * @throws io.lakestream.api.exception.StreamPermanentlyDeletedException if the stream identity
-     *     has a durable permanent-deletion fence
-     * @throws UnsupportedOperationException if retired keyed allocations require durable mapping
-     *     fencing that the catalog storage does not support
+     * @param identifier the stream to update
+     * @param properties the complete replacement property snapshot
+     * @param sourceRevision the external source revision associated with the snapshot
+     * @return a future resolving to the resulting stream metadata
      */
-    CompletableFuture<Log> openExternalPartition(StreamIdentifier id, int partitionIndex,
-                                                  Map<String, String> properties);
+    CompletableFuture<StreamMetadata> replaceStreamProperties(
+        StreamIdentifier identifier, Map<String, String> properties, long sourceRevision);
 
     /**
-     * Deletes an externally controlled partition.
+     * Resolves the effective materialization policy for a stream without opening data-plane
+     * resources.
      *
-     * <p>Deletion first replaces catalog partition metadata with an ownership-fenced tombstone,
-     * then removes log data and atomically replaces the keyed log-ID mapping with a durable fence.
-     * Both tombstones are retained so a delayed writer from the deleted incarnation cannot make
-     * the partition visible again.
-     *
-     * @param id the partition-stripped stream identity
-     * @param partitionIndex the zero-based partition index
-     * @return a future that completes when deletion is finished
-     * @throws UnsupportedOperationException if the catalog storage cannot durably fence a keyed
-     *     stream-ID mapping
+     * @param identifier the stream to resolve
+     * @return a future resolving to the materialization target, or empty when materialization is
+     *     disabled or its referenced table catalog does not exist
      */
-    CompletableFuture<Void> deleteExternalPartition(StreamIdentifier id, int partitionIndex);
+    CompletableFuture<Optional<ResolvedMaterialization>> resolveMaterialization(
+        StreamIdentifier identifier);
 
     /**
      * Drops a stream.
      *
+     * <p>Dropping an identifier with no live stream still durably tombstones that identifier so a
+     * late create or reconciler cannot resurrect it. A later {@link #createStream} for the same
+     * identifier must fail with a permanent-deletion error. Consequently, a {@code false} result
+     * means that no live stream existed; it does not mean that catalog metadata was unchanged.
+     *
      * @param identifier the stream to drop
      * @param purge if true, also purge all data; if false, only remove metadata
-     * @return a future resolving to true if the stream was dropped, false if it didn't exist
+     * @return a future resolving to true if a live stream was dropped, false if no live stream
+     *     existed before the permanent tombstone was installed
      * @throws UnsupportedOperationException if the catalog storage cannot durably fence keyed
-     *     stream-ID mappings
+     *     stream-ID mappings and writes to retired log IDs
      */
     CompletableFuture<Boolean> dropStream(StreamIdentifier identifier, boolean purge);
 
@@ -330,24 +318,6 @@ public interface StreamCatalog extends AutoCloseable {
      * @return a future resolving to true if the stream exists
      */
     CompletableFuture<Boolean> streamExists(StreamIdentifier identifier);
-
-    /**
-     * Sets properties on a stream (merge semantics).
-     *
-     * @param id the stream identifier
-     * @param props the properties to set
-     * @return a future that completes when the properties are updated
-     */
-    CompletableFuture<Void> setStreamProperties(StreamIdentifier id, Map<String, String> props);
-
-    /**
-     * Removes properties from a stream.
-     *
-     * @param id the stream identifier
-     * @param keys the property keys to remove
-     * @return a future that completes when the properties are removed
-     */
-    CompletableFuture<Void> removeStreamProperties(StreamIdentifier id, List<String> keys);
 
     /**
      * Sets the stream-level materialization policy override.
@@ -366,24 +336,6 @@ public interface StreamCatalog extends AutoCloseable {
      */
     CompletableFuture<Void> clearStreamMaterialization(StreamIdentifier id);
 
-    // --- Lifecycle ---
-
-    /**
-     * Seals a stream — no more writes accepted, reads still work.
-     *
-     * @param identifier the stream to seal
-     * @return a future that completes when the stream is sealed
-     */
-    CompletableFuture<Void> sealStream(StreamIdentifier identifier);
-
-    /**
-     * Truncates all data in a stream.
-     *
-     * @param identifier the stream to truncate
-     * @return a future that completes when truncation is done
-     */
-    CompletableFuture<Void> truncateStream(StreamIdentifier identifier);
-
     // --- Data plane ---
 
     /**
@@ -395,6 +347,20 @@ public interface StreamCatalog extends AutoCloseable {
     CompletableFuture<StreamLayout> getLayout(StreamIdentifier identifier);
 
     /**
+     * Opens an existing log that belongs to the stream's committed layout.
+     *
+     * <p>This is a pure data-plane open operation. It must not allocate a log ID, register a
+     * partition, grow the stream, or mutate catalog metadata.
+     *
+     * @param identifier the stream identifier
+     * @param logId an existing log ID from the stream's committed layout
+     * @return a future resolving to the opened log
+     * @throws io.lakestream.api.exception.NoSuchStreamException if the stream is not active
+     * @throws IllegalArgumentException if the log ID is not in the committed stream layout
+     */
+    CompletableFuture<Log> openLog(StreamIdentifier identifier, LogId logId);
+
+    /**
      * Opens a writer for the stream.
      *
      * @param identifier the stream to write to
@@ -404,6 +370,9 @@ public interface StreamCatalog extends AutoCloseable {
 
     /**
      * Opens a reader for the stream.
+     *
+     * <p>The returned handle owns its lazily opened child logs and must be closed before the
+     * catalog is closed.
      *
      * @param identifier the stream to read from
      * @return a future resolving to a stream reader

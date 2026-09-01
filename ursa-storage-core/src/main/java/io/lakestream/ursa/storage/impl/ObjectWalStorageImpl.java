@@ -16,6 +16,7 @@ import io.lakestream.ursa.storage.Entry;
 import io.lakestream.ursa.storage.EntryList;
 import io.lakestream.ursa.storage.FileStorage;
 import io.lakestream.ursa.storage.IDGenerator;
+import io.lakestream.ursa.storage.OwnedResultFutures;
 import io.lakestream.ursa.storage.WalStorage;
 import io.lakestream.ursa.storage.WalStorageMetrics;
 import io.lakestream.ursa.storage.impl.exception.IDGeneratorException;
@@ -409,7 +410,7 @@ public class ObjectWalStorageImpl implements WalStorage {
                 metrics.getPutEntryRequestCount().increment();
             }
         });
-        return future;
+        return OwnedResultFutures.nonCancellableCompletion(future);
     }
 
 

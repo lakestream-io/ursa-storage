@@ -259,7 +259,8 @@ public class CompactedDataCleanupHandler implements StartStopRunner {
                     log.info("Deleted parquet files for topic: {}, end offset: {}, files count: {}, deleted files: {}",
                             task.topic(), subTask.endOffset(), files.size(), files);
                     final var streamId = task.streamId();
-                    return storage.hardTrimStream(streamId, subTask.endOffset())
+                    return storage.withStreamWriteLease(streamId, ignoredLease ->
+                        storage.hardTrimStream(streamId, subTask.endOffset()))
                             .thenAccept(___ -> log.info(
                                     "Deleted stream head for topic: {}, end offset: {}, stream-id: {}",
                                     task.topic(), subTask.endOffset(), streamId));

@@ -6,18 +6,19 @@ package io.lakestream.ursa.storage;
 
 import io.lakestream.api.EntryHeader;
 import io.lakestream.api.EntryIndex;
-import io.lakestream.api.LogState;
 import io.lakestream.api.LogStateManager;
 import io.lakestream.api.Position;
 import io.netty.buffer.ByteBuf;
 import io.oxia.client.api.AsyncOxiaClient;
 import java.io.Closeable;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
 
 /**
  * StorageApi is the high-level interface for the Ursa stream storage engine.
@@ -76,6 +77,81 @@ import java.util.concurrent.CompletableFuture;
  * storage operations.
  */
 public interface StorageApi extends Closeable {
+
+    /**
+     * A durable-storage write lease held by one opened writable log handle.
+     *
+     * <p>The backing record is ephemeral and therefore also disappears when the Oxia client
+     * session expires. Callers must nevertheless close the lease explicitly after all writes
+     * issued by the log handle have drained. Closing is idempotent. Implementations must retain
+     * ownership of a started release and retry transient metadata-store failures internally; a
+     * caller dropping or attempting to cancel the returned future must not abandon the ephemeral
+     * lease cleanup.
+     */
+    interface StreamWriteLease extends AutoCloseable {
+
+        /** Returns the numeric stream ID protected by this lease. */
+        long streamId();
+
+        /**
+         * Releases this lease asynchronously.
+         *
+         * <p>Concurrent calls share one in-flight completion. Transient release failures are
+         * retried internally with bounded backoff until the ephemeral lease is removed. Caller
+         * cancellation must not stop that cleanup.
+         */
+        CompletableFuture<Void> closeAsync();
+
+        /** Releases this lease and waits for Oxia to acknowledge the deletion. */
+        @Override
+        default void close() {
+            closeAsync().join();
+        }
+    }
+
+    /**
+     * Reports that physical deletion could not drain the opened writable log handles before its
+     * deadline.
+     *
+     * <p>The durable write fence remains installed after this exception. No stream indexes or
+     * registration metadata have been purged, so a lifecycle reconciler can retry deletion later.
+     */
+    final class StreamWriteLeaseDrainTimeoutException extends IllegalStateException {
+
+        /** The active count is unknown because the lease inventory read itself timed out. */
+        public static final int UNKNOWN_ACTIVE_LEASE_COUNT = -1;
+
+        private final long streamId;
+        private final int activeLeaseCount;
+
+        public StreamWriteLeaseDrainTimeoutException(long streamId, int activeLeaseCount,
+                                                      Duration timeout) {
+            super(timeoutMessage(streamId, activeLeaseCount, timeout));
+            if (activeLeaseCount < UNKNOWN_ACTIVE_LEASE_COUNT) {
+                throw new IllegalArgumentException(
+                    "activeLeaseCount must be non-negative or UNKNOWN_ACTIVE_LEASE_COUNT");
+            }
+            this.streamId = streamId;
+            this.activeLeaseCount = activeLeaseCount;
+        }
+
+        private static String timeoutMessage(
+                long streamId, int activeLeaseCount, Duration timeout) {
+            String leaseDescription = activeLeaseCount == UNKNOWN_ACTIVE_LEASE_COUNT
+                ? "the active write-lease inventory"
+                : activeLeaseCount + " active write lease(s)";
+            return "Timed out after " + timeout + " waiting for " + leaseDescription
+                + " on stream " + streamId;
+        }
+
+        public long streamId() {
+            return streamId;
+        }
+
+        public int activeLeaseCount() {
+            return activeLeaseCount;
+        }
+    }
 
     /**
      * Generates a globally unique stream ID that is never reused by this storage instance.
@@ -471,8 +547,12 @@ public interface StorageApi extends Closeable {
      *
      * @param streamId         The ID of the stream
      * @param numberOfMessages The number of messages in the data
-     * @param data             The ByteBuf containing the data to append
+     * @param data             The ByteBuf containing the data to append. The caller retains
+     *                         ownership of its reference until the returned future completes and
+     *                         must then release that reference exactly once.
      * @return A CompletableFuture that resolves to the EntryHeader of the appended entry
+     * @implSpec Durable-fencing implementations require an active {@link StreamWriteLease} owned
+     *     by the same storage instance.
      */
     CompletableFuture<AddResult> append(long streamId, int numberOfMessages, ByteBuf data);
 
@@ -483,8 +563,12 @@ public interface StorageApi extends Closeable {
      * @param numberOfMessages The number of messages in the data
      * @param initialOffset    The initial offset of the entry
      * @param cumulativeSize   The specified cumulative size
-     * @param data             The ByteBuf containing the data to append
+     * @param data             The ByteBuf containing the data to append. The caller retains
+     *                         ownership of its reference until the returned future completes and
+     *                         must then release that reference exactly once.
      * @return A CompletableFuture that resolves to the EntryHeader of the appended entry
+     * @implSpec Durable-fencing implementations require an active {@link StreamWriteLease} owned
+     *     by the same storage instance.
      */
     CompletableFuture<AddResult> write(long streamId, int numberOfMessages, long initialOffset, long cumulativeSize,
                                        ByteBuf data);
@@ -582,6 +666,8 @@ public interface StorageApi extends Closeable {
      * @param streamId       The ID of the stream
      * @param offsetIncluded The offset up to which (inclusive) entries should be removed
      * @return the future of the first entry's offset after the truncation is done
+     * @implSpec Durable-fencing implementations require an active {@link StreamWriteLease} owned
+     *     by the same storage instance.
      */
     CompletableFuture<Long> softTrimStream(long streamId, long offsetIncluded);
 
@@ -600,8 +686,137 @@ public interface StorageApi extends Closeable {
      * @param streamId       The ID of the stream from which to delete entries
      * @param offsetExcluded The offset up to which (exclusive) entries should be deleted
      * @return A CompletableFuture that completes when the entries have been deleted
+     * @implSpec Durable-fencing implementations require an active {@link StreamWriteLease} owned
+     *     by the same storage instance.
      */
     CompletableFuture<Void> hardTrimStream(long streamId, long offsetExcluded);
+
+    /**
+     * Returns whether this storage implementation provides durable, cross-process stream write
+     * fencing and ephemeral per-log-handle leases.
+     */
+    default boolean supportsDurableStreamWriteFencing() {
+        return false;
+    }
+
+    /**
+     * Acquires an ephemeral write lease for one opened writable-log handle of the numeric stream.
+     *
+     * <p>The lease is published before the durable fence is checked. This ordering closes the
+     * open-versus-delete race: a lease ordered before the fence blocks physical deletion, while a
+     * lease ordered after the fence is rejected and removed. Callers must retain the returned
+     * lease for the entire lifetime of the opened log and close it only after outstanding writes
+     * have drained.
+     *
+     * @param streamId numeric stream ID to open for writing
+     * @return a future resolving to an owned, idempotently closeable lease
+     */
+    default CompletableFuture<StreamWriteLease> acquireStreamWriteLease(long streamId) {
+        return CompletableFuture.failedFuture(new UnsupportedOperationException(
+            "Durable stream write leases are not supported"));
+    }
+
+    /**
+     * Runs one storage mutation while owning a durable write lease for its entire lifetime.
+     *
+     * <p>Cancellation of the returned future does not abandon the mutation or lease cleanup. The
+     * lease is released only after the mutation settles. If both mutation and release fail, the
+     * release failure is attached to the mutation failure.
+     *
+     * @param streamId numeric stream ID being mutated
+     * @param mutation operation to run after the lease is acquired
+     * @param <T> mutation result type
+     * @return a future that completes only after the mutation and lease release settle
+     */
+    default <T> CompletableFuture<T> withStreamWriteLease(
+            long streamId,
+            Function<StreamWriteLease, CompletableFuture<T>> mutation) {
+        Objects.requireNonNull(mutation, "mutation");
+        CompletableFuture<T> result = new CompletableFuture<>();
+        acquireStreamWriteLease(streamId).whenComplete((lease, acquireFailure) -> {
+            if (acquireFailure != null) {
+                result.completeExceptionally(acquireFailure);
+                return;
+            }
+            final CompletableFuture<T> operation;
+            try {
+                operation = Objects.requireNonNull(
+                    mutation.apply(lease), "storage mutation future");
+            } catch (RuntimeException | Error failure) {
+                completeAfterWriteLeaseClose(result, lease, null, failure);
+                return;
+            }
+            operation.whenComplete((value, failure) ->
+                completeAfterWriteLeaseClose(result, lease, value, failure));
+        });
+        return result;
+    }
+
+    private static <T> void completeAfterWriteLeaseClose(
+            CompletableFuture<T> result, StreamWriteLease lease,
+            T value, Throwable mutationFailure) {
+        final CompletableFuture<Void> close;
+        try {
+            close = Objects.requireNonNull(lease.closeAsync(), "lease close future");
+        } catch (RuntimeException | Error closeFailure) {
+            completeWriteLeaseResult(result, value, mutationFailure, closeFailure);
+            return;
+        }
+        close.whenComplete((ignored, closeFailure) ->
+            completeWriteLeaseResult(result, value, mutationFailure, closeFailure));
+    }
+
+    private static <T> void completeWriteLeaseResult(
+            CompletableFuture<T> result, T value,
+            Throwable mutationFailure, Throwable closeFailure) {
+        if (mutationFailure != null) {
+            if (closeFailure != null && closeFailure != mutationFailure) {
+                mutationFailure.addSuppressed(closeFailure);
+            }
+            result.completeExceptionally(mutationFailure);
+        } else if (closeFailure != null) {
+            result.completeExceptionally(closeFailure);
+        } else {
+            result.complete(value);
+        }
+    }
+
+    /**
+     * Permanently fences new write leases for a numeric stream ID.
+     *
+     * <p>This operation is durable and idempotent. There is intentionally no unfence operation:
+     * numeric stream IDs must never be reused after fencing.
+     */
+    default CompletableFuture<Void> fenceStreamWrites(long streamId) {
+        return CompletableFuture.failedFuture(new UnsupportedOperationException(
+            "Durable stream write fencing is not supported"));
+    }
+
+    /**
+     * Permanently fences a numeric stream ID and waits for every opened write lease to drain,
+     * without deleting its data.
+     *
+     * <p>Successful retirement is terminal: no later writable handle may be opened for this
+     * numeric ID. A timeout leaves the durable fence and physical data intact so lifecycle
+     * reconciliation can retry safely.
+     */
+    default CompletableFuture<Void> fenceAndDrainStreamWrites(long streamId) {
+        return fenceAndDrainStreamWrites(streamId, Duration.ofSeconds(30));
+    }
+
+    /**
+     * Permanently fences a numeric stream ID and drains write leases within the supplied timeout.
+     *
+     * @param streamId numeric stream ID to retire
+     * @param leaseDrainTimeout maximum time to wait for opened write leases
+     * @return a future completing after the durable fence is installed and leases are drained
+     */
+    default CompletableFuture<Void> fenceAndDrainStreamWrites(
+            long streamId, Duration leaseDrainTimeout) {
+        Objects.requireNonNull(leaseDrainTimeout, "leaseDrainTimeout");
+        return CompletableFuture.failedFuture(new UnsupportedOperationException(
+            "Durable stream write fencing is not supported"));
+    }
 
     /**
      * Deletes the specified stream.
@@ -613,6 +828,28 @@ public interface StorageApi extends Closeable {
      */
     default CompletableFuture<Void> deleteStream(long streamId) {
         return deleteStream(streamId, Optional.empty());
+    }
+
+    /**
+     * Deletes a numeric stream after permanently fencing new handles and draining existing write
+     * leases.
+     *
+     * <p>Implementations that advertise {@link #supportsDurableStreamWriteFencing()} must leave the
+     * durable fence installed on every outcome. If the timeout expires, the future fails with
+     * {@link StreamWriteLeaseDrainTimeoutException} and physical data must remain untouched.
+     * Existing implementations without durable fencing retain their legacy deletion behavior.
+     *
+     * @param streamId numeric stream ID to delete
+     * @param leaseDrainTimeout maximum time to wait for all opened-handle leases to close
+     * @return a future completing only after physical deletion succeeds
+     */
+    default CompletableFuture<Void> deleteStream(long streamId, Duration leaseDrainTimeout) {
+        Objects.requireNonNull(leaseDrainTimeout, "leaseDrainTimeout");
+        if (leaseDrainTimeout.isNegative()) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException(
+                "leaseDrainTimeout must not be negative"));
+        }
+        return deleteStream(streamId);
     }
 
     /**
@@ -645,6 +882,8 @@ public interface StorageApi extends Closeable {
      * @param endOffset The end offset for compact index.
      * @param endCumulativeSize The new compacted key's endCumulativeSize
      * @param value The new value.
+     * @implSpec Durable-fencing implementations require an active {@link StreamWriteLease} owned
+     *     by the same storage instance.
      */
     CompletableFuture<Void> compactEntryIndex(long streamId, long startOffset, long endOffset, long endCumulativeSize,
                                               Value value);
@@ -761,9 +1000,9 @@ public interface StorageApi extends Closeable {
                                                     boolean includeTrimmed);
 
     /**
-     * Get the log state manager, which manages the state of all streams generated by this storage.
-     * When an existing stream id is retrieved from {@link this#generateStreamId(Optional)}, the stream's state will be
-     * reset as {@link LogState#NORMAL} automatically.
+     * Get the log state manager, which manages the process-local state of all streams generated by
+     * this storage. A durable write fence is terminal for a numeric stream ID and is never reset by
+     * resolving an existing keyed mapping.
      */
     LogStateManager getStreamStateManager();
 }

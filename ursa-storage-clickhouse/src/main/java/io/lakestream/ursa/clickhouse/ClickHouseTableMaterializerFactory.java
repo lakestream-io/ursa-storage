@@ -4,8 +4,7 @@
  */
 package io.lakestream.ursa.clickhouse;
 
-import io.lakestream.api.Stream;
-import io.lakestream.api.materialization.ResolvedMaterialization;
+import io.lakestream.api.StreamMetadata;
 import io.lakestream.api.materialization.TableCatalog;
 import io.lakestream.api.materialization.TableCatalogType;
 import io.lakestream.api.materialization.TableIdentifier;
@@ -27,7 +26,6 @@ import java.sql.Connection;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
 import javax.annotation.Nullable;
 
 /**
@@ -49,11 +47,11 @@ public final class ClickHouseTableMaterializerFactory implements TableMaterializ
     @Override
     public TableMaterializer<?> create(TableMaterializationPolicy policy,
                                        TableCatalog resolvedCatalog,
-                                       Stream stream,
+                                       StreamMetadata streamMetadata,
                                        MaterializationRuntime runtime) {
         Objects.requireNonNull(policy, "policy");
         Objects.requireNonNull(resolvedCatalog, "resolvedCatalog");
-        Objects.requireNonNull(stream, "stream");
+        Objects.requireNonNull(streamMetadata, "streamMetadata");
         Objects.requireNonNull(runtime, "runtime");
 
         if (resolvedCatalog.type() != TableCatalogType.CLICKHOUSE) {
@@ -62,7 +60,7 @@ public final class ClickHouseTableMaterializerFactory implements TableMaterializ
                             + resolvedCatalog.name() + " (type=" + resolvedCatalog.type() + ")");
         }
 
-        TableIdentifier tableId = resolveTableIdentifier(policy, stream);
+        TableIdentifier tableId = resolveTableIdentifier(policy, streamMetadata);
         ClickHouseTableEngine engine = ClickHouseTableEngine.forPolicy(policy);
         List<String> primaryKey = policy.primaryKey().orElseGet(List::of);
         int batchSize = policy.framework()
@@ -83,7 +81,7 @@ public final class ClickHouseTableMaterializerFactory implements TableMaterializ
                 rowEncoder = new EntrySerdeFactory(sourceSchemaService).getEncoder(SerdeType.KAFKA_CLICKHOUSE);
             }
             if (rowEncoder != null) {
-                String sourceTopic = sourceTopic(stream, runtime);
+                String sourceTopic = sourceTopic(streamMetadata, runtime);
                 // Share the materializer's JDBC connection so the schema-aware path can create/evolve the
                 // destination table (derived from the decoded row shape) before the first INSERT.
                 ClickHouseTableSchemaService chSchemaService = new ClickHouseTableSchemaService(
@@ -104,19 +102,19 @@ public final class ClickHouseTableMaterializerFactory implements TableMaterializ
         }
     }
 
-    static String sourceTopic(Stream stream, MaterializationRuntime runtime) {
+    static String sourceTopic(StreamMetadata streamMetadata, MaterializationRuntime runtime) {
         return KafkaSourceMetadata.topicName(
-                stream.identifier().fullName(), runtime.taskProperties());
+                streamMetadata.identifier().fullName(), runtime.taskProperties());
     }
 
     @Override
     @Nullable
     public TableSchemaService<?, ?> schemaService(TableMaterializationPolicy policy,
                                                   TableCatalog resolvedCatalog,
-                                                  Stream stream) {
+                                                  StreamMetadata streamMetadata) {
         Objects.requireNonNull(policy, "policy");
         Objects.requireNonNull(resolvedCatalog, "resolvedCatalog");
-        Objects.requireNonNull(stream, "stream");
+        Objects.requireNonNull(streamMetadata, "streamMetadata");
 
         if (resolvedCatalog.type() != TableCatalogType.CLICKHOUSE) {
             throw new MaterializationException(ExceptionCode.INTERNAL_ERROR,
@@ -124,10 +122,10 @@ public final class ClickHouseTableMaterializerFactory implements TableMaterializ
                             + resolvedCatalog.name() + " (type=" + resolvedCatalog.type() + ")");
         }
 
-        TableIdentifier tableId = resolveTableIdentifier(policy, stream);
+        TableIdentifier tableId = resolveTableIdentifier(policy, streamMetadata);
         ClickHouseTableEngine engine = ClickHouseTableEngine.forPolicy(policy);
         List<String> primaryKey = policy.primaryKey().orElseGet(List::of);
-        String streamId = stream.identifier().fullName();
+        String streamId = streamMetadata.identifier().fullName();
 
         Connection connection = ClickHouseConnectionFactory.open(resolvedCatalog, policy);
         return new ClickHouseTableSchemaService(connection, tableId, engine, primaryKey, streamId);
@@ -137,23 +135,16 @@ public final class ClickHouseTableMaterializerFactory implements TableMaterializ
      * Resolves the destination table identifier. Prefers the policy's explicit
      * {@link TableMaterializationPolicy#tableIdentifier()} (used by the
      * orchestrator after {@link io.lakestream.api.materialization.ResolvedMaterialization}
-     * resolution) and falls back to the stream's
-     * {@link Stream#effectiveMaterialization() effective materialization} when the policy was
-     * built without one.
+     * resolution). The factory never performs catalog resolution itself.
      */
     private static TableIdentifier resolveTableIdentifier(TableMaterializationPolicy policy,
-                                                          Stream stream) {
-        Optional<TableIdentifier> explicit = policy.tableIdentifier();
-        if (explicit.isPresent()) {
-            return sanitize(explicit.get());
-        }
-        Optional<ResolvedMaterialization> resolved = stream.effectiveMaterialization();
-        if (resolved.isPresent()) {
-            return sanitize(resolved.get().tableIdentifier());
-        }
-        throw new MaterializationException(ExceptionCode.INTERNAL_ERROR,
-                "ClickHouse policy for stream " + stream.identifier().fullName()
-                        + " has no resolvable table identifier");
+                                                          StreamMetadata streamMetadata) {
+        return policy.tableIdentifier()
+                .map(ClickHouseTableMaterializerFactory::sanitize)
+                .orElseThrow(() -> new MaterializationException(ExceptionCode.INTERNAL_ERROR,
+                        "Resolved ClickHouse policy for stream "
+                                + streamMetadata.identifier().fullName()
+                                + " has no table identifier"));
     }
 
     /**

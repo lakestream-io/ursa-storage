@@ -4,7 +4,7 @@
  */
 package io.lakestream.ursa.materialization;
 
-import io.lakestream.api.Stream;
+import io.lakestream.api.StreamMetadata;
 import io.lakestream.api.materialization.TableCatalog;
 import io.lakestream.api.materialization.TableCatalogType;
 import io.lakestream.api.materialization.TableMaterializationPolicy;
@@ -36,14 +36,14 @@ public interface TableMaterializerFactory {
      *
      * @param policy            the effective (already resolved) policy for the stream
      * @param resolvedCatalog   the catalog the materializer writes into
-     * @param stream            the source stream handle
+     * @param streamMetadata    immutable source stream metadata
      * @param runtime           injected framework services
      * @return a materializer ready to accept records
      */
     TableMaterializer<?> create(
             TableMaterializationPolicy policy,
             TableCatalog resolvedCatalog,
-            Stream stream,
+            StreamMetadata streamMetadata,
             MaterializationRuntime runtime);
 
     /**
@@ -56,5 +56,5 @@ public interface TableMaterializerFactory {
     TableSchemaService<?, ?> schemaService(
             TableMaterializationPolicy policy,
             TableCatalog resolvedCatalog,
-            Stream stream);
+            StreamMetadata streamMetadata);
 }

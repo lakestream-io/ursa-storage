@@ -33,8 +33,10 @@ public interface WalStorage {
      *
      * @param id               A unique identifier for the entry, typically representing a stream or partition.
      * @param numberOfMessages number of messages in the buf
-     * @param buf              ByteBuf containing the data to be written. The buffer's ownership is transferred,
-     *                         and it will be released after the operation completes.
+     * @param buf              ByteBuf containing the data to be written. The caller retains
+     *                         ownership of its reference until the returned future completes and
+     *                         must then release that reference exactly once. An implementation may
+     *                         retain and release its own reference for asynchronous work.
      * @return CompletableFuture that resolves to the Position of the written entry. This Position
      * can be used for subsequent read or delete operations.
      */
@@ -48,8 +50,10 @@ public interface WalStorage {
      * @param numberOfMessages number of messages in the buf
      * @param initialOffset    The initial offset of the entry.
      * @param cumulativeSize   The cumulative size for the stream
-     * @param buf              ByteBuf containing the data to be written. The buffer's ownership is transferred,
-     *                         and it will be released after the operation completes.
+     * @param buf              ByteBuf containing the data to be written. The caller retains
+     *                         ownership of its reference until the returned future completes and
+     *                         must then release that reference exactly once. An implementation may
+     *                         retain and release its own reference for asynchronous work.
      * @return CompletableFuture that resolves to the Position of the written entry. This Position
      * can be used for subsequent read or delete operations.
      */
@@ -63,8 +67,10 @@ public interface WalStorage {
      * This method asynchronously appends the given data to the WAL, associating it with the provided ID.
      *
      * @param id  A unique identifier for the entry, typically representing a stream or partition.
-     * @param buf ByteBuf containing the data to be written. The buffer's ownership is transferred,
-     *            and it will be released after the operation completes.
+     * @param buf ByteBuf containing the data to be written. The caller retains ownership of its
+     *            reference until the returned future completes and must then release that
+     *            reference exactly once. An implementation may retain and release its own
+     *            reference for asynchronous work.
      * @return CompletableFuture that resolves to the Position of the written entry. This Position
      * can be used for subsequent read or delete operations.
      */

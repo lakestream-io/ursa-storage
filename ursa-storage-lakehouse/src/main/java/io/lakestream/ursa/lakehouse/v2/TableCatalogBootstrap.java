@@ -147,8 +147,8 @@ public final class TableCatalogBootstrap {
      * When {@code materializationEnabled=true} and a {@code materializationDefaultNamespace} is set,
      * synthesizes a default {@link TableCatalog} from the flat legacy lakehouse config and attaches a
      * default {@link TableMaterializationPolicy} (EXTERNAL, referencing that catalog, table name =
-     * {@code ${stream.name}}) to that namespace. This makes {@code Stream.effectiveMaterialization()}
-     * resolve so the new {@code maybeMaterialize} pipeline materializes every stream in the namespace
+     * {@code ${stream.name}}) to that namespace. This makes catalog-side materialization resolution
+     * succeed so the new {@code maybeMaterialize} pipeline materializes every stream in the namespace
      * — the same coverage the legacy global-config pipeline had — without per-stream policy authoring.
      *
      * <p>No-op when the flag is off or no default namespace is configured (then streams must carry
@@ -163,7 +163,7 @@ public final class TableCatalogBootstrap {
         }
         // materializationDefaultNamespace scopes the synthesized default policy to a single namespace.
         // When it is absent/blank, apply the policy CLUSTER-WIDE: every stream in every namespace
-        // materializes (the lowest-priority baseline in Stream.effectiveMaterialization()).
+        // materializes (the lowest-priority baseline in catalog-side materialization resolution).
         String namespace = properties.getProperty("materializationDefaultNamespace");
         boolean clusterWide = namespace == null || namespace.isBlank();
         Optional<CatalogAndPolicy> synthesized = buildCatalogAndPolicy(properties);
@@ -194,7 +194,7 @@ public final class TableCatalogBootstrap {
         // broker's own namespace creation is safe — createNamespace fails-if-exists and we recover.
         if (clusterWide) {
             // Cluster-wide: register the policy as the catalog's lowest-priority default. No namespace
-            // metadata is touched; Stream.effectiveMaterialization() falls back to it for any namespace.
+            // metadata is touched; catalog-side resolution falls back to it for any namespace.
             try {
                 streamCatalog.setClusterDefaultMaterialization(policy).join();
                 log.info("default-policy bridge: cluster-wide default → catalog {} ({}), mode {}",
@@ -354,7 +354,7 @@ public final class TableCatalogBootstrap {
      * Resolves a {@link ResolvedMaterialization} for {@code streamId} directly from flat legacy config
      * (e.g. compaction task properties carrying the catalog config + {@code DynamicConfigs}). This is the
      * backward-compatibility path for deployments that drove materialization through task properties
-     * rather than a policy: when {@code Stream.effectiveMaterialization()} resolves nothing, the worker
+     * rather than a policy: when catalog-side materialization resolution returns empty, the worker
      * falls back to this. Returns {@link Optional#empty()} when neither SDT nor SBT is enabled, or the
      * config does not describe a supported catalog.
      *

@@ -6,8 +6,9 @@ package io.lakestream.ursa.materialization;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatNullPointerException;
+import static org.mockito.Mockito.mock;
 
-import io.lakestream.api.StreamIdentifier;
+import io.lakestream.api.StreamMetadata;
 import io.lakestream.api.materialization.ResolvedMaterialization;
 import io.lakestream.api.materialization.TableCatalog;
 import io.lakestream.api.materialization.TableCatalogType;
@@ -18,7 +19,7 @@ import org.junit.jupiter.api.Test;
 
 class MaterializationTaskTest {
 
-    private static final StreamIdentifier STREAM = StreamIdentifier.of("public/default", "events");
+    private static final StreamMetadata STREAM_METADATA = mock(StreamMetadata.class);
 
     private static ResolvedMaterialization resolved() {
         TableCatalog catalog = new TableCatalog(
@@ -33,30 +34,32 @@ class MaterializationTaskTest {
     }
 
     @Test
-    void rejectsNullStream() {
+    void rejectsNullStreamMetadata() {
         assertThatNullPointerException()
                 .isThrownBy(() -> new MaterializationTask(null, resolved(), "t", 1L, 0L, 0L))
-                .withMessageContaining("stream");
+                .withMessageContaining("streamMetadata");
     }
 
     @Test
     void rejectsNullResolvedMaterialization() {
         assertThatNullPointerException()
-                .isThrownBy(() -> new MaterializationTask(STREAM, null, "t", 1L, 0L, 0L))
+                .isThrownBy(() -> new MaterializationTask(STREAM_METADATA, null, "t", 1L, 0L, 0L))
                 .withMessageContaining("resolvedMaterialization");
     }
 
     @Test
     void rejectsNullSourceTopic() {
         assertThatNullPointerException()
-                .isThrownBy(() -> new MaterializationTask(STREAM, resolved(), null, 1L, 0L, 0L))
+                .isThrownBy(() -> new MaterializationTask(STREAM_METADATA, resolved(), null, 1L, 0L, 0L))
                 .withMessageContaining("sourceTopic");
     }
 
     @Test
     void preservesOffsetRangeAndSource() {
         MaterializationTask task =
-                new MaterializationTask(STREAM, resolved(), "default/t-partition-0", 7L, 1000L, 2000L);
+                new MaterializationTask(
+                        STREAM_METADATA, resolved(), "default/t-partition-0", 7L, 1000L, 2000L);
+        assertThat(task.streamMetadata()).isSameAs(STREAM_METADATA);
         assertThat(task.sourceTopic()).isEqualTo("default/t-partition-0");
         assertThat(task.streamId()).isEqualTo(7L);
         assertThat(task.startOffset()).isEqualTo(1000L);

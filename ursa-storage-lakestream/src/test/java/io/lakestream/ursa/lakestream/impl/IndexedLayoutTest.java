@@ -11,6 +11,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.lakestream.api.LogId;
 import io.lakestream.api.PartitioningStrategy;
 import io.lakestream.api.RoutingKey;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -58,6 +59,23 @@ class IndexedLayoutTest {
         IndexedLayout layout = new IndexedLayout(logIds);
 
         assertEquals(logIds, layout.logIds().get());
+    }
+
+    @Test
+    void testLogIdsAreDefensivelyCopied() throws Exception {
+        List<LogId> source = new ArrayList<>(List.of(LogId.of(101)));
+        IndexedLayout layout = new IndexedLayout(source);
+
+        source.add(LogId.of(102));
+
+        assertEquals(List.of(LogId.of(101)), layout.logIds().get());
+        assertThrows(UnsupportedOperationException.class,
+            () -> layout.logIds().get().add(LogId.of(103)));
+    }
+
+    @Test
+    void testEmptyLayoutIsRejected() {
+        assertThrows(IllegalArgumentException.class, () -> new IndexedLayout(List.of()));
     }
 
     @Test

@@ -9,8 +9,8 @@ import io.lakestream.api.StreamIdentifier;
 /**
  * Signals that a stream identity has a durable permanent-deletion fence.
  *
- * <p>The stream is absent, and creating or externally registering the same identity cannot make it
- * active again. A replacement resource must use a different {@link StreamIdentifier}.
+ * <p>The stream is absent, and creating or recreating the same identity cannot make it active
+ * again. A replacement resource must use a different {@link StreamIdentifier}.
  */
 public class StreamPermanentlyDeletedException extends NoSuchStreamException {
 
