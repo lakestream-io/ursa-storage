@@ -62,8 +62,14 @@ public class AsyncCleanerTest {
     }
 
     @AfterEach
-    public void tearDown() {
-        ursaStorageTestBase.cleanup();
+    public void tearDown() throws Exception {
+        try {
+            if (storageApi != null) {
+                storageApi.close();
+            }
+        } finally {
+            ursaStorageTestBase.cleanup();
+        }
     }
 
     @Test

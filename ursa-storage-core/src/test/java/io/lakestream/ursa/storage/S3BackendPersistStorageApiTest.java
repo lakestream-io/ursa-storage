@@ -58,6 +58,14 @@ public class S3BackendPersistStorageApiTest {
         return storage.append(streamId, numberOfMessages, data);
     }
 
+    private void closeWriteLease(long streamId) {
+        StreamWriteLease lease = writeLeases.get(streamId);
+        if (lease != null) {
+            lease.close();
+            writeLeases.remove(streamId, lease);
+        }
+    }
+
     @Test
     public void testAsyncApi() throws Exception {
         final long streamId = 100;
@@ -176,6 +184,7 @@ public class S3BackendPersistStorageApiTest {
         eh = storage.getLastEntry(6).join().header();
         assertEquals(EntryHeader.NOT_FOUND, eh);
 
+        closeWriteLease(1);
         storage.deleteStream(1).join();
         eh = storage.getFirstEntry(1).join().header();
         assertEquals(EntryHeader.NOT_FOUND, eh);

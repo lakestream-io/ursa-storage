@@ -91,6 +91,13 @@ public class TestPersistStorageApi {
 
     @AfterEach
     public void cleanup() {
+        if (client != null) {
+            client.setFailureMode(false);
+        }
+        if (failureInjectedStorage != null) {
+            failureInjectedStorage.setFailureMode(false);
+            failureInjectedStorage.setPartReadFailureMode(false);
+        }
         try {
             writeLeases.values().forEach(StreamWriteLease::close);
             writeLeases.clear();
@@ -102,6 +109,14 @@ public class TestPersistStorageApi {
     private StreamWriteLease writeLease(long streamId) {
         return writeLeases.computeIfAbsent(
             streamId, id -> storage.acquireStreamWriteLease(id).join());
+    }
+
+    private void closeWriteLease(long streamId) {
+        StreamWriteLease lease = writeLeases.get(streamId);
+        if (lease != null) {
+            lease.close();
+            writeLeases.remove(streamId, lease);
+        }
     }
 
     private CompletableFuture<AddResult> appendWithLease(
@@ -274,6 +289,7 @@ public class TestPersistStorageApi {
         eh = storage.getFirstEntry(1).join().header();
         assertEquals(eh2, eh);
 
+        closeWriteLease(1);
         storage.deleteStream(1).join();
         eh = storage.getFirstEntry(1).join().header();
         assertEquals(EntryHeader.NOT_FOUND, eh);
@@ -351,12 +367,14 @@ public class TestPersistStorageApi {
         int dataSet = 1000;
         generateData(streamId, dataSet);
 
-        client.setFailureMode(true);
         try {
+            client.setFailureMode(true);
             storage.readEntries(streamId, 0, 10, 1000).get();
             fail();
         } catch (Exception e) {
             // expected
+        } finally {
+            client.setFailureMode(false);
         }
     }
 
@@ -368,12 +386,14 @@ public class TestPersistStorageApi {
         int dataSet = 1000;
         generateData(streamId, dataSet);
 
-        failureInjectedStorage.setFailureMode(true);
         try {
+            failureInjectedStorage.setFailureMode(true);
             storage.readEntries(streamId, 0, 10, 1000).get();
             fail();
         } catch (Exception e) {
             // expected
+        } finally {
+            failureInjectedStorage.setFailureMode(false);
         }
     }
 
@@ -386,8 +406,8 @@ public class TestPersistStorageApi {
         generateData(streamId, dataSet);
 
         // part read failure, it will return the success part
-        failureInjectedStorage.setPartReadFailureMode(true);
         try {
+            failureInjectedStorage.setPartReadFailureMode(true);
             List<Entry> entries = storage.readEntries(streamId, 0, 10, 1000).get();
             verifyResult(entries, 0, entries.size());
         } catch (Exception e) {
@@ -399,6 +419,8 @@ public class TestPersistStorageApi {
             verifyResult(entries, 20, entries.size());
         } catch (Exception e) {
             fail(e);
+        } finally {
+            failureInjectedStorage.setPartReadFailureMode(false);
         }
     }
 
