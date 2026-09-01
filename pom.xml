@@ -133,6 +133,7 @@
 
     <testMaxHeapSize>1024M</testMaxHeapSize>
     <testHeapDumpPath>/tmp</testHeapDumpPath>
+    <failIfNoTests>false</failIfNoTests>
     <!--
       The otel.*.exporter=none flags below keep OpenTelemetry autoconfiguration from selecting the
       OTLP exporter in test JVMs. CompactionScheduler no longer relies on them - it supplies the same
@@ -2387,7 +2388,7 @@
             -Dursa.test.enabled=true
             ${test.additional.args}
           </argLine>
-          <failIfNoTests>false</failIfNoTests>
+          <failIfNoTests>${failIfNoTests}</failIfNoTests>
           <excludedGroups>${excludeGroups}</excludedGroups>
         </configuration>
       </plugin>
