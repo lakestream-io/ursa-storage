@@ -98,12 +98,7 @@ final class IndexedStreamConfigStore {
         String path = catalogPaths.streamConfigPath(id);
         return oxiaClient.get(path).thenCompose(result -> {
             if (result == null) {
-                return readTombstone(id).thenApply(tombstone -> {
-                    if (tombstone.isPresent()) {
-                        throw new StreamPermanentlyDeletedException(id);
-                    }
-                    throw new NoSuchStreamException(id);
-                });
+                return absentOrTombstoned(id);
             }
             StreamConfigData config = parse(id, result.value());
             if (config.provisioningState() == ProvisioningState.DROPPED) {
@@ -113,12 +108,7 @@ final class IndexedStreamConfigStore {
                 // A PROVISIONING or ABORTING record left behind by a drop that completed its
                 // tombstone but not its config delete is still a permanently deleted identity.
                 // The tombstone is only consulted once the record is known not to be ACTIVE.
-                return readTombstone(id).thenApply(tombstone -> {
-                    if (tombstone.isPresent()) {
-                        throw new StreamPermanentlyDeletedException(id);
-                    }
-                    throw new NoSuchStreamException(id);
-                });
+                return absentOrTombstoned(id);
             }
             return CompletableFuture.completedFuture(
                 new ActiveStreamConfig(config, result.version().versionId()));
@@ -140,6 +130,38 @@ final class IndexedStreamConfigStore {
             StreamConfigData config = parse(id, result.value());
             return Optional.of(new CompletedDrop(config, result.version().versionId()));
         });
+    }
+
+    /**
+     * Fails an identity that has no usable config record: permanently deleted when a tombstone
+     * fences it, otherwise merely absent.
+     */
+    private <T> CompletableFuture<T> absentOrTombstoned(StreamIdentifier id) {
+        return unlessTombstoned(
+            id, () -> CompletableFuture.failedFuture(new NoSuchStreamException(id)));
+    }
+
+    /**
+     * Runs {@code action} unless a tombstone fences the identity, in which case it is permanently
+     * deleted and the caller fails with {@link StreamPermanentlyDeletedException}.
+     */
+    private <T> CompletableFuture<T> unlessTombstoned(
+            StreamIdentifier id, Supplier<CompletableFuture<T>> action) {
+        return unlessTombstoned(
+            id,
+            () -> CompletableFuture.failedFuture(new StreamPermanentlyDeletedException(id)),
+            action);
+    }
+
+    /**
+     * As {@link #unlessTombstoned(StreamIdentifier, Supplier)}, but for callers that have to undo
+     * their own half-written state before reporting the fence.
+     */
+    private <T> CompletableFuture<T> unlessTombstoned(
+            StreamIdentifier id, Supplier<CompletableFuture<T>> onTombstoned,
+            Supplier<CompletableFuture<T>> action) {
+        return readTombstone(id).thenCompose(tombstone ->
+            tombstone.isPresent() ? onTombstoned.get() : action.get());
     }
 
     CompletableFuture<List<StreamCatalogEntry>> listStreamEntries(String namespaceName) {
@@ -447,10 +469,8 @@ final class IndexedStreamConfigStore {
     CompletableFuture<Void> ensureCreatable(StreamIdentifier id) {
         return oxiaClient.get(catalogPaths.streamConfigPath(id)).thenCompose(result -> {
             if (result == null) {
-                return readTombstone(id).thenCompose(tombstone -> tombstone.isPresent()
-                    ? CompletableFuture.failedFuture(
-                        new StreamPermanentlyDeletedException(id))
-                    : CompletableFuture.completedFuture(null));
+                return unlessTombstoned(
+                    id, () -> CompletableFuture.<Void>completedFuture(null));
             }
             ProvisioningState state = parse(id, result.value()).provisioningState();
             if (state == ProvisioningState.DROPPED) {
@@ -475,10 +495,8 @@ final class IndexedStreamConfigStore {
      */
     private <T> CompletableFuture<T> failAbortingOrPermanentlyDeleted(
             StreamIdentifier id, String stillAbortingMessage) {
-        return readTombstone(id).thenCompose(tombstone -> CompletableFuture.failedFuture(
-            tombstone.isPresent()
-                ? new StreamPermanentlyDeletedException(id)
-                : new AlreadyExistsException(stillAbortingMessage)));
+        return unlessTombstoned(id, () -> CompletableFuture.failedFuture(
+            new AlreadyExistsException(stillAbortingMessage)));
     }
 
     CompletableFuture<ProvisioningClaim> claimCreation(
@@ -541,11 +559,7 @@ final class IndexedStreamConfigStore {
                     return CompletableFuture.failedFuture(new AlreadyExistsException(
                         "Stream creation lifecycle changed: " + id.fullName()));
                 }
-                return readTombstone(id).thenCompose(tombstone -> {
-                    if (tombstone.isPresent()) {
-                        return CompletableFuture.failedFuture(
-                            new StreamPermanentlyDeletedException(id));
-                    }
+                return unlessTombstoned(id, () -> {
                     StreamConfigData desired = StreamConfigData.provisioning(
                         partitions, properties, materialization, definition, kind,
                         UUID.randomUUID().toString(), ownerToken);
@@ -598,9 +612,9 @@ final class IndexedStreamConfigStore {
             CreationKind kind,
             String requestingOwnerToken,
             int retryCount) {
-        return readTombstone(id).thenCompose(tombstone -> tombstone.isPresent()
-            ? rollBackFencedClaim(id, claim(current, currentVersion))
-            : resumeProvisioningClaim(
+        return unlessTombstoned(id,
+            () -> rollBackFencedClaim(id, claim(current, currentVersion)),
+            () -> resumeProvisioningClaim(
                 id, current, currentVersion, requestedDefinition, requestedProperties,
                 requestedMaterialization, kind, requestingOwnerToken, retryCount));
     }
@@ -681,9 +695,9 @@ final class IndexedStreamConfigStore {
      */
     private CompletableFuture<ProvisioningClaim> validateDeletionFence(
             StreamIdentifier id, ProvisioningClaim claim) {
-        return readTombstone(id).thenCompose(tombstone -> tombstone.isEmpty()
-            ? CompletableFuture.completedFuture(claim)
-            : rollBackFencedClaim(id, claim));
+        return unlessTombstoned(id,
+            () -> rollBackFencedClaim(id, claim),
+            () -> CompletableFuture.completedFuture(claim));
     }
 
     private CompletableFuture<ProvisioningClaim> rollBackFencedClaim(
@@ -812,30 +826,32 @@ final class IndexedStreamConfigStore {
         String path = catalogPaths.streamConfigPath(id);
         return oxiaClient.get(path).thenCompose(current -> {
             if (current != null) {
-                return verifyNativeCleanupContext(id, expected, current);
+                return verifyNativeCleanupContext(
+                    id, expected, parse(id, current.value()),
+                    current.version().versionId());
             }
-            return oxiaClient.get(catalogPaths.streamTombstonePath(id))
-                .thenCompose(tombstone -> {
-                    if (tombstone == null) {
-                        return expected.config().isEmpty()
-                            ? CompletableFuture.<Void>completedFuture(null)
-                            : CompletableFuture.<Void>failedFuture(
-                                new AbortingOwnershipLostException(id));
-                    }
-                    return verifyNativeCleanupContext(id, expected, tombstone);
-                });
+            return readTombstone(id).thenCompose(tombstone -> {
+                if (tombstone.isEmpty()) {
+                    return expected.config().isEmpty()
+                        ? CompletableFuture.<Void>completedFuture(null)
+                        : CompletableFuture.<Void>failedFuture(
+                            new AbortingOwnershipLostException(id));
+                }
+                CompletedDrop fence = tombstone.orElseThrow();
+                return verifyNativeCleanupContext(
+                    id, expected, fence.config(), fence.versionId());
+            });
         });
     }
 
     private CompletableFuture<Void> verifyNativeCleanupContext(
-            StreamIdentifier id, NativeCleanupContext expected, GetResult current) {
-        if (expected.config().isEmpty()
-                || current.version().versionId() != expected.versionId()) {
+            StreamIdentifier id, NativeCleanupContext expected,
+            StreamConfigData observed, long versionId) {
+        if (expected.config().isEmpty() || versionId != expected.versionId()) {
             return CompletableFuture.failedFuture(
                 new AbortingOwnershipLostException(id));
         }
         StreamConfigData expectedConfig = expected.config().orElseThrow();
-        StreamConfigData observed = parse(id, current.value());
         if (observed.incarnationId().equals(expectedConfig.incarnationId())
                 && observed.ownerToken().equals(expectedConfig.ownerToken())
                 && observed.ownerGeneration() == expectedConfig.ownerGeneration()
@@ -1213,10 +1229,10 @@ final class IndexedStreamConfigStore {
 
     CompletableFuture<Void> verifyCompletedDrop(
             StreamIdentifier id, CompletedDrop expected) {
-        return oxiaClient.get(catalogPaths.streamTombstonePath(id))
-            .thenCompose(result -> result == null
-                ? verifyLegacyCompletedDrop(id, expected)
-                : verifyCompletedDropRecord(id, result, expected));
+        return readTombstone(id).thenCompose(tombstone -> tombstone
+            .map(fence -> verifyCompletedDropRecord(
+                id, fence.config(), fence.versionId(), expected))
+            .orElseGet(() -> verifyLegacyCompletedDrop(id, expected)));
     }
 
     private CompletableFuture<Void> verifyLegacyCompletedDrop(
@@ -1226,14 +1242,15 @@ final class IndexedStreamConfigStore {
                 return CompletableFuture.failedFuture(
                     new AbortingOwnershipLostException(id));
             }
-            return verifyCompletedDropRecord(id, result, expected);
+            return verifyCompletedDropRecord(
+                id, parse(id, result.value()), result.version().versionId(), expected);
         });
     }
 
     private CompletableFuture<Void> verifyCompletedDropRecord(
-            StreamIdentifier id, GetResult result, CompletedDrop expected) {
-        StreamConfigData current = parse(id, result.value());
-        if (result.version().versionId() == expected.versionId()
+            StreamIdentifier id, StreamConfigData current, long versionId,
+            CompletedDrop expected) {
+        if (versionId == expected.versionId()
                 && current.sameCompletedDrop(expected.config())) {
             return CompletableFuture.completedFuture(null);
         }
