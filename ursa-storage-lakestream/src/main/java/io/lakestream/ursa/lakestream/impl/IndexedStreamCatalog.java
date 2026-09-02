@@ -72,7 +72,6 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.UUID;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
@@ -110,7 +109,6 @@ public class IndexedStreamCatalog implements StreamCatalog {
     private static final int PROVISIONING_PARALLELISM = 8;
     private static final long PARTITION_METADATA_RETRY_DELAY_MILLIS = 10L;
     private static final long CATALOG_CLOSE_TIMEOUT_MILLIS = TimeUnit.SECONDS.toMillis(10);
-    private static final int FAILED_OPEN_CLEANUP_QUEUE_CAPACITY = 64;
     private static final int DELEGATE_CLOSE_THREADS = 2;
 
     @Getter
@@ -360,7 +358,10 @@ public class IndexedStreamCatalog implements StreamCatalog {
             1,
             0L,
             TimeUnit.MILLISECONDS,
-            new ArrayBlockingQueue<>(FAILED_OPEN_CLEANUP_QUEUE_CAPACITY),
+            // Unbounded on purpose: a bulk drop queues one small close task per partition, and a
+            // bounded queue turned that into rejection + exponential backoff (minutes for a
+            // thousand partitions). Rejections now only happen after shutdown.
+            new LinkedBlockingQueue<>(),
             task -> {
                 Thread thread = new Thread(task, "lakestream-failed-open-cleanup");
                 thread.setDaemon(true);

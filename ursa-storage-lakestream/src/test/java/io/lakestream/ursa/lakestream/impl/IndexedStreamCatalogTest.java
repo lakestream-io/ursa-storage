@@ -2035,7 +2035,7 @@ class IndexedStreamCatalogTest {
     }
 
     @Test
-    void saturatedFailedOpenCleanupQueueRetriesWithoutLosingOwnership() throws Exception {
+    void failedOpenCleanupQueuedBehindABusyWorkerKeepsOwnership() throws Exception {
         mockStreamConfig(streamId, 1);
         mockPartitionMetadata(streamId, 0, 100L, Map.of());
         Log wrongLog = mock(Log.class);
@@ -2047,6 +2047,8 @@ class IndexedStreamCatalogTest {
         ThreadPoolExecutor cleanupExecutor = failedOpenCleanupExecutor(failingCatalog);
         CountDownLatch cleanupWorkerStarted = new CountDownLatch(1);
         CountDownLatch releaseCleanupWorker = new CountDownLatch(1);
+        // One thread and an unbounded queue: occupying the thread leaves the failed open's
+        // cleanup waiting its turn rather than rejected, and it must still run in the end.
         cleanupExecutor.execute(() -> {
             cleanupWorkerStarted.countDown();
             try {
@@ -2056,10 +2058,6 @@ class IndexedStreamCatalogTest {
             }
         });
         assertTrue(cleanupWorkerStarted.await(5, TimeUnit.SECONDS));
-        int queueCapacity = cleanupExecutor.getQueue().remainingCapacity();
-        for (int index = 0; index < queueCapacity; index++) {
-            cleanupExecutor.execute(() -> { });
-        }
 
         ExecutionException failure = assertThrows(ExecutionException.class,
             () -> failingCatalog.openLog(streamId, LogId.of(100L)).get());
