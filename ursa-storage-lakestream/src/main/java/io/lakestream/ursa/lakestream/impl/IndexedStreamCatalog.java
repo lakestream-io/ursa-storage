@@ -2296,7 +2296,8 @@ public class IndexedStreamCatalog implements StreamCatalog {
                         .thenApply(tableCatalog -> TableMaterializationPolicy.resolve(
                             baseline, metadata.materialization(), id,
                             name -> expectedCatalog.equals(name)
-                                ? tableCatalog : Optional.empty()));
+                                ? tableCatalog : Optional.empty(),
+                            metadata.properties()));
                 }));
     }
 

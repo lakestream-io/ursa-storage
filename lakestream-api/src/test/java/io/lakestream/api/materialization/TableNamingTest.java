@@ -9,6 +9,8 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.lakestream.api.StreamIdentifier;
+import java.util.Map;
 import java.util.Optional;
 import org.junit.jupiter.api.Test;
 
@@ -50,5 +52,29 @@ class TableNamingTest {
     @Test
     void testRejectsEmptyTemplate() {
         assertThrows(IllegalArgumentException.class, () -> new TableNaming(Optional.empty(), ""));
+    }
+
+    @Test
+    void interpolatesStreamProperties() {
+        TableNaming naming = new TableNaming(Optional.empty(), "${stream.property.lakestream.kafka.topic.name}_v1");
+        TableIdentifier table = naming.toTableIdentifier(
+            StreamIdentifier.of("default", "orders-topic-id-abc"),
+            Map.of("lakestream.kafka.topic.name", "orders"));
+        assertEquals("orders_v1", table.name());
+        assertEquals("default", table.namespace());
+    }
+
+    @Test
+    void missingPropertyIsRejected() {
+        TableNaming naming = new TableNaming(Optional.empty(), "${stream.property.missing}");
+        assertThrows(IllegalArgumentException.class,
+            () -> naming.toTableIdentifier(StreamIdentifier.of("ns", "s"), Map.of()));
+    }
+
+    @Test
+    void singleArgumentOverloadRejectsPropertyVariables() {
+        TableNaming naming = new TableNaming(Optional.empty(), "${stream.property.x}");
+        assertThrows(IllegalArgumentException.class,
+            () -> naming.toTableIdentifier(StreamIdentifier.of("ns", "s")));
     }
 }
