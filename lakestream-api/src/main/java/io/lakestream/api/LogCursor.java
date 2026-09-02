@@ -68,6 +68,8 @@ public interface LogCursor extends AutoCloseable {
     /**
      * Moves the read position to the given offset.
      *
+     * <p>For ephemeral cursors this only updates the in-memory read position.
+     *
      * @param offset the offset to seek to
      * @return a future that completes when the seek is done
      */
@@ -180,4 +182,10 @@ public interface LogCursor extends AutoCloseable {
     default CompletableFuture<Void> deleteCursor() {
         return CompletableFuture.completedFuture(null);
     }
+
+    /**
+     * Closing an ephemeral cursor releases in-memory state only and does not block.
+     */
+    @Override
+    void close() throws Exception;
 }

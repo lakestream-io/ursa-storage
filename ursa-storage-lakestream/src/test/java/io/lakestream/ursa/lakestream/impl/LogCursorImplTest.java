@@ -17,6 +17,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import io.lakestream.api.EntryHeader;
@@ -37,6 +38,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -518,6 +520,18 @@ class LogCursorImplTest {
 
         assertEquals(5, result.size());
         assertEquals(5, cursor.readOffset());
+    }
+
+    // --- Ephemeral cursor lifecycle ---
+
+    @Test
+    void ephemeralCursorCloseDoesNotPersist() throws Exception {
+        Log log = mock(Log.class);
+        LogCursorImpl cursor = new LogCursorImpl("scan", log, 0L, -1L);
+        long start = System.nanoTime();
+        cursor.close();
+        assertTrue(System.nanoTime() - start < TimeUnit.SECONDS.toNanos(1));
+        verifyNoInteractions(log);
     }
 
     // --- Helpers ---

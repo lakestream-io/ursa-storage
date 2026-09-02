@@ -219,6 +219,9 @@ public interface Log extends AutoCloseable {
      * The cursor tracks read position in memory only — no Oxia persistence.
      * Suitable for fetch reads, timestamp scanning, and replay operations.
      *
+     * <p>Creating an ephemeral cursor allocates only in-memory state; callers should open
+     * one per read rather than pool them.
+     *
      * @param name the cursor name
      * @param initialOffset the initial read offset
      * @return a future resolving to the opened ephemeral cursor

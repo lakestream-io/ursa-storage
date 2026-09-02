@@ -580,6 +580,10 @@ public class LogCursorImpl implements LogCursor {
 
     @Override
     public void close() throws Exception {
+        if (!durable) {
+            clearPrefetchCache();
+            return;
+        }
         persistState().get(SYNC_TIMEOUT_SECONDS, TimeUnit.SECONDS);
     }
 
