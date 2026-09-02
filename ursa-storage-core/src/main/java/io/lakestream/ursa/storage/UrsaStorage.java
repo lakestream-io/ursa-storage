@@ -26,7 +26,6 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -144,7 +143,7 @@ public class UrsaStorage implements AutoCloseable {
             StorageConfig config, InstrumentProvider instrumentProvider,
             AsyncOxiaClient oxiaClient, StorageFormat storageFormat,
             LogStateManager streamStateManager,
-            Executor failedDataPlaneCloseExecutor) throws Exception {
+            ExecutorService failedDataPlaneCloseExecutor) throws Exception {
         FileStorage fileStorage = FileStorage.create(config, instrumentProvider);
         WalStorage walStorage = null;
         try {
@@ -183,14 +182,14 @@ public class UrsaStorage implements AutoCloseable {
 
     private static void closeDataPlaneAfterFailure(
             FileStorage fileStorage, WalStorage walStorage, Throwable failure,
-            Executor executor) {
+            ExecutorService executor) {
         closeDataPlaneAfterFailure(
             fileStorage, walStorage, failure, DEFAULT_CLOSE_TIMEOUT, executor);
     }
 
     static void closeDataPlaneAfterFailure(
             FileStorage fileStorage, WalStorage walStorage, Throwable failure,
-            Duration closeTimeout, Executor executor) {
+            Duration closeTimeout, ExecutorService executor) {
         Objects.requireNonNull(failure, "failure");
         Objects.requireNonNull(executor, "executor");
         long timeoutNanos = positiveDurationNanos(closeTimeout, "closeTimeout");
@@ -210,6 +209,17 @@ public class UrsaStorage implements AutoCloseable {
         } catch (Exception | Error closeFailure) {
             addSuppressed(failure, closeFailure);
         }
+    }
+
+    /**
+     * Test-only entry point that starts a {@link FailedDataPlaneCleanup} and exposes its
+     * completion future directly, bypassing {@link #closeDataPlaneAfterFailure}'s own bounded
+     * wait so tests can observe the cleanup settle (or fail) on their own schedule.
+     */
+    static CompletableFuture<Void> startFailedDataPlaneCleanupForTesting(
+            FileStorage fileStorage, WalStorage walStorage, Throwable failure,
+            ExecutorService executor) {
+        return new FailedDataPlaneCleanup(fileStorage, walStorage, failure, executor).start();
     }
 
     private static long positiveDurationNanos(Duration duration, String name) {
@@ -240,7 +250,7 @@ public class UrsaStorage implements AutoCloseable {
         private final FileStorage fileStorage;
         private final WalStorage walStorage;
         private final Throwable initializationFailure;
-        private final Executor executor;
+        private final ExecutorService executor;
         private final CompletableFuture<Void> completion = new CompletableFuture<>();
         private boolean cleanupFailureRecorded;
 
@@ -248,7 +258,7 @@ public class UrsaStorage implements AutoCloseable {
                 FileStorage fileStorage,
                 WalStorage walStorage,
                 Throwable initializationFailure,
-                Executor executor) {
+                ExecutorService executor) {
             this.fileStorage = fileStorage;
             this.walStorage = walStorage;
             this.initializationFailure = initializationFailure;
@@ -281,7 +291,11 @@ public class UrsaStorage implements AutoCloseable {
                     });
                 });
             } catch (RejectedExecutionException rejection) {
-                scheduleWalCloseRetry(retryAttempt, rejection);
+                if (executor.isShutdown()) {
+                    failRejectedCleanup(rejection);
+                } else {
+                    scheduleWalCloseRetry(retryAttempt, rejection);
+                }
             } catch (Throwable schedulingFailure) {
                 recordCleanupFailure(schedulingFailure);
                 completion.completeExceptionally(schedulingFailure);
@@ -303,11 +317,26 @@ public class UrsaStorage implements AutoCloseable {
                     }
                 });
             } catch (RejectedExecutionException rejection) {
-                scheduleFileStorageCloseRetry(retryAttempt, rejection);
+                if (executor.isShutdown()) {
+                    failRejectedCleanup(rejection);
+                } else {
+                    scheduleFileStorageCloseRetry(retryAttempt, rejection);
+                }
             } catch (Throwable schedulingFailure) {
                 recordCleanupFailure(schedulingFailure);
                 completion.completeExceptionally(schedulingFailure);
             }
+        }
+
+        /**
+         * A rejection while {@link #executor} has already been shut down (the owning
+         * {@link UrsaStorage} is closing) will never succeed on retry, unlike a transient
+         * "queue full" rejection. Give up and report failure instead of retrying forever
+         * against a permanently rejecting executor.
+         */
+        private void failRejectedCleanup(RejectedExecutionException rejection) {
+            recordCleanupFailure(rejection);
+            completion.completeExceptionally(rejection);
         }
 
         private void scheduleWalCloseRetry(int retryAttempt, Throwable failure) {
@@ -456,6 +485,11 @@ public class UrsaStorage implements AutoCloseable {
         }
         resourcesClosed = true;
         failedDataPlaneCloseExecutor.shutdown();
+    }
+
+    /** Test-only accessor for the instance-owned cleanup executor. */
+    ExecutorService failedDataPlaneCloseExecutorForTesting() {
+        return failedDataPlaneCloseExecutor;
     }
 
     private static void awaitWalClose(
