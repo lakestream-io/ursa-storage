@@ -74,6 +74,7 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -111,7 +112,6 @@ public class IndexedStreamCatalog implements StreamCatalog {
         TimeUnit.SECONDS.toMillis(10);
     private static final int FAILED_OPEN_CLEANUP_QUEUE_CAPACITY = 64;
     private static final int DELEGATE_CLOSE_THREADS = 2;
-    private static final int DELEGATE_CLOSE_QUEUE_CAPACITY = 64;
 
     @Getter
     private final AsyncOxiaClient oxiaClient;
@@ -374,7 +374,10 @@ public class IndexedStreamCatalog implements StreamCatalog {
             DELEGATE_CLOSE_THREADS,
             0L,
             TimeUnit.MILLISECONDS,
-            new ArrayBlockingQueue<>(DELEGATE_CLOSE_QUEUE_CAPACITY),
+            // Unbounded on purpose: a bulk drop queues one small close task per partition, and a
+            // bounded queue turned that into rejection + exponential backoff (minutes for a
+            // thousand partitions). Rejections now only happen after shutdown.
+            new LinkedBlockingQueue<>(),
             task -> {
                 Thread thread = new Thread(task,
                     "lakestream-log-close-" + closeThreadId.incrementAndGet());
