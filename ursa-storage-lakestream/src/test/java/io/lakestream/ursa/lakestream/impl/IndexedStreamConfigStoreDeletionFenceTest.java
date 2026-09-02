@@ -889,6 +889,202 @@ class IndexedStreamConfigStoreDeletionFenceTest {
         assertThat(ambiguous.getSuppressed()).contains(readFailure);
     }
 
+    @Test
+    void resumedProvisioningClaimIsRolledBackWhenTheIdentityIsAlreadyTombstoned() {
+        when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(
+            provisioning(VERSION_1, "attempt-1")));
+        when(oxiaClient.get(tombstonePath)).thenReturn(CompletableFuture.completedFuture(
+            new GetResult(tombstonePath, completedDropBytes(1), VERSION_2)));
+        when(oxiaClient.delete(eq(configPath), any()))
+            .thenReturn(CompletableFuture.completedFuture(true));
+
+        assertThatThrownBy(() -> store.claimCreation(
+                id, 1, Map.of(), Optional.empty(), "attempt-2").join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(StreamPermanentlyDeletedException.class);
+
+        verify(oxiaClient).delete(configPath,
+            Set.of(DeleteOption.IfVersionIdEquals(VERSION_1.versionId())));
+        verify(oxiaClient, never()).put(eq(configPath), any(byte[].class), any());
+    }
+
+    @Test
+    void fencedClaimRollbackToleratesAVersionMismatchOnTheOrphanedRecord() {
+        Set<PutOption> createOnly = Set.of(PutOption.IfRecordDoesNotExist);
+        when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(null));
+        when(oxiaClient.get(tombstonePath))
+            .thenReturn(CompletableFuture.completedFuture(null))
+            .thenReturn(CompletableFuture.completedFuture(
+                new GetResult(tombstonePath, completedDropBytes(1), VERSION_2)));
+        when(oxiaClient.put(eq(configPath), any(byte[].class), eq(createOnly)))
+            .thenReturn(CompletableFuture.completedFuture(
+                new PutResult(configPath, VERSION_1)));
+        when(oxiaClient.delete(eq(configPath), any()))
+            .thenReturn(CompletableFuture.failedFuture(
+                new UnexpectedVersionIdException(configPath, VERSION_1.versionId())));
+
+        assertThatThrownBy(() -> store.claimCreation(
+                id, 1, Map.of(), Optional.empty(), "attempt").join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(StreamPermanentlyDeletedException.class)
+            .cause()
+            // A version mismatch means the record already moved on; the fence still stands, so
+            // the rollback is not worth reporting as a secondary failure.
+            .satisfies(fenced -> assertThat(fenced.getSuppressed()).isEmpty());
+    }
+
+    @Test
+    void readActivePrefersPermanentDeletionForANonActiveRecord() {
+        when(oxiaClient.get(configPath))
+            .thenReturn(CompletableFuture.completedFuture(aborting(VERSION_1, "drop-owner")))
+            .thenReturn(CompletableFuture.completedFuture(
+                provisioning(VERSION_1, "create-owner")));
+        when(oxiaClient.get(tombstonePath)).thenReturn(CompletableFuture.completedFuture(
+            new GetResult(tombstonePath, completedDropBytes(1), VERSION_2)));
+
+        assertThatThrownBy(() -> store.readActive(id).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(StreamPermanentlyDeletedException.class);
+        assertThatThrownBy(() -> store.readActive(id).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(StreamPermanentlyDeletedException.class);
+    }
+
+    @Test
+    void readActiveNeverReadsTheTombstoneForAnActiveRecord() {
+        when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(
+            nativeActive(VERSION_1, 1, "owner", 1L, Map.of())));
+
+        store.readActive(id).join();
+
+        verify(oxiaClient, never()).get(tombstonePath);
+    }
+
+    @Test
+    void creationPrefersPermanentDeletionOverAnAbortingRecord() {
+        when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(
+            aborting(VERSION_1, "drop-owner")));
+        when(oxiaClient.get(tombstonePath)).thenReturn(CompletableFuture.completedFuture(
+            new GetResult(tombstonePath, completedDropBytes(1), VERSION_2)));
+
+        assertThatThrownBy(() -> store.ensureCreatable(id).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(StreamPermanentlyDeletedException.class);
+        assertThatThrownBy(() -> store.claimCreation(
+                id, 1, Map.of(), Optional.empty(), "attempt").join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(StreamPermanentlyDeletedException.class);
+        verify(oxiaClient, never()).put(eq(configPath), any(byte[].class), any());
+    }
+
+    @Test
+    void creationStillReportsAlreadyExistsForAnAbortingRecordWithoutATombstone() {
+        when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(
+            aborting(VERSION_1, "drop-owner")));
+
+        assertThatThrownBy(() -> store.ensureCreatable(id).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(AlreadyExistsException.class);
+        assertThatThrownBy(() -> store.claimCreation(
+                id, 1, Map.of(), Optional.empty(), "attempt").join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(AlreadyExistsException.class);
+    }
+
+    @Test
+    void completeDropUpgradesTheEmptyTombstoneLeftByAnAbsentStreamDrop() {
+        AtomicReference<VersionedValue> config = mockVersionedRecord(configPath, null);
+        AtomicReference<VersionedValue> tombstone =
+            mockVersionedRecord(tombstonePath, null);
+
+        // Dropping an identity whose config record is absent fences it with a zero-partition
+        // tombstone that carries no partitions to clean up.
+        assertThat(store.beginDrop(id, "drop-a").join()).isEmpty();
+        assertThat(json(tombstone.get().value()).path("partitions").asInt()).isZero();
+
+        // The real stream turns up afterwards and is dropped for real.
+        config.set(new VersionedValue(activeConfigBytes(3), VERSION_1));
+        IndexedStreamConfigStore.DropClaim claim =
+            store.beginDrop(id, "drop-b").join().orElseThrow();
+        assertThat(claim.config().partitions()).isEqualTo(3);
+        store.completeDrop(id, claim).join();
+
+        assertThat(config.get()).isNull();
+        assertThat(json(tombstone.get().value()).path("partitions").asInt()).isEqualTo(3);
+        assertThat(json(tombstone.get().value()).path("_provisioningState").asText())
+            .isEqualTo("DROPPED");
+        IndexedStreamConfigStore.CompletedDrop completed =
+            store.readCompletedDrop(id).join().orElseThrow();
+        assertThat(completed.config().partitions()).isEqualTo(3);
+        store.verifyCompletedDrop(id, completed).join();
+    }
+
+    @Test
+    void completeDropKeepsAPurgeRequestedByTheEmptyTombstone() {
+        AtomicReference<VersionedValue> config = mockVersionedRecord(configPath, null);
+        AtomicReference<VersionedValue> tombstone =
+            mockVersionedRecord(tombstonePath, null);
+
+        assertThat(store.beginDrop(id, "drop-a", true).join()).isEmpty();
+        config.set(new VersionedValue(activeConfigBytes(2), VERSION_1));
+        IndexedStreamConfigStore.DropClaim claim =
+            store.beginDrop(id, "drop-b", false).join().orElseThrow();
+        store.completeDrop(id, claim).join();
+
+        assertThat(json(tombstone.get().value()).path("partitions").asInt()).isEqualTo(2);
+        assertThat(json(tombstone.get().value()).path("_purgeRequested").asBoolean()).isTrue();
+    }
+
+    @Test
+    void absentStreamPurgeUpgradeRereadsTheConfigRecordBeforeRetrying() {
+        List<Long> backoffs = new ArrayList<>();
+        CompletableFuture<Void> retryGate = new CompletableFuture<>();
+        store = new IndexedStreamConfigStore(oxiaClient, paths, delayMillis -> {
+            backoffs.add(delayMillis);
+            return retryGate;
+        });
+        AtomicReference<VersionedValue> config = mockVersionedRecord(configPath, null);
+        when(oxiaClient.put(eq(tombstonePath), any(byte[].class),
+                eq(Set.of(PutOption.IfRecordDoesNotExist))))
+            .thenReturn(CompletableFuture.failedFuture(
+                new KeyAlreadyExistsException(tombstonePath)));
+        // The conflicting tombstone is gone by the time the purge upgrade reads it back.
+        when(oxiaClient.get(tombstonePath))
+            .thenReturn(CompletableFuture.completedFuture(null));
+
+        CompletableFuture<Optional<IndexedStreamConfigStore.DropClaim>> drop =
+            store.beginDrop(id, "drop-owner", true);
+
+        assertThat(drop).isNotDone();
+        assertThat(backoffs).containsExactly(
+            IndexedStreamConfigStore.INITIAL_RETRY_BACKOFF_MILLIS);
+        // A creation wins the race for the identity while the purge upgrade waits to retry.
+        config.set(new VersionedValue(activeConfigBytes(3), VERSION_1));
+        retryGate.complete(null);
+
+        IndexedStreamConfigStore.DropClaim claim = drop.join().orElseThrow();
+        assertThat(claim.config().partitions()).isEqualTo(3);
+        assertThat(claim.config().purgeRequested()).isTrue();
+        verify(oxiaClient, times(1)).put(eq(tombstonePath), any(byte[].class),
+            eq(Set.of(PutOption.IfRecordDoesNotExist)));
+    }
+
+    private static byte[] activeConfigBytes(int partitions) {
+        return ("{\"partitions\":" + partitions + ",\"properties\":{},"
+            + "\"_incarnationId\":\"incarnation\","
+            + "\"_ownerToken\":\"create-owner\","
+            + "\"_ownerGeneration\":1,"
+            + "\"_creationKind\":\"NATIVE_CREATE\"}")
+            .getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static byte[] completedDropBytes(int partitions) {
+        return streamConfigBytes(
+            partitions, Map.of(), "dropped-incarnation", "drop-owner", 2L, "create-owner", 1L,
+            IndexedStreamConfigStore.CreationKind.NATIVE_CREATE,
+            IndexedStreamConfigStore.ProvisioningState.DROPPED);
+    }
+
     private GetResult provisioning(Version version, String attempt) {
         return provisioning(version, attempt, 1L);
     }

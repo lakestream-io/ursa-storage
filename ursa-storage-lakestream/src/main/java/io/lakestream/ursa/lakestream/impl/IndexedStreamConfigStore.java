@@ -113,7 +113,15 @@ final class IndexedStreamConfigStore {
                 throw new StreamPermanentlyDeletedException(id);
             }
             if (config.provisioningState() != ProvisioningState.ACTIVE) {
-                throw new NoSuchStreamException(id);
+                // A PROVISIONING or ABORTING record left behind by a drop that completed its
+                // tombstone but not its config delete is still a permanently deleted identity.
+                // The tombstone is only consulted once the record is known not to be ACTIVE.
+                return readTombstone(id).thenApply(tombstone -> {
+                    if (tombstone.isPresent()) {
+                        throw new StreamPermanentlyDeletedException(id);
+                    }
+                    throw new NoSuchStreamException(id);
+                });
             }
             return CompletableFuture.completedFuture(
                 new ActiveStreamConfig(config, result.version().versionId()));
@@ -447,13 +455,33 @@ final class IndexedStreamConfigStore {
                         new StreamPermanentlyDeletedException(id))
                     : CompletableFuture.completedFuture(null));
             }
-            if (parse(id, result.value()).provisioningState() == ProvisioningState.DROPPED) {
+            ProvisioningState state = parse(id, result.value()).provisioningState();
+            if (state == ProvisioningState.DROPPED) {
                 return CompletableFuture.failedFuture(
                     new StreamPermanentlyDeletedException(id));
+            }
+            if (state == ProvisioningState.ABORTING) {
+                return failAbortingOrPermanentlyDeleted(id,
+                    "Stream already exists: " + id.fullName());
             }
             return CompletableFuture.failedFuture(
                 new AlreadyExistsException("Stream already exists: " + id.fullName()));
         });
+    }
+
+    /**
+     * Reports an aborting stream as permanently deleted once its tombstone exists.
+     *
+     * <p>A drop publishes the tombstone before deleting the config record, so an {@code ABORTING}
+     * record observed after that publish belongs to an identity that is already gone forever. Only
+     * the aborting branch pays for the extra read; an active record never reads the tombstone.
+     */
+    private <T> CompletableFuture<T> failAbortingOrPermanentlyDeleted(
+            StreamIdentifier id, String stillAbortingMessage) {
+        return readTombstone(id).thenCompose(tombstone -> CompletableFuture.failedFuture(
+            tombstone.isPresent()
+                ? new StreamPermanentlyDeletedException(id)
+                : new AlreadyExistsException(stillAbortingMessage)));
     }
 
     CompletableFuture<ProvisioningClaim> claimCreation(
@@ -542,8 +570,8 @@ final class IndexedStreamConfigStore {
                     "Stream already exists: " + id.fullName()));
             }
             if (current.provisioningState() == ProvisioningState.ABORTING) {
-                return CompletableFuture.failedFuture(new AlreadyExistsException(
-                    "Stream creation is aborting: " + id.fullName()));
+                return failAbortingOrPermanentlyDeleted(id,
+                    "Stream creation is aborting: " + id.fullName());
             }
             if (!current.canResumeCreation(definition, kind)) {
                 return CompletableFuture.failedFuture(new AlreadyExistsException(
@@ -555,7 +583,32 @@ final class IndexedStreamConfigStore {
         });
     }
 
+    /**
+     * Resumes an existing {@code PROVISIONING} claim unless the identity is already tombstoned.
+     *
+     * <p>A creation that crashed between writing its claim and validating the deletion fence leaves
+     * a claim that no longer has an owner. Reading the tombstone before adopting such a claim closes
+     * that window: the orphan is deleted by version and the creation loses to the fence, exactly as
+     * {@link #writeInitialClaim} would have done had it survived.
+     */
     private CompletableFuture<ProvisioningClaim> convergeProvisioningClaim(
+            StreamIdentifier id,
+            StreamConfigData current,
+            long currentVersion,
+            ImmutableStreamDefinition requestedDefinition,
+            Map<String, String> requestedProperties,
+            Optional<TableMaterializationPolicy> requestedMaterialization,
+            CreationKind kind,
+            String requestingOwnerToken,
+            int retryCount) {
+        return readTombstone(id).thenCompose(tombstone -> tombstone.isPresent()
+            ? rollBackFencedClaim(id, claim(current, currentVersion))
+            : resumeProvisioningClaim(
+                id, current, currentVersion, requestedDefinition, requestedProperties,
+                requestedMaterialization, kind, requestingOwnerToken, retryCount));
+    }
+
+    private CompletableFuture<ProvisioningClaim> resumeProvisioningClaim(
             StreamIdentifier id,
             StreamConfigData current,
             long currentVersion,
@@ -853,7 +906,7 @@ final class IndexedStreamConfigStore {
         String path = catalogPaths.streamConfigPath(id);
         return oxiaClient.get(path).thenCompose(current -> {
             if (current == null) {
-                return dropAbsentStream(id, purge, retryCount);
+                return dropAbsentStream(id, ownerToken, purge, retryCount);
             }
             StreamConfigData config = parse(id, current.value());
             if (config.provisioningState() == ProvisioningState.DROPPED) {
@@ -933,7 +986,7 @@ final class IndexedStreamConfigStore {
      * a purge requested after the fact is merged into the existing tombstone.
      */
     private CompletableFuture<Optional<DropClaim>> dropAbsentStream(
-            StreamIdentifier id, boolean purge, int retryCount) {
+            StreamIdentifier id, String ownerToken, boolean purge, int retryCount) {
         String tombstonePath = catalogPaths.streamTombstonePath(id);
         return putWithResult(tombstonePath, StreamConfigData.emptyDropped(purge),
                 Set.of(PutOption.IfRecordDoesNotExist))
@@ -945,12 +998,20 @@ final class IndexedStreamConfigStore {
                 if (!(failure instanceof KeyAlreadyExistsException)) {
                     return CompletableFuture.failedFuture(failure);
                 }
-                return upgradeTombstonePurge(id, purge, retryCount, failure);
+                return upgradeTombstonePurge(id, ownerToken, purge, retryCount, failure);
             });
     }
 
+    /**
+     * Merges a late purge request into the tombstone that already fences an absent identity.
+     *
+     * <p>Every retry goes back through {@link #beginDropAttempt} rather than straight to
+     * {@link #dropAbsentStream}: the config record is re-read first, so a stream created while this
+     * upgrade was in flight is claimed and dropped for real instead of being fenced as absent.
+     */
     private CompletableFuture<Optional<DropClaim>> upgradeTombstonePurge(
-            StreamIdentifier id, boolean purge, int retryCount, Throwable conflict) {
+            StreamIdentifier id, String ownerToken, boolean purge, int retryCount,
+            Throwable conflict) {
         if (!purge) {
             return CompletableFuture.completedFuture(Optional.empty());
         }
@@ -959,7 +1020,7 @@ final class IndexedStreamConfigStore {
             if (existing == null) {
                 return retryAfterConflict(
                     id, "absent stream deletion tombstone", retryCount, conflict,
-                    () -> dropAbsentStream(id, true, retryCount + 1));
+                    () -> beginDropAttempt(id, ownerToken, true, retryCount + 1));
             }
             StreamConfigData tombstone = parse(id, existing.value());
             if (tombstone.purgeRequested()) {
@@ -975,7 +1036,7 @@ final class IndexedStreamConfigStore {
                     if (failure instanceof UnexpectedVersionIdException) {
                         return retryAfterConflict(
                             id, "absent stream purge upgrade", retryCount, failure,
-                            () -> dropAbsentStream(id, true, retryCount + 1));
+                            () -> beginDropAttempt(id, ownerToken, true, retryCount + 1));
                     }
                     return CompletableFuture.failedFuture(failure);
                 });
@@ -1047,17 +1108,70 @@ final class IndexedStreamConfigStore {
      * one from a concurrent completion of the same drop counts as success.
      */
     CompletableFuture<Void> completeDrop(StreamIdentifier id, DropClaim claim) {
+        return completeDropAttempt(id, claim, 0);
+    }
+
+    private CompletableFuture<Void> completeDropAttempt(
+            StreamIdentifier id, DropClaim claim, int retryCount) {
         String path = catalogPaths.streamConfigPath(id);
         String tombstonePath = catalogPaths.streamTombstonePath(id);
         StreamConfigData dropped = claim.config().completeDrop();
         return putWithResult(tombstonePath, dropped, Set.of(PutOption.IfRecordDoesNotExist))
             .handle((result, failure) -> unwrapNullable(failure))
             .thenCompose(failure -> {
-                if (failure != null && !(failure instanceof KeyAlreadyExistsException)) {
+                if (failure == null) {
+                    return deleteCompletedDropConfig(id, path, claim);
+                }
+                if (!(failure instanceof KeyAlreadyExistsException)) {
                     return CompletableFuture.<Void>failedFuture(failure);
                 }
-                return deleteCompletedDropConfig(id, path, claim);
+                return convergeExistingTombstone(
+                    id, path, tombstonePath, claim, dropped, retryCount, failure);
             });
+    }
+
+    /**
+     * Replaces an empty fence with this drop's payload before the drop counts as complete.
+     *
+     * <p>{@link #dropAbsentStream} fences an identity whose config record is absent with a
+     * zero-partition tombstone. When the real stream turns up afterwards, that fence would make the
+     * completed drop describe no partitions at all and leave the recovery sweep with nothing to
+     * clean up. Overwriting it by version keeps the recorded partition count and any purge intent
+     * that either payload carries.
+     */
+    private CompletableFuture<Void> convergeExistingTombstone(
+            StreamIdentifier id, String path, String tombstonePath, DropClaim claim,
+            StreamConfigData dropped, int retryCount, Throwable conflict) {
+        if (dropped.partitions() <= 0) {
+            return deleteCompletedDropConfig(id, path, claim);
+        }
+        return oxiaClient.get(tombstonePath).thenCompose(existing -> {
+            if (existing == null) {
+                return retryAfterConflict(
+                    id, "stream deletion tombstone", retryCount, conflict,
+                    () -> completeDropAttempt(id, claim, retryCount + 1));
+            }
+            StreamConfigData tombstone = parse(id, existing.value());
+            if (tombstone.partitions() > 0) {
+                return deleteCompletedDropConfig(id, path, claim);
+            }
+            StreamConfigData replacement = tombstone.purgeRequested()
+                ? dropped.requestPurge() : dropped;
+            return put(tombstonePath, replacement,
+                    Set.of(PutOption.IfVersionIdEquals(existing.version().versionId())))
+                .handle((ignored, failure) -> unwrapNullable(failure))
+                .thenCompose(failure -> {
+                    if (failure == null) {
+                        return deleteCompletedDropConfig(id, path, claim);
+                    }
+                    if (failure instanceof UnexpectedVersionIdException) {
+                        return retryAfterConflict(
+                            id, "stream deletion tombstone upgrade", retryCount, failure,
+                            () -> completeDropAttempt(id, claim, retryCount + 1));
+                    }
+                    return CompletableFuture.<Void>failedFuture(failure);
+                });
+        });
     }
 
     private CompletableFuture<Void> deleteCompletedDropConfig(
