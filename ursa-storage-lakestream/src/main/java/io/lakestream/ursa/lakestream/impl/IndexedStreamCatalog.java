@@ -80,6 +80,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiFunction;
 import java.util.function.Function;
+import java.util.function.LongFunction;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
@@ -592,44 +593,11 @@ public class IndexedStreamCatalog implements StreamCatalog {
             StreamIdentifier id, IndexedStreamConfigStore.ProvisioningClaim claim,
             int partIdx) {
         String allocationKey = nativePartitionAllocationKey(id, partIdx);
-        return streamConfigStore.verifyProvisioningOwnership(id, claim)
-            .thenCompose(ignored ->
-                prepareRetiredNativePartition(id, partIdx, claim))
-            .thenCompose(prepared -> allocateNativeKeyedStreamId(
-                allocationKey, streamIdMappingOwner(claim),
-                prepared.acknowledgedFence())
-                .thenApply(streamId -> {
-                    if (prepared.retiredStreamIds().contains(streamId)) {
-                        throw new RetiredStreamIdAllocationException(
-                            new StreamIdAllocation(streamId, false),
-                            "Native partition " + id.fullName() + "-partition-"
-                                + partIdx
-                                + " cannot reuse a retired physical stream ID");
-                    }
-                    return streamId;
-                })
-                .handle((streamId, failure) -> new NativeAllocationAttempt(
-                    streamId, unwrapNullable(failure))))
-            .thenCompose(attempt -> {
-                if (attempt.failure() == null) {
-                    return verifyAndWriteNativePartitionAfterAllocation(
-                        id, partIdx, allocationKey, attempt.streamId(), claim);
-                }
-                Throwable cause = rootCause(attempt.failure());
-                if (cause instanceof KeyedAllocationInvalidatedException invalidated) {
-                    return compensateRejectedNativeAllocation(
-                        id, partIdx, allocationKey,
-                        invalidated.allocation().streamId(), claim, cause);
-                }
-                if (cause instanceof RetiredStreamIdAllocationException retired) {
-                    return compensateRetiredNativeAllocation(
-                        id, partIdx, allocationKey,
-                        retired.allocation().streamId(), claim, cause);
-                }
-                return CompletableFuture.failedFuture(cause);
-            })
-            .thenCompose(ignored ->
-                streamConfigStore.verifyProvisioningOwnership(id, claim));
+        return allocateNativePartition(
+            id, partIdx, allocationKey, claim,
+            () -> streamConfigStore.verifyProvisioningOwnership(id, claim),
+            streamId -> verifyAndWriteNativePartitionAfterAllocation(
+                id, partIdx, allocationKey, streamId, claim));
     }
 
     private CompletableFuture<Void> createExpansionPartitions(
@@ -643,13 +611,34 @@ public class IndexedStreamCatalog implements StreamCatalog {
             StreamIdentifier id, IndexedStreamConfigStore.ExpansionClaim claim,
             int partitionIndex) {
         String allocationKey = nativePartitionAllocationKey(id, partitionIndex);
-        return streamConfigStore.verifyExpansion(id, claim)
+        return allocateNativePartition(
+            id, partitionIndex, allocationKey, expansionCleanupClaim(claim),
+            () -> streamConfigStore.verifyExpansion(id, claim),
+            streamId -> verifyAndWriteExpansionPartitionAfterAllocation(
+                id, partitionIndex, allocationKey, streamId, claim));
+    }
+
+    /**
+     * Allocates one native partition's physical stream ID and writes its metadata.
+     *
+     * <p>Creation and expansion run the same chain and differ only in the record that owns it:
+     * {@code ownershipVerifier} re-checks that record before and after every step that could
+     * outlive it, {@code writeAfterAllocation} performs the claim-specific metadata write, and
+     * {@code cleanupClaim} is the provisioning claim that compensation writes roll back under. The
+     * expansion claim converts to that provisioning claim once, up front, so every compensation
+     * path below sees the identity its own owner recorded.
+     */
+    private CompletableFuture<Void> allocateNativePartition(
+            StreamIdentifier id, int partitionIndex, String allocationKey,
+            IndexedStreamConfigStore.ProvisioningClaim cleanupClaim,
+            Supplier<CompletableFuture<Void>> ownershipVerifier,
+            LongFunction<CompletableFuture<Void>> writeAfterAllocation) {
+        StreamIdMappingOwner mappingOwner = streamIdMappingOwner(cleanupClaim);
+        return ownershipVerifier.get()
             .thenCompose(ignored -> prepareRetiredNativePartition(
-                id, partitionIndex, streamIdMappingOwner(claim),
-                () -> streamConfigStore.verifyExpansion(id, claim)))
+                id, partitionIndex, mappingOwner, ownershipVerifier))
             .thenCompose(prepared -> allocateNativeKeyedStreamId(
-                allocationKey, streamIdMappingOwner(claim),
-                prepared.acknowledgedFence())
+                allocationKey, mappingOwner, prepared.acknowledgedFence())
                 .thenApply(streamId -> {
                     if (prepared.retiredStreamIds().contains(streamId)) {
                         throw new RetiredStreamIdAllocationException(
@@ -664,13 +653,9 @@ public class IndexedStreamCatalog implements StreamCatalog {
                     streamId, unwrapNullable(failure))))
             .thenCompose(attempt -> {
                 if (attempt.failure() == null) {
-                    return verifyAndWriteExpansionPartitionAfterAllocation(
-                        id, partitionIndex, allocationKey,
-                        attempt.streamId(), claim);
+                    return writeAfterAllocation.apply(attempt.streamId());
                 }
                 Throwable cause = rootCause(attempt.failure());
-                IndexedStreamConfigStore.ProvisioningClaim cleanupClaim =
-                    expansionCleanupClaim(claim);
                 if (cause instanceof KeyedAllocationInvalidatedException invalidated) {
                     return compensateRejectedNativeAllocation(
                         id, partitionIndex, allocationKey,
@@ -683,7 +668,7 @@ public class IndexedStreamCatalog implements StreamCatalog {
                 }
                 return CompletableFuture.failedFuture(cause);
             })
-            .thenCompose(ignored -> streamConfigStore.verifyExpansion(id, claim));
+            .thenCompose(ignored -> ownershipVerifier.get());
     }
 
     private CompletableFuture<Void> verifyAndWriteExpansionPartitionAfterAllocation(
@@ -715,14 +700,6 @@ public class IndexedStreamCatalog implements StreamCatalog {
             config.ownerToken().orElseThrow(),
             IndexedStreamConfigStore.CreationKind.NATIVE_CREATE,
             config.ownerGeneration(), claim.versionId());
-    }
-
-    private CompletableFuture<PreparedNativePartition> prepareRetiredNativePartition(
-            StreamIdentifier id, int partitionIndex,
-            IndexedStreamConfigStore.ProvisioningClaim claim) {
-        return prepareRetiredNativePartition(
-            id, partitionIndex, streamIdMappingOwner(claim),
-            () -> streamConfigStore.verifyProvisioningOwnership(id, claim));
     }
 
     private CompletableFuture<PreparedNativePartition> prepareRetiredNativePartition(
@@ -2164,14 +2141,6 @@ public class IndexedStreamCatalog implements StreamCatalog {
             IndexedStreamConfigStore.ProvisioningClaim claim) {
         return new StreamIdMappingOwner(
             claim.incarnationId(), claim.ownerToken(), claim.ownerGeneration());
-    }
-
-    private static StreamIdMappingOwner streamIdMappingOwner(
-            IndexedStreamConfigStore.ExpansionClaim claim) {
-        IndexedStreamConfigStore.StreamConfigData config = claim.config();
-        return new StreamIdMappingOwner(
-            config.incarnationId().orElseThrow(),
-            config.ownerToken().orElseThrow(), config.ownerGeneration());
     }
 
     private static StreamIdMappingOwner streamIdMappingOwner(LogMetadata metadata) {
