@@ -111,6 +111,38 @@ streamCatalog.setStreamMaterialization(
 > overrides only need the fields that differ from the namespace policy;
 > every other field uses `Optional.empty()` to inherit.
 
+## Table Naming Templates
+
+`TableNaming.tableNameTemplate` is interpolated once per stream when the policy
+is resolved. Three variables are supported, all case-sensitive:
+
+| Variable | Resolves to |
+|----------|-------------|
+| `${stream.namespace}` | The stream's namespace. |
+| `${stream.name}` | The stream's name within its namespace. |
+| `${stream.property.<key>}` | The value of the stream property `<key>`, taken from `StreamMetadata.properties()`. |
+
+`${stream.property.<key>}` lets one namespace policy route streams to tables
+named after something the stream itself carries — a tenant, a region, a dataset
+name a producer set as a stream property:
+
+```java
+new TableNaming(Optional.of("analytics"), "${stream.property.dataset}_events")
+```
+
+Resolution fails with `IllegalArgumentException` when the template names a
+variable that does not exist, and equally when it names a stream property that
+is unset or blank on that stream: an unresolvable name is never silently
+replaced with a default or an empty string. Templates are interpolated per
+stream, so a policy valid for one stream can still fail for its neighbour.
+
+Only `TableNaming.toTableIdentifier(StreamIdentifier, Map<String, String>)`
+resolves property variables. The single-argument
+`toTableIdentifier(StreamIdentifier)` has no properties to consult and rejects
+any template that uses one; call sites inside materialization pass
+`StreamMetadata.properties()`. `tableNamespacePrefix` is used literally and is
+never interpolated.
+
 ## Configuration Keys
 
 Operator-side keys read on `CompactionScheduler` startup:
