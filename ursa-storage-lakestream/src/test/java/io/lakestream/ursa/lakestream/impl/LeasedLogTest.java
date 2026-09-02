@@ -659,6 +659,87 @@ class LeasedLogTest {
         verify(delegate, times(3)).getLastOffset();
     }
 
+    @Test
+    void appendRepairsCachedEmptyFirstOffset() throws Exception {
+        Log delegate = mock(Log.class);
+        StreamWriteLease lease = lease(54L);
+        when(delegate.id()).thenReturn(LogId.of(54L));
+        when(delegate.getFirstOffset())
+            .thenReturn(CompletableFuture.completedFuture(LogOffset.NOT_FOUND));
+        LogEntryHeader header = mock(LogEntryHeader.class);
+        when(header.offset()).thenReturn(0L);
+        when(header.numberOfRecords()).thenReturn(1);
+        when(header.timestamp()).thenReturn(100L);
+        when(header.entrySize()).thenReturn(50);
+        when(header.cumulativeSize()).thenReturn(50L);
+        when(delegate.append(1, Unpooled.EMPTY_BUFFER))
+            .thenReturn(CompletableFuture.completedFuture(header));
+        LeasedLog log = new LeasedLog(delegate, lease, Runnable::run, () -> { });
+
+        assertEquals(LogOffset.NOT_FOUND, log.getFirstOffset().get(10, TimeUnit.SECONDS));
+        log.append(1, Unpooled.EMPTY_BUFFER).get(10, TimeUnit.SECONDS);
+
+        assertEquals(new LogOffset(0L, 1, 100L, 50, 50L),
+            log.getFirstOffset().get(10, TimeUnit.SECONDS));
+        verify(delegate, times(1)).getFirstOffset();
+    }
+
+    @Test
+    void staleFirstOffsetReadDoesNotOverrideAppend() throws Exception {
+        Log delegate = mock(Log.class);
+        StreamWriteLease lease = lease(55L);
+        when(delegate.id()).thenReturn(LogId.of(55L));
+        CompletableFuture<LogOffset> pending = new CompletableFuture<>();
+        LogOffset fresh = new LogOffset(0L, 1, 200L, 60, 60L);
+        when(delegate.getFirstOffset())
+            .thenReturn(pending)
+            .thenReturn(CompletableFuture.completedFuture(fresh));
+        LogEntryHeader header = mock(LogEntryHeader.class);
+        when(header.offset()).thenReturn(0L);
+        when(header.numberOfRecords()).thenReturn(1);
+        when(header.timestamp()).thenReturn(200L);
+        when(header.entrySize()).thenReturn(60);
+        when(header.cumulativeSize()).thenReturn(60L);
+        when(delegate.append(1, Unpooled.EMPTY_BUFFER))
+            .thenReturn(CompletableFuture.completedFuture(header));
+        LeasedLog log = new LeasedLog(delegate, lease, Runnable::run, () -> { });
+
+        CompletableFuture<LogOffset> staleRead = log.getFirstOffset();
+        assertFalse(staleRead.isDone());
+
+        log.append(1, Unpooled.EMPTY_BUFFER).get(10, TimeUnit.SECONDS);
+        pending.complete(LogOffset.NOT_FOUND);
+
+        assertEquals(LogOffset.NOT_FOUND, staleRead.get(10, TimeUnit.SECONDS));
+        assertEquals(fresh, log.getFirstOffset().get(10, TimeUnit.SECONDS));
+        verify(delegate, times(2)).getFirstOffset();
+    }
+
+    @Test
+    void staleFirstOffsetReadDoesNotOverrideSoftTrim() throws Exception {
+        Log delegate = mock(Log.class);
+        StreamWriteLease lease = lease(56L);
+        when(delegate.id()).thenReturn(LogId.of(56L));
+        CompletableFuture<LogOffset> pending = new CompletableFuture<>();
+        LogOffset stale = new LogOffset(3L, 1, 1L);
+        LogOffset fresh = new LogOffset(9L, 1, 2L);
+        when(delegate.getFirstOffset())
+            .thenReturn(pending)
+            .thenReturn(CompletableFuture.completedFuture(fresh));
+        when(delegate.softTrim(8L)).thenReturn(CompletableFuture.completedFuture(9L));
+        LeasedLog log = new LeasedLog(delegate, lease, Runnable::run, () -> { });
+
+        CompletableFuture<LogOffset> staleRead = log.getFirstOffset();
+        assertFalse(staleRead.isDone());
+
+        log.softTrim(8L).get(10, TimeUnit.SECONDS);
+        pending.complete(stale);
+
+        assertEquals(stale, staleRead.get(10, TimeUnit.SECONDS));
+        assertEquals(fresh, log.getFirstOffset().get(10, TimeUnit.SECONDS));
+        verify(delegate, times(2)).getFirstOffset();
+    }
+
     private static StreamWriteLease lease(long streamId) {
         StreamWriteLease lease = mock(StreamWriteLease.class);
         when(lease.streamId()).thenReturn(streamId);

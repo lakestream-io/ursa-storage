@@ -26,6 +26,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
@@ -57,6 +58,7 @@ final class LeasedLog implements Log {
     private final Runnable onFullyClosed;
     private final AtomicReference<LogOffset> cachedFirstOffset = new AtomicReference<>();
     private final AtomicReference<LogOffset> cachedLastOffset = new AtomicReference<>();
+    private final AtomicLong mutationEpoch = new AtomicLong();
 
     private boolean closing;
     private int activeOperations;
@@ -263,6 +265,7 @@ final class LeasedLog implements Log {
                     invalidateOffsetCache();
                     return;
                 }
+                mutationEpoch.incrementAndGet();
                 LogOffset appended = new LogOffset(header.offset(), header.numberOfRecords(),
                     header.timestamp(), header.entrySize(), header.cumulativeSize());
                 cachedLastOffset.set(appended);
@@ -446,7 +449,10 @@ final class LeasedLog implements Log {
     @Override
     public CompletableFuture<Long> softTrim(long offsetIncluded) {
         return trackOperation(() -> delegate.softTrim(offsetIncluded)
-            .whenComplete((ignored, failure) -> cachedFirstOffset.set(null)), ignored -> { });
+            .whenComplete((ignored, failure) -> {
+                mutationEpoch.incrementAndGet();
+                cachedFirstOffset.set(null);
+            }), ignored -> { });
     }
 
     private CompletableFuture<LogOffset> cachedOffset(
@@ -455,16 +461,18 @@ final class LeasedLog implements Log {
         if (cached != null) {
             return trackOperation(() -> CompletableFuture.completedFuture(cached), ignored -> { });
         }
+        long epoch = mutationEpoch.get();
         return trackOperation(() -> read.get().whenComplete((value, failure) -> {
             if (failure != null || value == null) {
                 cache.set(null);
-            } else {
+            } else if (mutationEpoch.get() == epoch) {
                 cache.compareAndSet(null, value);
             }
         }), ignored -> { });
     }
 
     private void invalidateOffsetCache() {
+        mutationEpoch.incrementAndGet();
         cachedFirstOffset.set(null);
         cachedLastOffset.set(null);
     }
