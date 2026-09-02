@@ -386,6 +386,23 @@ class LeasedLogTest {
     }
 
     @Test
+    void closeAsyncRetriesUntilDelegateAndLeaseAreClosed() throws Exception {
+        Log delegate = mock(Log.class);
+        StreamWriteLease lease = lease(41L);
+        when(delegate.id()).thenReturn(LogId.of(41L));
+        doThrow(new IOException("first close fails")).doNothing().when(delegate).close();
+        when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
+        LeasedLog log = new LeasedLog(delegate, lease, Runnable::run, () -> { });
+
+        CompletableFuture<Void> closed = log.closeAsync();
+
+        closed.get(10, TimeUnit.SECONDS);
+        verify(delegate, times(2)).close();
+        verify(lease, times(1)).closeAsync();
+        assertSame(closed, log.closeAsync(), "closeAsync is idempotent");
+    }
+
+    @Test
     void failedOpenCleanupDoesNotReadThrowingDelegateIdAndRetriesClose()
             throws Exception {
         Log delegate = mock(Log.class);

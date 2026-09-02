@@ -179,6 +179,24 @@ public interface Log extends AutoCloseable {
      */
     void fence();
 
+    /**
+     * Closes this log without blocking the caller.
+     *
+     * <p>The returned future completes when the log and any durable lease it owns are released.
+     * Implementations retry internally, so callers may drop the returned future. This method
+     * never throws; a close failure is reported through the future.
+     *
+     * @return a future that completes when the log is fully closed
+     */
+    default CompletableFuture<Void> closeAsync() {
+        try {
+            close();
+            return CompletableFuture.completedFuture(null);
+        } catch (Throwable failure) {
+            return CompletableFuture.failedFuture(failure);
+        }
+    }
+
     // --- Cursor management ---
 
     /**

@@ -597,6 +597,11 @@ final class LeasedLog implements Log {
         }
     }
 
+    @Override
+    public CompletableFuture<Void> closeAsync() {
+        return closeEventually(delegateCloseExecutor);
+    }
+
     /**
      * Starts a supervised, non-cancellable close that retries until both the delegate and lease are
      * closed in the required order. The retry chain retains this handle even if its caller drops the
