@@ -70,7 +70,9 @@ import io.oxia.client.api.options.PutOption;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -79,6 +81,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.Set;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
@@ -217,6 +220,22 @@ class IndexedStreamCatalogTest {
         // and while building the returned layout.
         verify(oxiaClient, times(3)).get(firstPartitionPath);
         verify(oxiaClient, times(3)).get(secondPartitionPath);
+    }
+
+    @Test
+    void createStream_interleavedPartitionChainsMatchSequentialOnes() throws Exception {
+        CreationOutcome sequential = createPartitionsSequentially(
+            new StreamIdentifier("public/default", "sequential-topic"));
+        CreationOutcome interleaved = createPartitionsCompletingOutOfOrder(
+            new StreamIdentifier("public/default", "interleaved-topic"));
+
+        // Completion order does not reach the committed result: the layout keeps partition order,
+        // each partition keeps the stream ID its own allocation key resolves to, and neither run
+        // fences anything.
+        assertEquals(sequential, interleaved);
+        assertEquals(List.of(100L, 101L), interleaved.logIds());
+        assertEquals(Map.of(0, 100L, 1, 101L), interleaved.persistedStreamIds());
+        assertEquals(List.of(), interleaved.fenceAttempts());
     }
 
     @Test
@@ -1828,6 +1847,7 @@ class IndexedStreamCatalogTest {
         ExecutionException outOfRange = assertThrows(ExecutionException.class,
             () -> catalog.openLog(streamId, 2).get(10, TimeUnit.SECONDS));
         assertEquals(IllegalArgumentException.class, outOfRange.getCause().getClass());
+        opened.close();
     }
 
     @Test
@@ -2113,6 +2133,96 @@ class IndexedStreamCatalogTest {
 
     // --- Helpers ---
 
+    private CreationOutcome createPartitionsSequentially(StreamIdentifier id) throws Exception {
+        FencedStorageHarness storage = new FencedStorageHarness(
+            IndexedStreamCatalogTest::allocateByPartitionIndex);
+        IndexedStreamCatalog target = fencedCatalog(storage);
+        mockVersionedConfig(catalogPaths.streamConfigPath(id));
+        List<AtomicReference<VersionedValue>> partitions = List.of(
+            mockCreateOnlyRecord(catalogPaths.partitionMetadataPath(id, 0)),
+            mockCreateOnlyRecord(catalogPaths.partitionMetadataPath(id, 1)));
+
+        StreamMetadata metadata = target.createStream(
+                id, new StreamConfig(), indexedPartitioning(2), new SchemaConfig(), Map.of())
+            .get(10, TimeUnit.SECONDS);
+
+        return creationOutcome(id, storage, metadata, partitions);
+    }
+
+    /**
+     * Creates a two-partition stream while partition 1's chain runs ahead of partition 0's.
+     *
+     * <p>Both chains park on their first partition read; partition 1's Oxia futures are then
+     * completed to the end of its chain before partition 0's first read is answered at all.
+     */
+    private CreationOutcome createPartitionsCompletingOutOfOrder(StreamIdentifier id)
+            throws Exception {
+        FencedStorageHarness storage = new FencedStorageHarness(
+            IndexedStreamCatalogTest::allocateByPartitionIndex);
+        IndexedStreamCatalog target = fencedCatalog(storage);
+        mockVersionedConfig(catalogPaths.streamConfigPath(id));
+        DeferredRecord first = mockDeferredCreateOnlyRecord(
+            catalogPaths.partitionMetadataPath(id, 0));
+        DeferredRecord second = mockDeferredCreateOnlyRecord(
+            catalogPaths.partitionMetadataPath(id, 1));
+
+        CompletableFuture<StreamMetadata> create = target.createStream(
+            id, new StreamConfig(), indexedPartitioning(2), new SchemaConfig(), Map.of());
+
+        assertFalse(create.isDone());
+        assertEquals(1, first.pendingCount());
+        assertEquals(1, second.pendingCount());
+
+        second.releaseAll();
+        assertFalse(create.isDone());
+        assertNotNull(second.state().get(), "partition 1 must have committed its metadata");
+        assertNull(first.state().get(), "partition 0 must not have written anything yet");
+        assertEquals(1, first.pendingCount(), "partition 0 must not have made any progress");
+
+        first.releaseAll();
+        // Finalization and the layout read that follows it touch both partitions again.
+        while (!create.isDone()) {
+            assertTrue(first.releaseAll() | second.releaseAll(),
+                "creation stalled with no pending partition metadata calls");
+        }
+
+        return creationOutcome(id, storage, create.get(10, TimeUnit.SECONDS),
+            List.of(first.state(), second.state()));
+    }
+
+    private CreationOutcome creationOutcome(
+            StreamIdentifier id, FencedStorageHarness storage, StreamMetadata metadata,
+            List<AtomicReference<VersionedValue>> partitions) throws Exception {
+        List<Long> logIds = metadata.layout().logIds().join().stream()
+            .map(LogId::id).toList();
+        Map<Integer, Long> mappedStreamIds = new HashMap<>();
+        Map<Integer, Long> persistedStreamIds = new HashMap<>();
+        for (int index = 0; index < partitions.size(); index++) {
+            String path = catalogPaths.partitionMetadataPath(id, index);
+            mappedStreamIds.put(index, storage.activeStreamId(
+                "lakestream-native/" + id.fullName() + "/partition-" + index).orElseThrow());
+            persistedStreamIds.put(index, LOG_METADATA_SERDE.deserialize(
+                path, partitions.get(index).get().value()).streamId());
+        }
+        List<String> fenceAttempts = storage.fenceAttempts().stream()
+            .map(attempt -> attempt.replace(id.fullName(), "<stream>"))
+            .toList();
+        return new CreationOutcome(logIds, Map.copyOf(mappedStreamIds),
+            Map.copyOf(persistedStreamIds), fenceAttempts, storage.writeLeases().size());
+    }
+
+    private static CompletableFuture<Long> allocateByPartitionIndex(String allocationKey) {
+        String marker = "/partition-";
+        int index = Integer.parseInt(
+            allocationKey.substring(allocationKey.lastIndexOf(marker) + marker.length()));
+        return CompletableFuture.completedFuture(100L + index);
+    }
+
+    private static Partitioning indexedPartitioning(int partitions) {
+        return new Partitioning(
+            PartitioningStrategy.INDEXED, Map.of("numPartitions", String.valueOf(partitions)));
+    }
+
     private void mockStreamConfig(StreamIdentifier id, int numPartitions) {
         mockStreamConfig(id, numPartitions, Map.of());
     }
@@ -2284,6 +2394,44 @@ class IndexedStreamCatalogTest {
                 return CompletableFuture.completedFuture(new PutResult(path, version));
             });
         return state;
+    }
+
+    /**
+     * Stubs a create-only record whose reads and writes settle only when the test releases them.
+     *
+     * <p>Each call is evaluated against the record's state at release time, not at call time, so
+     * releasing one path's queue ahead of another's reproduces an out-of-order completion.
+     */
+    private DeferredRecord mockDeferredCreateOnlyRecord(String path) {
+        DeferredRecord deferred = new DeferredRecord();
+        AtomicLong nextVersion = new AtomicLong();
+        lenient().when(oxiaClient.get(path)).thenAnswer(ignored -> deferred.defer(() -> {
+            VersionedValue current = deferred.state().get();
+            return current == null ? null
+                : new GetResult(path, current.value(), current.version());
+        }));
+        lenient().when(oxiaClient.put(eq(path), any(byte[].class), any()))
+            .thenAnswer(invocation -> {
+                byte[] value = invocation.getArgument(1, byte[].class);
+                @SuppressWarnings("unchecked")
+                Set<PutOption> options = invocation.getArgument(2, Set.class);
+                return deferred.defer(() -> {
+                    VersionedValue current = deferred.state().get();
+                    if (options.contains(PutOption.IfRecordDoesNotExist) && current != null) {
+                        throw new KeyAlreadyExistsException(path);
+                    }
+                    if (!options.contains(PutOption.IfRecordDoesNotExist)
+                            && (current == null || !options.contains(
+                                PutOption.IfVersionIdEquals(current.version().versionId())))) {
+                        throw new UnexpectedVersionIdException(
+                            path, current == null ? -1L : current.version().versionId());
+                    }
+                    Version version = version(nextVersion.incrementAndGet());
+                    deferred.state().set(new VersionedValue(value.clone(), version));
+                    return new PutResult(path, version);
+                });
+            });
+        return deferred;
     }
 
     private IndexedStreamCatalog fencedCatalog(FencedStorageHarness storage) {
@@ -2576,6 +2724,52 @@ class IndexedStreamCatalogTest {
     }
 
     private record VersionedValue(byte[] value, Version version) {
+    }
+
+    /** The observable result of one stream creation, independent of chain completion order. */
+    private record CreationOutcome(
+            List<Long> logIds,
+            Map<Integer, Long> mappedStreamIds,
+            Map<Integer, Long> persistedStreamIds,
+            List<String> fenceAttempts,
+            int writeLeases) {
+    }
+
+    /** A record whose Oxia calls queue up until the test releases them, in call order. */
+    private static final class DeferredRecord {
+
+        private final Deque<Runnable> pending = new ArrayDeque<>();
+        private final AtomicReference<VersionedValue> state = new AtomicReference<>();
+
+        private AtomicReference<VersionedValue> state() {
+            return state;
+        }
+
+        private <T> CompletableFuture<T> defer(Callable<T> answer) {
+            CompletableFuture<T> deferred = new CompletableFuture<>();
+            pending.add(() -> {
+                try {
+                    deferred.complete(answer.call());
+                } catch (Throwable failure) {
+                    deferred.completeExceptionally(failure);
+                }
+            });
+            return deferred;
+        }
+
+        private int pendingCount() {
+            return pending.size();
+        }
+
+        /** Answers every queued call, including calls the answers themselves trigger. */
+        private boolean releaseAll() {
+            boolean released = false;
+            while (!pending.isEmpty()) {
+                pending.poll().run();
+                released = true;
+            }
+            return released;
+        }
     }
 
     private void mockStreamExistence(StreamIdentifier id, boolean exists) {

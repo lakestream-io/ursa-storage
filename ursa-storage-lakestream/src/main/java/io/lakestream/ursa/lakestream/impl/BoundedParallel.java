@@ -40,6 +40,10 @@ final class BoundedParallel {
      * One {@link #forEach} invocation. Launches are driven by a trampoline so that bodies which
      * settle synchronously do not grow the stack: a completion that wants to start the next index
      * only records the request, and the thread already inside the drain loop performs it.
+     *
+     * <p>Once a body fails, no further index is launched. Every body already in flight still runs
+     * to completion — each one owns a chain whose compensation depends on finishing — and only then
+     * does the first failure propagate.
      */
     private static final class Run {
 
@@ -72,6 +76,10 @@ final class BoundedParallel {
         }
 
         private void launchOne() {
+            if (firstFailure.get() != null) {
+                abandonUnlaunched();
+                return;
+            }
             int index = next.getAndIncrement();
             if (index >= count) {
                 return;
@@ -86,17 +94,37 @@ final class BoundedParallel {
                 if (failure != null) {
                     firstFailure.compareAndSet(null, unwrap(failure));
                 }
-                if (remaining.decrementAndGet() == 0) {
-                    Throwable recorded = firstFailure.get();
-                    if (recorded == null) {
-                        result.complete(null);
-                    } else {
-                        result.completeExceptionally(recorded);
-                    }
-                    return;
+                if (!settle(1)) {
+                    requestLaunch();
                 }
-                requestLaunch();
             });
+        }
+
+        /**
+         * Claims every index that has not been launched yet, so no further body starts and the run
+         * can still settle once the bodies in flight finish. {@link #next} hands out each index
+         * exactly once, to a launch or to this claim, which keeps {@link #remaining} exact even
+         * when a launch already past its failure check runs concurrently with this call.
+         */
+        private void abandonUnlaunched() {
+            int from = next.getAndSet(count);
+            if (from < count) {
+                settle(count - from);
+            }
+        }
+
+        /** Records that {@code finished} indices are done, returning whether the run settled. */
+        private boolean settle(int finished) {
+            if (remaining.addAndGet(-finished) != 0) {
+                return false;
+            }
+            Throwable recorded = firstFailure.get();
+            if (recorded == null) {
+                result.complete(null);
+            } else {
+                result.completeExceptionally(recorded);
+            }
+            return true;
         }
     }
 }
