@@ -6,6 +6,7 @@ package io.lakestream.ursa.lakestream.impl;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -525,12 +526,21 @@ class LogCursorImplTest {
     // --- Ephemeral cursor lifecycle ---
 
     @Test
-    void ephemeralCursorCloseDoesNotPersist() throws Exception {
+    void ephemeralCursorCloseDropsThePrefetchCacheInsteadOfPersisting() throws Exception {
         Log log = mock(Log.class);
         LogCursorImpl cursor = new LogCursorImpl("scan", log, 0L, -1L);
-        long start = System.nanoTime();
+        cursor.getPrefetchedIndexes().add(makeRawEntryIndex(0, 1));
+        cursor.getPrefetchedIndexes().add(makeRawEntryIndex(1, 1));
+        cursor.setPrefetchedMessageCount(2);
+        cursor.setNextReadIndex(CompletableFuture.completedFuture(makeRawEntryIndex(0, 1)));
+
         cursor.close();
-        assertTrue(System.nanoTime() - start < TimeUnit.SECONDS.toNanos(1));
+
+        // An ephemeral cursor has no durable state to write, so closing it only drops what it
+        // prefetched: the cache is empty and the pre-resolved next index is back to nothing.
+        assertTrue(cursor.getPrefetchedIndexes().isEmpty());
+        assertEquals(0, cursor.getPrefetchedMessageCount());
+        assertNull(cursor.getNextReadIndex().get(5, TimeUnit.SECONDS));
         verifyNoInteractions(log);
     }
 

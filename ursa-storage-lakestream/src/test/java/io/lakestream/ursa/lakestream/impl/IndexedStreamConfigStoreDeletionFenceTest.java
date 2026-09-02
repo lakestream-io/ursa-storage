@@ -30,6 +30,7 @@ import io.lakestream.api.exception.AlreadyExistsException;
 import io.lakestream.api.exception.NoSuchStreamException;
 import io.lakestream.api.exception.StreamPermanentlyDeletedException;
 import io.lakestream.api.materialization.TableMaterializationPolicy;
+import io.lakestream.ursa.lakestream.impl.FakeOxiaRecord.VersionedValue;
 import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.GetResult;
 import io.oxia.client.api.PutResult;
@@ -61,8 +62,8 @@ import org.mockito.junit.jupiter.MockitoExtension;
 class IndexedStreamConfigStoreDeletionFenceTest {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
-    private static final Version VERSION_1 = version(1);
-    private static final Version VERSION_2 = version(2);
+    private static final Version VERSION_1 = FakeOxiaRecord.version(1);
+    private static final Version VERSION_2 = FakeOxiaRecord.version(2);
 
     @Mock
     private AsyncOxiaClient oxiaClient;
@@ -400,7 +401,7 @@ class IndexedStreamConfigStoreDeletionFenceTest {
         when(oxiaClient.put(eq(configPath), any(byte[].class),
                 eq(Set.of(PutOption.IfVersionIdEquals(VERSION_2.versionId())))))
             .thenReturn(CompletableFuture.completedFuture(
-                new PutResult(configPath, version(3))));
+                new PutResult(configPath, FakeOxiaRecord.version(3))));
 
         CompletableFuture<Void> update = store.setProperties(id, Map.of("tier", "hot"));
 
@@ -576,23 +577,23 @@ class IndexedStreamConfigStoreDeletionFenceTest {
                 1, Map.of("state", "active"), "active-incarnation", "active-owner", 1L,
                 IndexedStreamConfigStore.NO_METADATA_GENERATION,
                 IndexedStreamConfigStore.CreationKind.NATIVE_CREATE,
-                IndexedStreamConfigStore.ProvisioningState.ACTIVE), version(10))));
+                IndexedStreamConfigStore.ProvisioningState.ACTIVE), FakeOxiaRecord.version(10))));
         when(oxiaClient.get(creatingKey)).thenReturn(CompletableFuture.completedFuture(
             new GetResult(creatingKey, streamConfigBytes(
                 1, Map.of("state", "creating"), "creating-incarnation", "creating-owner", 1L,
                 IndexedStreamConfigStore.NO_METADATA_GENERATION,
                 IndexedStreamConfigStore.CreationKind.NATIVE_CREATE,
-                IndexedStreamConfigStore.ProvisioningState.PROVISIONING), version(11))));
+                IndexedStreamConfigStore.ProvisioningState.PROVISIONING), FakeOxiaRecord.version(11))));
         when(oxiaClient.get(deletingKey)).thenReturn(CompletableFuture.completedFuture(
             new GetResult(deletingKey, streamConfigBytes(
                 1, Map.of("state", "deleting"), "deleting-incarnation", "delete-owner", 2L,
                 "create-owner", 1L, IndexedStreamConfigStore.CreationKind.NATIVE_CREATE,
-                IndexedStreamConfigStore.ProvisioningState.ABORTING), version(12))));
+                IndexedStreamConfigStore.ProvisioningState.ABORTING), FakeOxiaRecord.version(12))));
         when(oxiaClient.get(droppedKey)).thenReturn(CompletableFuture.completedFuture(
             new GetResult(droppedKey, streamConfigBytes(
                 1, Map.of("state", "dropped"), "dropped-incarnation", "delete-owner", 2L,
                 "create-owner", 1L, IndexedStreamConfigStore.CreationKind.NATIVE_CREATE,
-                IndexedStreamConfigStore.ProvisioningState.DROPPED), version(13))));
+                IndexedStreamConfigStore.ProvisioningState.DROPPED), FakeOxiaRecord.version(13))));
         when(oxiaClient.get(disappearedKey)).thenReturn(CompletableFuture.completedFuture(null));
 
         List<StreamCatalogEntry> entries = store.listStreamEntries(id.namespace()).join();
@@ -1281,7 +1282,7 @@ class IndexedStreamConfigStoreDeletionFenceTest {
                             configPath, current == null
                                 ? -1L : current.version().versionId()));
                 }
-                Version next = version(current.version().versionId() + 1L);
+                Version next = FakeOxiaRecord.version(current.version().versionId() + 1L);
                 state.set(new VersionedValue(value.clone(), next));
                 return CompletableFuture.completedFuture(new PutResult(configPath, next));
             });
@@ -1318,7 +1319,7 @@ class IndexedStreamConfigStoreDeletionFenceTest {
                         new UnexpectedVersionIdException(
                             configPath, current.version().versionId()));
                 }
-                Version next = version(nextVersion.incrementAndGet());
+                Version next = FakeOxiaRecord.version(nextVersion.incrementAndGet());
                 byte[] value = invocation.getArgument(1, byte[].class);
                 state.set(new VersionedValue(value.clone(), next));
                 return CompletableFuture.completedFuture(new PutResult(configPath, next));
@@ -1332,55 +1333,23 @@ class IndexedStreamConfigStoreDeletionFenceTest {
 
     private AtomicReference<VersionedValue> mockVersionedRecord(
             String path, byte[] initialValue) {
-        AtomicReference<VersionedValue> state = new AtomicReference<>(initialValue == null
-            ? null : new VersionedValue(initialValue.clone(), VERSION_1));
-        AtomicLong nextVersion = new AtomicLong(VERSION_1.versionId());
-        lenient().when(oxiaClient.get(path)).thenAnswer(ignored -> {
-            VersionedValue current = state.get();
-            return CompletableFuture.completedFuture(current == null ? null
-                : new GetResult(path, current.value(), current.version()));
-        });
+        FakeOxiaRecord record =
+            new FakeOxiaRecord(path, initialValue, VERSION_1.versionId());
+        lenient().when(oxiaClient.get(path))
+            .thenAnswer(ignored -> CompletableFuture.completedFuture(record.applyGet()));
         lenient().when(oxiaClient.put(eq(path), any(byte[].class), any()))
             .thenAnswer(invocation -> {
+                byte[] value = invocation.getArgument(1, byte[].class);
                 @SuppressWarnings("unchecked")
                 Set<PutOption> options = invocation.getArgument(2, Set.class);
-                VersionedValue current = state.get();
-                if (options.contains(PutOption.IfRecordDoesNotExist)) {
-                    if (current != null) {
-                        return CompletableFuture.failedFuture(
-                            new KeyAlreadyExistsException(path));
-                    }
-                } else if (current == null || !options.contains(
-                        PutOption.IfVersionIdEquals(current.version().versionId()))) {
-                    return CompletableFuture.failedFuture(
-                        new UnexpectedVersionIdException(
-                            path, current == null
-                                ? -1L : current.version().versionId()));
-                }
-                Version next = version(nextVersion.incrementAndGet());
-                byte[] value = invocation.getArgument(1, byte[].class);
-                state.set(new VersionedValue(value.clone(), next));
-                return CompletableFuture.completedFuture(new PutResult(path, next));
+                return FakeOxiaRecord.settle(() -> record.applyPut(value, options));
             });
         lenient().when(oxiaClient.delete(eq(path), any())).thenAnswer(invocation -> {
             @SuppressWarnings("unchecked")
             Set<DeleteOption> options = invocation.getArgument(1, Set.class);
-            VersionedValue current = state.get();
-            if (current == null) {
-                return CompletableFuture.completedFuture(false);
-            }
-            if (!options.contains(
-                    DeleteOption.IfVersionIdEquals(current.version().versionId()))) {
-                return CompletableFuture.failedFuture(new UnexpectedVersionIdException(
-                    path, current.version().versionId()));
-            }
-            state.set(null);
-            return CompletableFuture.completedFuture(true);
+            return FakeOxiaRecord.settle(() -> record.applyDelete(options));
         });
-        return state;
-    }
-
-    private record VersionedValue(byte[] value, Version version) {
+        return record.state();
     }
 
     private record InitialClaimRace(
@@ -1403,7 +1372,4 @@ class IndexedStreamConfigStoreDeletionFenceTest {
         }
     }
 
-    private static Version version(long id) {
-        return new Version(id, 0, 0, 0, Optional.empty(), Optional.empty());
-    }
 }

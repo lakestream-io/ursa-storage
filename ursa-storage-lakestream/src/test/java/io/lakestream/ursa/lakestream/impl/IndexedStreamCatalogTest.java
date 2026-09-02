@@ -49,6 +49,7 @@ import io.lakestream.api.exception.StreamPermanentlyDeletedException;
 import io.lakestream.api.materialization.TableMaterializationPolicy;
 import io.lakestream.ursa.catalog.metadata.LogMetadata;
 import io.lakestream.ursa.catalog.metadata.LogMetadataSerde;
+import io.lakestream.ursa.lakestream.impl.FakeOxiaRecord.VersionedValue;
 import io.lakestream.ursa.storage.StorageApi;
 import io.lakestream.ursa.storage.StorageApi.ActiveStreamIdMapping;
 import io.lakestream.ursa.storage.StorageApi.KeyedAllocationInvalidatedException;
@@ -63,7 +64,6 @@ import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.GetResult;
 import io.oxia.client.api.PutResult;
 import io.oxia.client.api.Version;
-import io.oxia.client.api.exceptions.KeyAlreadyExistsException;
 import io.oxia.client.api.exceptions.UnexpectedVersionIdException;
 import io.oxia.client.api.options.DeleteOption;
 import io.oxia.client.api.options.PutOption;
@@ -618,14 +618,14 @@ class IndexedStreamCatalogTest {
             }
             byte[] value = currentConfig.get();
             return CompletableFuture.completedFuture(value == null ? null
-                : new GetResult(configPath, value, version(1)));
+                : new GetResult(configPath, value, FakeOxiaRecord.version(1)));
         });
         when(oxiaClient.put(eq(configPath), any(byte[].class),
                 eq(Set.of(PutOption.IfRecordDoesNotExist))))
             .thenAnswer(invocation -> {
                 currentConfig.set(invocation.getArgument(1, byte[].class));
                 return CompletableFuture.completedFuture(
-                    new PutResult(configPath, version(1)));
+                    new PutResult(configPath, FakeOxiaRecord.version(1)));
             });
         mockCreateOnlyRecord(partitionPath);
         when(oxiaClient.put(eq(configPath), any(byte[].class),
@@ -2338,48 +2338,21 @@ class IndexedStreamCatalogTest {
 
     private AtomicReference<VersionedValue> mockVersionedConfig(
             String path, byte[] initialValue) {
-        AtomicReference<VersionedValue> state = new AtomicReference<>(initialValue == null
-            ? null : new VersionedValue(initialValue.clone(), version(1)));
-        AtomicLong nextVersion = new AtomicLong(initialValue == null ? 0L : 1L);
-        lenient().when(oxiaClient.get(path)).thenAnswer(ignored -> {
-            VersionedValue current = state.get();
-            return CompletableFuture.completedFuture(current == null ? null
-                : new GetResult(path, current.value(), current.version()));
-        });
+        FakeOxiaRecord record = new FakeOxiaRecord(path, initialValue);
+        lenient().when(oxiaClient.get(path))
+            .thenAnswer(ignored -> CompletableFuture.completedFuture(record.applyGet()));
         lenient().when(oxiaClient.put(eq(path), any(byte[].class), any())).thenAnswer(invocation -> {
             byte[] value = invocation.getArgument(1, byte[].class);
             @SuppressWarnings("unchecked")
             Set<PutOption> options = invocation.getArgument(2, Set.class);
-            VersionedValue current = state.get();
-            if (options.contains(PutOption.IfRecordDoesNotExist) && current != null) {
-                return CompletableFuture.failedFuture(new KeyAlreadyExistsException(path));
-            }
-            if (!options.contains(PutOption.IfRecordDoesNotExist)
-                    && (current == null || !options.contains(
-                        PutOption.IfVersionIdEquals(current.version().versionId())))) {
-                return CompletableFuture.failedFuture(new UnexpectedVersionIdException(
-                    path, current == null ? -1L : current.version().versionId()));
-            }
-            Version version = version(nextVersion.incrementAndGet());
-            state.set(new VersionedValue(value.clone(), version));
-            return CompletableFuture.completedFuture(new PutResult(path, version));
+            return FakeOxiaRecord.settle(() -> record.applyPut(value, options));
         });
         lenient().when(oxiaClient.delete(eq(path), any())).thenAnswer(invocation -> {
             @SuppressWarnings("unchecked")
             Set<DeleteOption> options = invocation.getArgument(1, Set.class);
-            VersionedValue current = state.get();
-            if (current == null) {
-                return CompletableFuture.completedFuture(false);
-            }
-            if (!options.contains(
-                    DeleteOption.IfVersionIdEquals(current.version().versionId()))) {
-                return CompletableFuture.failedFuture(new UnexpectedVersionIdException(
-                    path, current.version().versionId()));
-            }
-            state.set(null);
-            return CompletableFuture.completedFuture(true);
+            return FakeOxiaRecord.settle(() -> record.applyDelete(options));
         });
-        return state;
+        return record.state();
     }
 
     private AtomicReference<VersionedValue> mockCreateOnlyRecord(String path) {
@@ -2388,39 +2361,23 @@ class IndexedStreamCatalogTest {
 
     private AtomicReference<VersionedValue> mockCreateOnlyRecord(
             String path, RuntimeException firstWriteFailure) {
-        AtomicReference<VersionedValue> state = new AtomicReference<>();
-        AtomicLong nextVersion = new AtomicLong();
+        FakeOxiaRecord record = new FakeOxiaRecord(path, null);
         AtomicReference<RuntimeException> pendingFailure =
             new AtomicReference<>(firstWriteFailure);
-        lenient().when(oxiaClient.get(path)).thenAnswer(ignored -> {
-            VersionedValue current = state.get();
-            return CompletableFuture.completedFuture(current == null ? null
-                : new GetResult(path, current.value(), current.version()));
-        });
+        lenient().when(oxiaClient.get(path))
+            .thenAnswer(ignored -> CompletableFuture.completedFuture(record.applyGet()));
         lenient().when(oxiaClient.put(eq(path), any(byte[].class), any()))
             .thenAnswer(invocation -> {
                 RuntimeException failure = pendingFailure.getAndSet(null);
                 if (failure != null) {
                     return CompletableFuture.failedFuture(failure);
                 }
-                VersionedValue current = state.get();
+                byte[] value = invocation.getArgument(1, byte[].class);
                 @SuppressWarnings("unchecked")
                 Set<PutOption> options = invocation.getArgument(2, Set.class);
-                if (options.contains(PutOption.IfRecordDoesNotExist) && current != null) {
-                    return CompletableFuture.failedFuture(new KeyAlreadyExistsException(path));
-                }
-                if (!options.contains(PutOption.IfRecordDoesNotExist)
-                        && (current == null || !options.contains(
-                            PutOption.IfVersionIdEquals(current.version().versionId())))) {
-                    return CompletableFuture.failedFuture(new UnexpectedVersionIdException(
-                        path, current == null ? -1L : current.version().versionId()));
-                }
-                Version version = version(nextVersion.incrementAndGet());
-                byte[] value = invocation.getArgument(1, byte[].class);
-                state.set(new VersionedValue(value.clone(), version));
-                return CompletableFuture.completedFuture(new PutResult(path, version));
+                return FakeOxiaRecord.settle(() -> record.applyPut(value, options));
             });
-        return state;
+        return record.state();
     }
 
     /**
@@ -2430,33 +2387,15 @@ class IndexedStreamCatalogTest {
      * releasing one path's queue ahead of another's reproduces an out-of-order completion.
      */
     private DeferredRecord mockDeferredCreateOnlyRecord(String path) {
-        DeferredRecord deferred = new DeferredRecord();
-        AtomicLong nextVersion = new AtomicLong();
-        lenient().when(oxiaClient.get(path)).thenAnswer(ignored -> deferred.defer(() -> {
-            VersionedValue current = deferred.state().get();
-            return current == null ? null
-                : new GetResult(path, current.value(), current.version());
-        }));
+        DeferredRecord deferred = new DeferredRecord(new FakeOxiaRecord(path, null));
+        lenient().when(oxiaClient.get(path))
+            .thenAnswer(ignored -> deferred.defer(deferred.record()::applyGet));
         lenient().when(oxiaClient.put(eq(path), any(byte[].class), any()))
             .thenAnswer(invocation -> {
                 byte[] value = invocation.getArgument(1, byte[].class);
                 @SuppressWarnings("unchecked")
                 Set<PutOption> options = invocation.getArgument(2, Set.class);
-                return deferred.defer(() -> {
-                    VersionedValue current = deferred.state().get();
-                    if (options.contains(PutOption.IfRecordDoesNotExist) && current != null) {
-                        throw new KeyAlreadyExistsException(path);
-                    }
-                    if (!options.contains(PutOption.IfRecordDoesNotExist)
-                            && (current == null || !options.contains(
-                                PutOption.IfVersionIdEquals(current.version().versionId())))) {
-                        throw new UnexpectedVersionIdException(
-                            path, current == null ? -1L : current.version().versionId());
-                    }
-                    Version version = version(nextVersion.incrementAndGet());
-                    deferred.state().set(new VersionedValue(value.clone(), version));
-                    return new PutResult(path, version);
-                });
+                return deferred.defer(() -> deferred.record().applyPut(value, options));
             });
         return deferred;
     }
@@ -2746,13 +2685,6 @@ class IndexedStreamCatalogTest {
         }
     }
 
-    private static Version version(long id) {
-        return new Version(id, 0, 0, 0, Optional.empty(), Optional.empty());
-    }
-
-    private record VersionedValue(byte[] value, Version version) {
-    }
-
     /** The observable result of one stream creation, independent of chain completion order. */
     private record CreationOutcome(
             List<Long> logIds,
@@ -2766,10 +2698,18 @@ class IndexedStreamCatalogTest {
     private static final class DeferredRecord {
 
         private final Deque<Runnable> pending = new ArrayDeque<>();
-        private final AtomicReference<VersionedValue> state = new AtomicReference<>();
+        private final FakeOxiaRecord record;
+
+        private DeferredRecord(FakeOxiaRecord record) {
+            this.record = record;
+        }
+
+        private FakeOxiaRecord record() {
+            return record;
+        }
 
         private AtomicReference<VersionedValue> state() {
-            return state;
+            return record.state();
         }
 
         private <T> CompletableFuture<T> defer(Callable<T> answer) {

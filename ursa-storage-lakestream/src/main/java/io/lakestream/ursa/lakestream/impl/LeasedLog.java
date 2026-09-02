@@ -124,6 +124,12 @@ final class LeasedLog implements Log {
             delegateCloseExecutor, onFullyClosed);
     }
 
+    /**
+     * Test-only seam for injecting a close timeout.
+     *
+     * <p>Production callers take {@link #DEFAULT_CLOSE_TIMEOUT_MILLIS}; only a test needs a
+     * timeout short enough to watch a close time out without stalling the suite.
+     */
     LeasedLog(
             Log delegate,
             StreamWriteLease lease,

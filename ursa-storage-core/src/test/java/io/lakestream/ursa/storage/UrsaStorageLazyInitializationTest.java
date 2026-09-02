@@ -54,10 +54,25 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
 
 class UrsaStorageLazyInitializationTest {
+
+    /** The executor the failed-data-plane cleanup runs on; one per test, torn down after it. */
+    private ExecutorService cleanupExecutor;
+
+    @BeforeEach
+    void startCleanupExecutor() {
+        cleanupExecutor = Executors.newSingleThreadExecutor();
+    }
+
+    @AfterEach
+    void stopCleanupExecutor() {
+        cleanupExecutor.shutdownNow();
+    }
 
     @Test
     void metadataFacadeAndCloseDoNotInitializeDataPlane() throws Exception {
@@ -466,27 +481,22 @@ class UrsaStorageLazyInitializationTest {
         IllegalStateException initializationFailure =
             new IllegalStateException("injected initialization failure");
 
-        ExecutorService cleanupExecutor = Executors.newSingleThreadExecutor();
-        try {
-            assertTimeout(Duration.ofSeconds(2), () ->
-                UrsaStorage.closeDataPlaneAfterFailure(
-                    fileStorage, walStorage, initializationFailure,
-                    Duration.ofMillis(100), cleanupExecutor));
+        assertTimeout(Duration.ofSeconds(2), () ->
+            UrsaStorage.closeDataPlaneAfterFailure(
+                fileStorage, walStorage, initializationFailure,
+                Duration.ofMillis(100), cleanupExecutor));
 
-            verify(walStorage).close();
-            verify(fileStorage, never()).close();
-            assertEquals(1, initializationFailure.getSuppressed().length);
-            assertTrue(initializationFailure.getSuppressed()[0] instanceof TimeoutException);
+        verify(walStorage).close();
+        verify(fileStorage, never()).close();
+        assertEquals(1, initializationFailure.getSuppressed().length);
+        assertTrue(initializationFailure.getSuppressed()[0] instanceof TimeoutException);
 
-            pendingWalClose.complete(null);
+        pendingWalClose.complete(null);
 
-            verify(fileStorage, timeout(5000)).close();
-            InOrder closeOrder = inOrder(walStorage, fileStorage);
-            closeOrder.verify(walStorage).close();
-            closeOrder.verify(fileStorage).close();
-        } finally {
-            cleanupExecutor.shutdownNow();
-        }
+        verify(fileStorage, timeout(5000)).close();
+        InOrder closeOrder = inOrder(walStorage, fileStorage);
+        closeOrder.verify(walStorage).close();
+        closeOrder.verify(fileStorage).close();
     }
 
     @Test
@@ -502,21 +512,16 @@ class UrsaStorageLazyInitializationTest {
         IllegalStateException initializationFailure =
             new IllegalStateException("injected initialization failure");
 
-        ExecutorService cleanupExecutor = Executors.newSingleThreadExecutor();
-        try {
-            assertTimeout(Duration.ofSeconds(2), () ->
-                UrsaStorage.closeDataPlaneAfterFailure(
-                    fileStorage, walStorage, initializationFailure,
-                    Duration.ofSeconds(1), cleanupExecutor));
+        assertTimeout(Duration.ofSeconds(2), () ->
+            UrsaStorage.closeDataPlaneAfterFailure(
+                fileStorage, walStorage, initializationFailure,
+                Duration.ofSeconds(1), cleanupExecutor));
 
-            InOrder closeOrder = inOrder(walStorage, fileStorage);
-            closeOrder.verify(walStorage, times(2)).close();
-            closeOrder.verify(fileStorage).close();
-            assertEquals(1, initializationFailure.getSuppressed().length);
-            assertSame(closeFailure, initializationFailure.getSuppressed()[0]);
-        } finally {
-            cleanupExecutor.shutdownNow();
-        }
+        InOrder closeOrder = inOrder(walStorage, fileStorage);
+        closeOrder.verify(walStorage, times(2)).close();
+        closeOrder.verify(fileStorage).close();
+        assertEquals(1, initializationFailure.getSuppressed().length);
+        assertSame(closeFailure, initializationFailure.getSuppressed()[0]);
     }
 
     @Test
@@ -531,21 +536,16 @@ class UrsaStorageLazyInitializationTest {
         IllegalStateException initializationFailure =
             new IllegalStateException("injected initialization failure");
 
-        ExecutorService cleanupExecutor = Executors.newSingleThreadExecutor();
-        try {
-            assertTimeout(Duration.ofSeconds(2), () ->
-                UrsaStorage.closeDataPlaneAfterFailure(
-                    fileStorage, walStorage, initializationFailure,
-                    Duration.ofSeconds(1), cleanupExecutor));
+        assertTimeout(Duration.ofSeconds(2), () ->
+            UrsaStorage.closeDataPlaneAfterFailure(
+                fileStorage, walStorage, initializationFailure,
+                Duration.ofSeconds(1), cleanupExecutor));
 
-            InOrder closeOrder = inOrder(walStorage, fileStorage);
-            closeOrder.verify(walStorage, times(2)).close();
-            closeOrder.verify(fileStorage).close();
-            assertEquals(1, initializationFailure.getSuppressed().length);
-            assertSame(closeFailure, initializationFailure.getSuppressed()[0]);
-        } finally {
-            cleanupExecutor.shutdownNow();
-        }
+        InOrder closeOrder = inOrder(walStorage, fileStorage);
+        closeOrder.verify(walStorage, times(2)).close();
+        closeOrder.verify(fileStorage).close();
+        assertEquals(1, initializationFailure.getSuppressed().length);
+        assertSame(closeFailure, initializationFailure.getSuppressed()[0]);
     }
 
     @Test
