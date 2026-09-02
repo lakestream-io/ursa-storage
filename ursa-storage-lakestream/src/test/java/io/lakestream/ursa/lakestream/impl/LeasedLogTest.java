@@ -790,6 +790,49 @@ class LeasedLogTest {
         verify(lease, never()).closeAsync();
     }
 
+    @Test
+    void outOfOrderAppendsKeepTheHighestLastOffset() throws Exception {
+        Log delegate = mock(Log.class);
+        StreamWriteLease lease = lease(59L);
+        when(delegate.id()).thenReturn(LogId.of(59L));
+        CompletableFuture<LogEntryHeader> firstAppend = new CompletableFuture<>();
+        CompletableFuture<LogEntryHeader> secondAppend = new CompletableFuture<>();
+        when(delegate.append(1, Unpooled.EMPTY_BUFFER))
+            .thenReturn(firstAppend)
+            .thenReturn(secondAppend);
+        LeasedLog log = new LeasedLog(delegate, lease, Runnable::run, () -> { });
+
+        CompletableFuture<LogEntryHeader> earlier = log.append(1, Unpooled.EMPTY_BUFFER);
+        CompletableFuture<LogEntryHeader> later = log.append(1, Unpooled.EMPTY_BUFFER);
+
+        // The append at the higher offset completes first, so a last-write-wins cache would be
+        // rewound by the append that started earlier and report a tail that is already stale.
+        secondAppend.complete(header(1L, 1, 200L, 60, 110L));
+        firstAppend.complete(header(0L, 1, 100L, 50, 50L));
+        later.get(10, TimeUnit.SECONDS);
+        earlier.get(10, TimeUnit.SECONDS);
+
+        assertEquals(new LogOffset(1L, 1, 200L, 60, 110L),
+            log.getLastOffset().get(10, TimeUnit.SECONDS));
+        verify(delegate, never()).getLastOffset();
+    }
+
+    @Test
+    void eventualLeaseReleaseGivesUpOnceItsExecutorIsShutDown() throws Exception {
+        StreamWriteLease lease = lease(60L);
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        executor.shutdown();
+
+        // The lease was acquired before its log could be created, so only this supervised release
+        // will ever free it. A rejection from a shut-down executor never succeeds on retry.
+        CompletableFuture<Void> release = LeasedLog.releaseLeaseEventually(lease, executor);
+
+        ExecutionException rejected = assertThrows(ExecutionException.class,
+            () -> release.get(5, TimeUnit.SECONDS));
+        assertInstanceOf(RejectedExecutionException.class, rejected.getCause());
+        verify(lease, never()).closeAsync();
+    }
+
     private static LogEntryHeader header(
             long offset, int numberOfRecords, long timestamp, int entrySize,
             long cumulativeSize) {

@@ -239,6 +239,14 @@ final class LeasedLog implements Log {
             CompletableFuture<Void> result,
             int retryAttempt,
             Throwable failure) {
+        if (isShutDownRejection(executor, failure)) {
+            // The executor is gone, so no retry can ever run. Nothing else will free this lease;
+            // report that rather than rescheduling against a permanently rejecting executor.
+            log.warn("Giving up on releasing the write lease for log {}: its close executor is "
+                + "shut down", lease.streamId(), failure);
+            result.completeExceptionally(failure);
+            return;
+        }
         int nextAttempt = retryAttempt == Integer.MAX_VALUE
             ? Integer.MAX_VALUE : retryAttempt + 1;
         long retryDelayMillis = eventualCloseRetryDelayMillis(retryAttempt);
@@ -270,7 +278,7 @@ final class LeasedLog implements Log {
                 mutationEpoch.incrementAndGet();
                 LogOffset appended = new LogOffset(header.offset(), header.numberOfRecords(),
                     header.timestamp(), header.entrySize(), header.cumulativeSize());
-                cachedLastOffset.set(appended);
+                advanceCachedLastOffset(appended);
                 repairCachedFirstOffset(appended);
             }));
     }
@@ -468,6 +476,19 @@ final class LeasedLog implements Log {
                 cache.compareAndSet(null, value);
             }
         }), ignored -> { });
+    }
+
+    /**
+     * Advances the cached tail from an append, keeping the highest candidate.
+     *
+     * <p>Appends may complete out of order, so the last one to arrive is not necessarily the one
+     * that ends the log. Keeping the maximum means a completion that started earlier can never
+     * rewind the tail to an offset the log has already passed. An empty cache is still filled, so
+     * a first append after an invalidation seeds it as before.
+     */
+    private void advanceCachedLastOffset(LogOffset appended) {
+        cachedLastOffset.accumulateAndGet(appended, (cached, candidate) ->
+            cached == null || candidate.offset() > cached.offset() ? candidate : cached);
     }
 
     /**
