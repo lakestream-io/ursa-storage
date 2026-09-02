@@ -2859,37 +2859,46 @@ public class IndexedStreamCatalog implements StreamCatalog {
     public CompletableFuture<Log> openLog(StreamIdentifier id, LogId logId) {
         Objects.requireNonNull(id, "id");
         Objects.requireNonNull(logId, "logId");
-        CompletableFuture<Log> opened = streamConfigStore.readActive(id)
+        // Resolving a LogId means finding its position, which only the whole layout can give.
+        return openOwnedLog(id, streamConfigStore.readActive(id)
             .thenCompose(active -> getLayout(id, active))
             .thenCompose(layout -> layout.logIds())
             .thenCompose(logIds -> {
                 int partitionIndex = logIds.indexOf(logId);
                 if (partitionIndex < 0) {
-                    return CompletableFuture.<Log>failedFuture(new IllegalArgumentException(
-                        "Log " + logId + " is not in the committed layout of stream "
-                            + id.fullName()));
+                    return CompletableFuture.<ResolvedPartition>failedFuture(
+                        new IllegalArgumentException(
+                            "Log " + logId + " is not in the committed layout of stream "
+                                + id.fullName()));
                 }
-                return openCommittedLog(id, partitionIndex, logId)
-                    .thenApply(Log.class::cast);
-            });
-        return OwnedResultFutures.transfer(opened, this::startAbandonedLogCleanup);
+                return CompletableFuture.completedFuture(
+                    new ResolvedPartition(partitionIndex, logId));
+            }));
     }
 
     @Override
     public CompletableFuture<Log> openLog(StreamIdentifier id, int partitionIndex) {
         Objects.requireNonNull(id, "id");
-        CompletableFuture<Log> opened = streamConfigStore.readActive(id)
-            .thenCompose(active -> getLayout(id, active))
-            .thenCompose(layout -> layout.logIds())
-            .thenCompose(logIds -> {
-                if (partitionIndex < 0 || partitionIndex >= logIds.size()) {
-                    return CompletableFuture.<Log>failedFuture(new IllegalArgumentException(
-                        "Partition " + partitionIndex + " is not in the committed layout of "
-                            + id.fullName() + " (" + logIds.size() + " logs)"));
-                }
-                return openCommittedLog(id, partitionIndex, logIds.get(partitionIndex))
-                    .thenApply(Log.class::cast);
-            });
+        return openOwnedLog(id, readPartitionMetadata(id, partitionIndex)
+            .thenApply(metadata -> new ResolvedPartition(
+                partitionIndex, LogId.of(metadata.streamId()))));
+    }
+
+    /** One partition of the committed layout, resolved to the log that currently backs it. */
+    private record ResolvedPartition(int partitionIndex, LogId logId) {
+    }
+
+    /**
+     * Opens a resolved partition and hands back a supervised handle the catalog still owns.
+     *
+     * <p>A caller that drops the returned future never leaks the log: the handle is closed and its
+     * write lease released through {@link #startAbandonedLogCleanup}.
+     */
+    private CompletableFuture<Log> openOwnedLog(
+            StreamIdentifier id, CompletableFuture<ResolvedPartition> resolved) {
+        CompletableFuture<Log> opened = resolved.thenCompose(partition ->
+            openCommittedLog(id, partition.partitionIndex(), partition.logId())
+                .thenApply(Log.class::cast));
         return OwnedResultFutures.transfer(opened, this::startAbandonedLogCleanup);
     }
 
@@ -3528,12 +3537,31 @@ public class IndexedStreamCatalog implements StreamCatalog {
 
     // --- Internal helpers ---
 
-    private CompletableFuture<LogMetadata> readPartitionMetadata(StreamIdentifier id, int partitionIndex) {
-        return streamConfigStore.readActive(id).thenCompose(active ->
-            readPartitionMetadata(id, partitionIndex, active.config())
+    /**
+     * Reads one partition's metadata under the active stream lifecycle, in a constant number of
+     * catalog reads.
+     *
+     * <p>Opening a single partition must not cost one metadata read per partition, so this does not
+     * build the layout: {@code readActive} pins the lifecycle, the partition record is read and
+     * checked against it, and {@link IndexedStreamConfigStore#verifyActiveOwnership} re-reads the
+     * config so a lifecycle that moved on underneath the read fails instead of yielding a stale log.
+     *
+     * @throws IllegalArgumentException if the index is outside the committed layout
+     */
+    private CompletableFuture<LogMetadata> readPartitionMetadata(
+            StreamIdentifier id, int partitionIndex) {
+        return streamConfigStore.readActive(id).thenCompose(active -> {
+            int partitions = active.config().partitions();
+            if (partitionIndex < 0 || partitionIndex >= partitions) {
+                return CompletableFuture.<LogMetadata>failedFuture(new IllegalArgumentException(
+                    "Partition " + partitionIndex + " is not in the committed layout of "
+                        + id.fullName() + " (" + partitions + " logs)"));
+            }
+            return readPartitionMetadata(id, partitionIndex, active.config())
                 .thenCompose(metadata ->
                     streamConfigStore.verifyActiveOwnership(id, active)
-                        .thenApply(ignored -> metadata.metadata())));
+                        .thenApply(ignored -> metadata.metadata()));
+        });
     }
 
     private CompletableFuture<VersionedLogMetadata> readPartitionMetadata(

@@ -1838,14 +1838,27 @@ class IndexedStreamCatalogTest {
 
     @Test
     void openLogByPartitionIndexReadsLayoutOnce() throws Exception {
-        mockStreamConfig(streamId, 2);
-        mockPartitionMetadata(streamId, 0, 100L, Map.of());
+        mockStreamConfig(streamId, 4);
+        // Only the opened partition is stubbed: reading any other one would be a strict-stub
+        // failure as well as a violation of the never() checks below.
         mockPartitionMetadata(streamId, 1, 101L, Map.of());
 
         Log opened = catalog.openLog(streamId, 1).get(10, TimeUnit.SECONDS);
+
         assertNotNull(opened);
+        verify(defaultStorage.storageApi()).acquireStreamWriteLease(101L);
+        // Opening one partition costs a constant number of catalog reads however wide the stream
+        // is: the active config, that one partition's metadata, and the ownership re-read that
+        // fences it. Building the layout instead would read every partition.
+        verify(oxiaClient, times(2)).get(catalogPaths.streamConfigPath(streamId));
+        verify(oxiaClient).get(catalogPaths.partitionMetadataPath(streamId, 1));
+        for (int untouched : List.of(0, 2, 3)) {
+            verify(oxiaClient, never())
+                .get(catalogPaths.partitionMetadataPath(streamId, untouched));
+        }
+
         ExecutionException outOfRange = assertThrows(ExecutionException.class,
-            () -> catalog.openLog(streamId, 2).get(10, TimeUnit.SECONDS));
+            () -> catalog.openLog(streamId, 4).get(10, TimeUnit.SECONDS));
         assertEquals(IllegalArgumentException.class, outOfRange.getCause().getClass());
         opened.close();
     }
