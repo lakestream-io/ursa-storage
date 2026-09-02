@@ -110,6 +110,8 @@ public interface Log extends AutoCloseable {
     /**
      * Returns the offset information of the first entry in the log.
      *
+     * <p>Implementations that hold the only write lease for the log may serve this from memory.
+     *
      * @return a future resolving to the first offset
      */
     CompletableFuture<LogOffset> getFirstOffset();
@@ -125,6 +127,8 @@ public interface Log extends AutoCloseable {
 
     /**
      * Returns the offset information of the last entry in the log.
+     *
+     * <p>Implementations that hold the only write lease for the log may serve this from memory.
      *
      * @return a future resolving to the last offset
      */

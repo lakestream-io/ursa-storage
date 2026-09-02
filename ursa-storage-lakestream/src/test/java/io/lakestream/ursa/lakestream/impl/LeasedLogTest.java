@@ -23,6 +23,7 @@ import io.lakestream.api.LogCursor;
 import io.lakestream.api.LogEntry;
 import io.lakestream.api.LogEntryHeader;
 import io.lakestream.api.LogId;
+import io.lakestream.api.LogOffset;
 import io.lakestream.ursa.storage.StorageApi.StreamWriteLease;
 import io.netty.buffer.Unpooled;
 import java.io.IOException;
@@ -593,6 +594,69 @@ class LeasedLogTest {
             allowFirstClose.countDown();
             closeExecutor.shutdownNow();
         }
+    }
+
+    @Test
+    void lastOffsetIsServedFromCacheAfterAppend() throws Exception {
+        Log delegate = mock(Log.class);
+        StreamWriteLease lease = lease(51L);
+        when(delegate.id()).thenReturn(LogId.of(51L));
+        LogEntryHeader header = mock(LogEntryHeader.class);
+        when(header.offset()).thenReturn(10L);
+        when(header.numberOfRecords()).thenReturn(3);
+        when(header.timestamp()).thenReturn(1234L);
+        when(header.entrySize()).thenReturn(100);
+        when(header.cumulativeSize()).thenReturn(1000L);
+        when(delegate.append(3, Unpooled.EMPTY_BUFFER))
+            .thenReturn(CompletableFuture.completedFuture(header));
+        LeasedLog log = new LeasedLog(delegate, lease, Runnable::run, () -> { });
+
+        log.append(3, Unpooled.EMPTY_BUFFER).get(10, TimeUnit.SECONDS);
+        LogOffset last = log.getLastOffset().get(10, TimeUnit.SECONDS);
+
+        assertEquals(new LogOffset(10L, 3, 1234L, 100, 1000L), last);
+        verify(delegate, never()).getLastOffset();
+    }
+
+    @Test
+    void firstOffsetIsCachedUntilSoftTrim() throws Exception {
+        Log delegate = mock(Log.class);
+        StreamWriteLease lease = lease(52L);
+        when(delegate.id()).thenReturn(LogId.of(52L));
+        LogOffset first = new LogOffset(4L, 2, 1L);
+        LogOffset afterTrim = new LogOffset(9L, 1, 2L);
+        when(delegate.getFirstOffset())
+            .thenReturn(CompletableFuture.completedFuture(first))
+            .thenReturn(CompletableFuture.completedFuture(afterTrim));
+        when(delegate.softTrim(8L)).thenReturn(CompletableFuture.completedFuture(9L));
+        LeasedLog log = new LeasedLog(delegate, lease, Runnable::run, () -> { });
+
+        assertEquals(first, log.getFirstOffset().get());
+        assertEquals(first, log.getFirstOffset().get());
+        verify(delegate, times(1)).getFirstOffset();
+
+        log.softTrim(8L).get();
+        assertEquals(afterTrim, log.getFirstOffset().get());
+        verify(delegate, times(2)).getFirstOffset();
+    }
+
+    @Test
+    void failedOffsetReadInvalidatesCache() throws Exception {
+        Log delegate = mock(Log.class);
+        StreamWriteLease lease = lease(53L);
+        when(delegate.id()).thenReturn(LogId.of(53L));
+        LogOffset last = new LogOffset(7L, 1, 1L);
+        when(delegate.getLastOffset())
+            .thenReturn(CompletableFuture.completedFuture(last))
+            .thenReturn(CompletableFuture.failedFuture(new IOException("boom")))
+            .thenReturn(CompletableFuture.completedFuture(last));
+        LeasedLog log = new LeasedLog(delegate, lease, Runnable::run, () -> { });
+
+        assertEquals(last, log.getLastOffset().get());
+        log.invalidateCache();
+        assertThrows(ExecutionException.class, () -> log.getLastOffset().get());
+        assertEquals(last, log.getLastOffset().get());
+        verify(delegate, times(3)).getLastOffset();
     }
 
     private static StreamWriteLease lease(long streamId) {

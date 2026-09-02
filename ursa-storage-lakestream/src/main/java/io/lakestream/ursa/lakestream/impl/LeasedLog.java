@@ -26,6 +26,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
@@ -54,6 +55,8 @@ final class LeasedLog implements Log {
     private final ClassLoader contextClassLoader;
     private final Executor delegateCloseExecutor;
     private final Runnable onFullyClosed;
+    private final AtomicReference<LogOffset> cachedFirstOffset = new AtomicReference<>();
+    private final AtomicReference<LogOffset> cachedLastOffset = new AtomicReference<>();
 
     private boolean closing;
     private int activeOperations;
@@ -254,8 +257,20 @@ final class LeasedLog implements Log {
 
     @Override
     public CompletableFuture<LogEntryHeader> append(int numberOfRecords, ByteBuf data) {
-        return trackNonCancellableOperation(
-            () -> delegate.append(numberOfRecords, data));
+        return trackNonCancellableOperation(() -> delegate.append(numberOfRecords, data)
+            .whenComplete((header, failure) -> {
+                if (failure != null || header == null) {
+                    invalidateOffsetCache();
+                    return;
+                }
+                LogOffset appended = new LogOffset(header.offset(), header.numberOfRecords(),
+                    header.timestamp(), header.entrySize(), header.cumulativeSize());
+                cachedLastOffset.set(appended);
+                LogOffset first = cachedFirstOffset.get();
+                if (first != null && first.offset() < 0) {
+                    cachedFirstOffset.compareAndSet(first, appended);
+                }
+            }));
     }
 
     private <T> CompletableFuture<T> trackNonCancellableOperation(
@@ -414,7 +429,7 @@ final class LeasedLog implements Log {
 
     @Override
     public CompletableFuture<LogOffset> getFirstOffset() {
-        return trackOperation(delegate::getFirstOffset, ignored -> { });
+        return cachedOffset(cachedFirstOffset, delegate::getFirstOffset);
     }
 
     @Override
@@ -425,12 +440,33 @@ final class LeasedLog implements Log {
 
     @Override
     public CompletableFuture<LogOffset> getLastOffset() {
-        return trackOperation(delegate::getLastOffset, ignored -> { });
+        return cachedOffset(cachedLastOffset, delegate::getLastOffset);
     }
 
     @Override
     public CompletableFuture<Long> softTrim(long offsetIncluded) {
-        return trackOperation(() -> delegate.softTrim(offsetIncluded), ignored -> { });
+        return trackOperation(() -> delegate.softTrim(offsetIncluded)
+            .whenComplete((ignored, failure) -> cachedFirstOffset.set(null)), ignored -> { });
+    }
+
+    private CompletableFuture<LogOffset> cachedOffset(
+            AtomicReference<LogOffset> cache, Supplier<CompletableFuture<LogOffset>> read) {
+        LogOffset cached = cache.get();
+        if (cached != null) {
+            return trackOperation(() -> CompletableFuture.completedFuture(cached), ignored -> { });
+        }
+        return trackOperation(() -> read.get().whenComplete((value, failure) -> {
+            if (failure != null || value == null) {
+                cache.set(null);
+            } else {
+                cache.compareAndSet(null, value);
+            }
+        }), ignored -> { });
+    }
+
+    private void invalidateOffsetCache() {
+        cachedFirstOffset.set(null);
+        cachedLastOffset.set(null);
     }
 
     @Override
@@ -445,6 +481,7 @@ final class LeasedLog implements Log {
 
     @Override
     public void invalidateCache() {
+        invalidateOffsetCache();
         runSynchronousOperation(delegate::invalidateCache);
     }
 
@@ -461,6 +498,7 @@ final class LeasedLog implements Log {
 
     @Override
     public void fence() {
+        invalidateOffsetCache();
         runSynchronousOperation(delegate::fence);
     }
 
