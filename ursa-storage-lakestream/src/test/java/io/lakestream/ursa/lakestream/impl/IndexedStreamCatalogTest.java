@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -113,6 +114,8 @@ class IndexedStreamCatalogTest {
     private IndexedStreamCatalog catalog;
     private FencedStorageHarness defaultStorage;
     private StreamIdentifier streamId;
+    private String tombstonePath;
+    private AtomicReference<VersionedValue> tombstoneState;
 
     private long nextStreamId = 100L;
 
@@ -126,6 +129,59 @@ class IndexedStreamCatalogTest {
         catalog = fencedCatalog(defaultStorage);
         catalog.initialize("test-catalog", Map.of()).join();
         streamId = new StreamIdentifier("public/default", "my-topic");
+        tombstonePath = catalogPaths.streamTombstonePath(streamId);
+        tombstoneState = mockVersionedConfig(tombstonePath);
+    }
+
+    // --- permanent deletion tombstones ---
+
+    @Test
+    void loadStreamReportsPermanentDeletionFromTombstonePath() throws Exception {
+        mockVersionedConfig(tombstonePath, droppedStreamConfigBytes(
+            1, "dropped-incarnation", "dropped-owner", 2L, "NATIVE_CREATE"));
+
+        ExecutionException failure = assertThrows(ExecutionException.class,
+            () -> catalog.loadStream(streamId).get());
+
+        assertInstanceOf(StreamPermanentlyDeletedException.class, failure.getCause());
+    }
+
+    @Test
+    void createStreamRejectsTombstonedIdentifier() throws Exception {
+        mockVersionedConfig(tombstonePath, droppedStreamConfigBytes(
+            1, "dropped-incarnation", "dropped-owner", 2L, "NATIVE_CREATE"));
+        Partitioning partitioning = new Partitioning(
+            PartitioningStrategy.INDEXED, Map.of("numPartitions", "1"));
+
+        ExecutionException failure = assertThrows(ExecutionException.class, () ->
+            catalog.createStream(streamId, new StreamConfig(), partitioning,
+                new SchemaConfig(), Map.of()).get());
+
+        assertInstanceOf(StreamPermanentlyDeletedException.class, failure.getCause());
+        verify(oxiaClient, never()).put(eq(catalogPaths.streamConfigPath(streamId)),
+            any(byte[].class), any());
+    }
+
+    @Test
+    void dropStreamWritesTombstoneOutsideConfigPrefixAndDeletesConfig() throws Exception {
+        String configPath = catalogPaths.streamConfigPath(streamId);
+        String configPrefix = catalogPaths.streamConfigPrefix(streamId.namespace());
+        mockVersionedConfig(configPath, ownedStreamConfigBytes(
+            2, Map.of(), "tombstone-incarnation", "tombstone-owner", "NATIVE_CREATE"));
+        mockCreateOnlyRecord(catalogPaths.partitionMetadataPath(streamId, 0));
+        mockCreateOnlyRecord(catalogPaths.partitionMetadataPath(streamId, 1));
+        when(oxiaClient.list(configPrefix, configPrefix + "\uffff"))
+            .thenReturn(CompletableFuture.completedFuture(List.of(configPath)));
+
+        assertTrue(catalog.dropStream(streamId, true).get(10, TimeUnit.SECONDS));
+
+        assertFalse(tombstonePath.startsWith(configPrefix));
+        verify(oxiaClient).put(eq(tombstonePath), any(byte[].class),
+            eq(Set.of(PutOption.IfRecordDoesNotExist)));
+        verify(oxiaClient).delete(eq(configPath), any());
+        assertEquals("DROPPED", MAPPER.readTree(tombstoneState.get().value())
+            .path("_provisioningState").asText());
+        assertTrue(catalog.listStreamEntries(streamId.namespace()).get().isEmpty());
     }
 
     // --- createStream ---
@@ -265,7 +321,8 @@ class IndexedStreamCatalogTest {
         String mappingKey = "lakestream-native/" + streamId.fullName() + "/partition-0";
         assertEquals(Optional.empty(), mappings.activeStreamId(mappingKey));
         assertEquals(701L, mappings.fence(mappingKey).orElseThrow().streamId());
-        assertEquals("DROPPED", MAPPER.readTree(config.get().value())
+        assertNull(config.get());
+        assertEquals("DROPPED", MAPPER.readTree(tombstoneState.get().value())
             .get("_provisioningState").asText());
         assertTrue(LOG_METADATA_SERDE.deserialize(
             partitionPath, partition.get().value()).deleted());
@@ -301,7 +358,8 @@ class IndexedStreamCatalogTest {
         CompletionException failure = assertThrows(CompletionException.class, create::join);
         assertEquals(invalidated, failure.getCause());
         assertEquals(validationFailure, failure.getCause().getCause());
-        assertEquals("DROPPED", MAPPER.readTree(config.get().value())
+        assertNull(config.get());
+        assertEquals("DROPPED", MAPPER.readTree(tombstoneState.get().value())
             .get("_provisioningState").asText());
         assertTrue(LOG_METADATA_SERDE.deserialize(
             partitionPath, partition.get().value()).deleted());
@@ -329,15 +387,14 @@ class IndexedStreamCatalogTest {
             streamId, new StreamConfig(), partitioning, new SchemaConfig(), Map.of());
         assertFalse(create.isDone());
         assertTrue(racedCatalog.dropStream(streamId, false).join());
+        assertNull(config.get());
 
         RuntimeException contextReadFailure =
             new RuntimeException("native cleanup context unavailable");
         AtomicInteger postDropReads = new AtomicInteger();
         when(oxiaClient.get(configPath)).thenAnswer(ignored -> {
             if (postDropReads.getAndIncrement() == 0) {
-                VersionedValue current = config.get();
-                return CompletableFuture.completedFuture(new GetResult(
-                    configPath, current.value(), current.version()));
+                return CompletableFuture.completedFuture(null);
             }
             return CompletableFuture.failedFuture(contextReadFailure);
         });
@@ -973,7 +1030,8 @@ class IndexedStreamCatalogTest {
         boolean result = catalog.dropStream(streamId, false).get();
 
         assertTrue(result);
-        assertEquals("DROPPED", MAPPER.readTree(config.get().value())
+        assertNull(config.get());
+        assertEquals("DROPPED", MAPPER.readTree(tombstoneState.get().value())
             .get("_provisioningState").asText());
         LogMetadata tombstone = LOG_METADATA_SERDE.deserialize(
             partitionPath, partition.get().value());
@@ -1042,7 +1100,9 @@ class IndexedStreamCatalogTest {
         assertEquals(physicalStreamId, retained.streamId());
         verify(logStorage, never()).deleteLog(any());
 
-        assertTrue(recoveringCatalog.dropStream(streamId, true).join());
+        // The identity is already permanently deleted, so the upgrade purges through the
+        // tombstone instead of claiming a new deletion.
+        assertFalse(recoveringCatalog.dropStream(streamId, true).join());
 
         LogMetadata purged = LOG_METADATA_SERDE.deserialize(
             partitionPath, partition.get().value());
@@ -1050,7 +1110,8 @@ class IndexedStreamCatalogTest {
         assertEquals(-1L, purged.streamId());
         assertTrue(purged.retiredStreamIds().isEmpty());
         assertTrue(purged.purgeableRetiredStreamIds().isEmpty());
-        assertTrue(MAPPER.readTree(config.get().value())
+        assertNull(config.get());
+        assertTrue(MAPPER.readTree(tombstoneState.get().value())
             .path("_purgeRequested").asBoolean());
         verify(logStorage).deleteLog(LogId.of(physicalStreamId));
 
@@ -1059,7 +1120,7 @@ class IndexedStreamCatalogTest {
     }
 
     @Test
-    void failedPurgeUpgradeRemainsVisibleAndCanBeRecovered() throws Exception {
+    void failedPurgeUpgradeKeepsPurgeIntentAndCanBeRecovered() throws Exception {
         long physicalStreamId = 310L;
         String configPath = catalogPaths.streamConfigPath(streamId);
         String partitionPath = catalogPaths.partitionMetadataPath(streamId, 0);
@@ -1090,20 +1151,21 @@ class IndexedStreamCatalogTest {
             .thenReturn(CompletableFuture.completedFuture(List.of(configPath)));
 
         assertTrue(recoveringCatalog.dropStream(streamId, false).join());
+        assertNull(config.get());
 
         CompletionException failedPurge = assertThrows(CompletionException.class, () ->
             recoveringCatalog.dropStream(streamId, true).join());
         assertEquals(cleanupFailure, failedPurge.getCause());
-        JsonNode retryable = MAPPER.readTree(config.get().value());
-        assertEquals("ABORTING", retryable.path("_provisioningState").asText());
+        // The purge intent is durable in the tombstone before cleanup runs, so a failed purge
+        // upgrade is retryable even though the identity is already permanently deleted.
+        JsonNode retryable = MAPPER.readTree(tombstoneState.get().value());
+        assertEquals("DROPPED", retryable.path("_provisioningState").asText());
         assertTrue(retryable.path("_purgeRequested").asBoolean());
-        assertEquals(1, recoveringCatalog.listStreamEntries(streamId.namespace()).join().size());
-        assertEquals(LifecycleState.DELETING,
-            recoveringCatalog.listStreamEntries(streamId.namespace()).join().get(0).state());
+        assertTrue(recoveringCatalog.listStreamEntries(streamId.namespace()).join().isEmpty());
 
-        assertTrue(recoveringCatalog.dropStream(streamId, true).join());
+        assertFalse(recoveringCatalog.dropStream(streamId, true).join());
 
-        JsonNode completed = MAPPER.readTree(config.get().value());
+        JsonNode completed = MAPPER.readTree(tombstoneState.get().value());
         assertEquals("DROPPED", completed.path("_provisioningState").asText());
         assertTrue(completed.path("_purgeRequested").asBoolean());
         assertTrue(recoveringCatalog.listStreamEntries(streamId.namespace()).join().isEmpty());
@@ -1153,7 +1215,8 @@ class IndexedStreamCatalogTest {
         opened.close();
         assertTrue(lifecycleCatalog.dropStream(streamId, false).join());
 
-        assertEquals("DROPPED", MAPPER.readTree(config.get().value())
+        assertNull(config.get());
+        assertEquals("DROPPED", MAPPER.readTree(tombstoneState.get().value())
             .path("_provisioningState").asText());
         LogMetadata retained = LOG_METADATA_SERDE.deserialize(
             partitionPath, partition.get().value());
@@ -1163,7 +1226,7 @@ class IndexedStreamCatalogTest {
             mappings.storageApi().acquireStreamWriteLease(physicalStreamId).join());
         assertInstanceOf(IllegalStateException.class, fencedAfterClose.getCause());
 
-        assertTrue(lifecycleCatalog.dropStream(streamId, true).join());
+        assertFalse(lifecycleCatalog.dropStream(streamId, true).join());
 
         assertEquals(-1L, LOG_METADATA_SERDE.deserialize(
             partitionPath, partition.get().value()).streamId());
@@ -1204,7 +1267,8 @@ class IndexedStreamCatalogTest {
         assertEquals(Optional.empty(), mappings.activeStreamId(mappingKey));
         StreamIdMappingFence durableFence = mappings.fence(mappingKey).orElseThrow();
         assertEquals(originalStreamId, durableFence.streamId());
-        assertTrue(MAPPER.readTree(config.get().value())
+        assertNull(config.get());
+        assertTrue(MAPPER.readTree(tombstoneState.get().value())
             .path("_purgeRequested").asBoolean());
 
         CompletionException unacknowledged = assertThrows(CompletionException.class, () ->
@@ -1231,7 +1295,8 @@ class IndexedStreamCatalogTest {
 
         assertFalse(catalog.dropStream(streamId, false).get());
 
-        JsonNode tombstone = MAPPER.readTree(config.get().value());
+        assertNull(config.get());
+        JsonNode tombstone = MAPPER.readTree(tombstoneState.get().value());
         assertEquals("DROPPED", tombstone.path("_provisioningState").asText());
         assertEquals(0, tombstone.path("partitions").asInt());
         CompletionException failure = assertThrows(CompletionException.class, () ->
@@ -1249,15 +1314,16 @@ class IndexedStreamCatalogTest {
         AtomicReference<VersionedValue> config = mockVersionedConfig(configPath);
 
         assertFalse(catalog.dropStream(streamId, false).get());
-        assertFalse(MAPPER.readTree(config.get().value())
+        assertNull(config.get());
+        assertFalse(MAPPER.readTree(tombstoneState.get().value())
             .path("_purgeRequested").asBoolean());
 
         assertFalse(catalog.dropStream(streamId, true).get());
-        assertTrue(MAPPER.readTree(config.get().value())
+        assertTrue(MAPPER.readTree(tombstoneState.get().value())
             .path("_purgeRequested").asBoolean());
 
         assertFalse(catalog.dropStream(streamId, false).get());
-        assertTrue(MAPPER.readTree(config.get().value())
+        assertTrue(MAPPER.readTree(tombstoneState.get().value())
             .path("_purgeRequested").asBoolean());
     }
 
@@ -1434,7 +1500,8 @@ class IndexedStreamCatalogTest {
 
         assertTrue(mappedCatalog.dropStream(streamId, false).join());
 
-        assertEquals("DROPPED", MAPPER.readTree(config.get().value())
+        assertNull(config.get());
+        assertEquals("DROPPED", MAPPER.readTree(tombstoneState.get().value())
             .get("_provisioningState").asText());
         assertEquals(2, mappings.fenceAttempts().size());
         assertEquals(300L, mappings.fence(mappingKey).orElseThrow().streamId());
@@ -2164,9 +2231,13 @@ class IndexedStreamCatalogTest {
             @SuppressWarnings("unchecked")
             Set<DeleteOption> options = invocation.getArgument(1, Set.class);
             VersionedValue current = state.get();
-            if (current == null || !options.contains(
-                    DeleteOption.IfVersionIdEquals(current.version().versionId()))) {
+            if (current == null) {
                 return CompletableFuture.completedFuture(false);
+            }
+            if (!options.contains(
+                    DeleteOption.IfVersionIdEquals(current.version().versionId()))) {
+                return CompletableFuture.failedFuture(new UnexpectedVersionIdException(
+                    path, current.version().versionId()));
             }
             state.set(null);
             return CompletableFuture.completedFuture(true);

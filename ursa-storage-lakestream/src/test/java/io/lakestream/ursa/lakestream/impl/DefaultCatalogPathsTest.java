@@ -5,6 +5,7 @@
 package io.lakestream.ursa.lakestream.impl;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 
 import io.lakestream.api.StreamIdentifier;
 import org.junit.jupiter.api.Test;
@@ -56,6 +57,13 @@ class DefaultCatalogPathsTest {
     @Test
     void testStreamConfigPrefix() {
         assertEquals("/admin/streams/default/", paths.streamConfigPrefix("default"));
+    }
+
+    @Test
+    void tombstonePathLivesUnderItsOwnPrefix() {
+        StreamIdentifier id = StreamIdentifier.of("ns", "orders");
+        assertEquals("/admin/streams/_tombstones/ns/orders", paths.streamTombstonePath(id));
+        assertFalse(paths.streamTombstonePath(id).startsWith(paths.streamConfigPrefix("ns")));
     }
 
     @Test

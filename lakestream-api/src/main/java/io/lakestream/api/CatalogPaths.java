@@ -77,6 +77,19 @@ public interface CatalogPaths {
     String streamConfigPrefix(String namespace);
 
     /**
+     * Key of the permanent-deletion tombstone for a stream identity.
+     *
+     * <p>Tombstones live outside {@link #streamConfigPrefix(String)} so listing a namespace never
+     * reads completed deletions. The default derives the key from the config prefix.
+     *
+     * @param id the stream identifier
+     * @return the tombstone path (e.g., "/admin/streams/_tombstones/default/my-stream")
+     */
+    default String streamTombstonePath(StreamIdentifier id) {
+        return streamConfigPrefix("_tombstones/" + id.namespace()) + id.name();
+    }
+
+    /**
      * Name passed to the compacted-object reader factory for one stream log.
      *
      * <p>The default format is suitable for generic indexed streams. Protocol-specific path
