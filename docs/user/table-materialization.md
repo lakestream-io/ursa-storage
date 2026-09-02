@@ -139,9 +139,20 @@ stream, so a policy valid for one stream can still fail for its neighbour.
 Only `TableNaming.toTableIdentifier(StreamIdentifier, Map<String, String>)`
 resolves property variables. The single-argument
 `toTableIdentifier(StreamIdentifier)` has no properties to consult and rejects
-any template that uses one; call sites inside materialization pass
-`StreamMetadata.properties()`. `tableNamespacePrefix` is used literally and is
+any template that uses one. `tableNamespacePrefix` is used literally and is
 never interpolated.
+
+`${stream.property.<key>}` therefore only works where the stream's own
+properties are at hand, which today means catalog-side resolution:
+`StreamCatalog.resolveMaterialization` loads the stream and passes
+`StreamMetadata.properties()` into the template. The compaction worker's
+backwards-compatible fallback — `TableCatalogBootstrap.resolveFromProperties`,
+reached only when catalog-side resolution returns empty and the deployment
+drives materialization from compaction task properties instead — has no stream
+properties to pass, so it resolves the policy without them and a template using
+`${stream.property.<key>}` fails there with `IllegalArgumentException`. A
+deployment that names tables after stream properties must drive materialization
+from a catalog policy.
 
 ## Configuration Keys
 
