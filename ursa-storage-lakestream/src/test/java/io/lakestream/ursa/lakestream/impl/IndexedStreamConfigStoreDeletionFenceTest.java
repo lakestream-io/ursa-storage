@@ -1069,6 +1069,35 @@ class IndexedStreamConfigStoreDeletionFenceTest {
             eq(Set.of(PutOption.IfRecordDoesNotExist)));
     }
 
+    @Test
+    void absentStreamPurgeUpgradeEscalatesItsBackoffAndGivesUpAtTheRetryLimit() {
+        List<Long> backoffs = new ArrayList<>();
+        store = new IndexedStreamConfigStore(oxiaClient, paths, delayMillis -> {
+            backoffs.add(delayMillis);
+            return CompletableFuture.completedFuture(null);
+        });
+        when(oxiaClient.put(eq(tombstonePath), any(byte[].class),
+                eq(Set.of(PutOption.IfRecordDoesNotExist))))
+            .thenReturn(CompletableFuture.failedFuture(
+                new KeyAlreadyExistsException(tombstonePath)));
+        // The conflicting fence is gone again every time the purge upgrade reads it back, so each
+        // attempt loses the same race and has to carry its retry count into the next one.
+        when(oxiaClient.get(tombstonePath))
+            .thenReturn(CompletableFuture.completedFuture(null));
+
+        assertThatThrownBy(() -> store.beginDrop(id, "drop-owner", true).join())
+            .isInstanceOf(CompletionException.class)
+            .hasRootCauseInstanceOf(KeyAlreadyExistsException.class);
+
+        assertThat(backoffs).containsExactly(
+            IndexedStreamConfigStore.INITIAL_RETRY_BACKOFF_MILLIS,
+            IndexedStreamConfigStore.INITIAL_RETRY_BACKOFF_MILLIS << 1,
+            IndexedStreamConfigStore.INITIAL_RETRY_BACKOFF_MILLIS << 2);
+        verify(oxiaClient, times(IndexedStreamConfigStore.MAX_CONFIG_WRITE_RETRIES + 1))
+            .put(eq(tombstonePath), any(byte[].class),
+                eq(Set.of(PutOption.IfRecordDoesNotExist)));
+    }
+
     private static byte[] activeConfigBytes(int partitions) {
         return ("{\"partitions\":" + partitions + ",\"properties\":{},"
             + "\"_incarnationId\":\"incarnation\","
