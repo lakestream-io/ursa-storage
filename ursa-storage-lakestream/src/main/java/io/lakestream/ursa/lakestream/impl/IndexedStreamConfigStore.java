@@ -215,23 +215,6 @@ final class IndexedStreamConfigStore {
     }
 
 
-    CompletableFuture<Void> verifyActiveOwnership(
-            StreamIdentifier id, ActiveStreamConfig expected) {
-        String path = catalogPaths.streamConfigPath(id);
-        return oxiaClient.get(path).thenCompose(result -> {
-            if (result == null) {
-                return CompletableFuture.failedFuture(new NoSuchStreamException(id));
-            }
-            StreamConfigData current = parse(id, result.value());
-            if (current.provisioningState() == ProvisioningState.ACTIVE
-                    && current.sameActiveLifecycle(expected.config(),
-                    result.version().versionId(), expected.versionId())) {
-                return CompletableFuture.completedFuture(null);
-            }
-            return CompletableFuture.failedFuture(new NoSuchStreamException(id));
-        });
-    }
-
     CompletableFuture<ExpansionClaim> claimExpansion(
             StreamIdentifier id, int targetPartitions) {
         Objects.requireNonNull(id, "id");
@@ -1736,25 +1719,6 @@ final class IndexedStreamConfigStore {
 
         boolean provisioning() {
             return provisioningState != ProvisioningState.ACTIVE;
-        }
-
-        boolean sameActiveLifecycle(
-                StreamConfigData expected, long currentVersion, long expectedVersion) {
-            if (provisioning() || expected.provisioning()
-                    || currentVersion != expectedVersion) {
-                return false;
-            }
-            if (expected.incarnationId().isPresent()) {
-                return incarnationId.equals(expected.incarnationId)
-                    && ownerToken.equals(expected.ownerToken)
-                    && ownerGeneration == expected.ownerGeneration
-                    && metadataSourceOwnerToken.equals(
-                        expected.metadataSourceOwnerToken)
-                    && metadataSourceGeneration == expected.metadataSourceGeneration
-                    && creationKind.equals(expected.creationKind);
-            }
-            return incarnationId.isEmpty()
-                && ownerToken.isEmpty();
         }
 
         boolean canResumeCreation(

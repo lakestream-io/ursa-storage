@@ -366,22 +366,6 @@ class IndexedStreamConfigStoreDeletionFenceTest {
     }
 
     @Test
-    void activeSnapshotVerificationRejectsSameLifecycleAtNewVersion() {
-        when(oxiaClient.get(configPath))
-            .thenReturn(CompletableFuture.completedFuture(
-                nativeActive(VERSION_1, 1, "owner", 1L, Map.of())))
-            .thenReturn(CompletableFuture.completedFuture(
-                nativeActive(VERSION_2, 2, "owner", 1L, Map.of())));
-
-        IndexedStreamConfigStore.ActiveStreamConfig snapshot =
-            store.readActive(id).join();
-
-        assertThatThrownBy(() -> store.verifyActiveOwnership(id, snapshot).join())
-            .isInstanceOf(CompletionException.class)
-            .hasCauseInstanceOf(NoSuchStreamException.class);
-    }
-
-    @Test
     void conflictingConfigUpdateWaitsForAsynchronousRetryAndThenSucceeds() {
         List<Long> backoffs = new ArrayList<>();
         CompletableFuture<Void> retryGate = new CompletableFuture<>();
