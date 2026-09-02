@@ -74,7 +74,7 @@ Package: `io.lakestream.api`
 |------|---------|
 | `AlreadyExistsException` | Stream or namespace already exists |
 | `NoSuchStreamException` | Stream not found |
-| `StreamPermanentlyDeletedException` | Stream identity carries a deletion tombstone and can never be made active again. Thrown by `createStream`, `loadStream`, `getLayout`, `openLog`, `openReader`, `openWriter` and `resolveMaterialization`. Extends `NoSuchStreamException`, so catch it first |
+| `StreamPermanentlyDeletedException` | Stream identity carries a deletion tombstone and can never be made active again. Thrown by `createStream`, `loadStream`, `getLayout`, `openLog`, `openReader`, `openWriter`, `increasePartitions`, `replaceStreamProperties` and `resolveMaterialization`. Extends `NoSuchStreamException`, so catch it first |
 | `NoSuchNamespaceException` | Namespace not found |
 | `NamespaceNotEmptyException` | Cannot drop non-empty namespace |
 

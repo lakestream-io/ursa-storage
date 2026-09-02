@@ -151,6 +151,28 @@ class IndexedStreamCatalogTest {
     }
 
     @Test
+    void increasePartitionsReportsPermanentDeletionFromTombstonePath() throws Exception {
+        mockVersionedConfig(tombstonePath, droppedStreamConfigBytes(
+            1, "dropped-incarnation", "dropped-owner", 2L, "NATIVE_CREATE"));
+
+        ExecutionException failure = assertThrows(ExecutionException.class,
+            () -> catalog.increasePartitions(streamId, 4).get());
+
+        assertInstanceOf(StreamPermanentlyDeletedException.class, failure.getCause());
+    }
+
+    @Test
+    void replaceStreamPropertiesReportsPermanentDeletionFromTombstonePath() throws Exception {
+        mockVersionedConfig(tombstonePath, droppedStreamConfigBytes(
+            1, "dropped-incarnation", "dropped-owner", 2L, "NATIVE_CREATE"));
+
+        ExecutionException failure = assertThrows(ExecutionException.class,
+            () -> catalog.replaceStreamProperties(streamId, Map.of("tier", "hot"), 1L).get());
+
+        assertInstanceOf(StreamPermanentlyDeletedException.class, failure.getCause());
+    }
+
+    @Test
     void createStreamRejectsTombstonedIdentifier() throws Exception {
         mockVersionedConfig(tombstonePath, droppedStreamConfigBytes(
             1, "dropped-incarnation", "dropped-owner", 2L, "NATIVE_CREATE"));
@@ -694,6 +716,9 @@ class IndexedStreamCatalogTest {
 
         StreamMetadata expanded = expandingCatalog.increasePartitions(streamId, 3).join();
 
+        // An active record answers the claim on its own; the tombstone costs a read only on the
+        // absent and non-ACTIVE branches.
+        verify(oxiaClient, never()).get(tombstonePath);
         assertEquals(3, expanded.partitioning().numPartitions());
         assertEquals(3, expanded.layout().logIds().join().size());
         JsonNode completed = MAPPER.readTree(config.get().value());
@@ -780,6 +805,9 @@ class IndexedStreamCatalogTest {
         StreamMetadata updated = catalog.replaceStreamProperties(
             streamId, Map.of("owner", "new"), 1L).join();
         assertEquals(Map.of("owner", "new"), updated.properties());
+        // An active record answers the write on its own; the tombstone costs a read only on the
+        // absent and non-ACTIVE branches.
+        verify(oxiaClient, never()).get(tombstonePath);
 
         VersionedValue readPartition = partition.get();
         delayedPartitionRead.complete(new GetResult(

@@ -246,11 +246,11 @@ final class IndexedStreamConfigStore {
         String path = catalogPaths.streamConfigPath(id);
         return oxiaClient.get(path).thenCompose(result -> {
             if (result == null) {
-                return CompletableFuture.failedFuture(new NoSuchStreamException(id));
+                return absentOrTombstoned(id);
             }
             StreamConfigData current = parse(id, result.value());
             if (current.provisioningState() != ProvisioningState.ACTIVE) {
-                return CompletableFuture.failedFuture(new NoSuchStreamException(id));
+                return absentOrTombstoned(id);
             }
             if (current.creationKind().orElse(null) != CreationKind.NATIVE_CREATE) {
                 return CompletableFuture.failedFuture(new AlreadyExistsException(
@@ -396,11 +396,11 @@ final class IndexedStreamConfigStore {
         String path = catalogPaths.streamConfigPath(id);
         return oxiaClient.get(path).thenCompose(result -> {
             if (result == null) {
-                return CompletableFuture.failedFuture(new NoSuchStreamException(id));
+                return absentOrTombstoned(id);
             }
             StreamConfigData current = parse(id, result.value());
             if (current.provisioningState() != ProvisioningState.ACTIVE) {
-                return CompletableFuture.failedFuture(new NoSuchStreamException(id));
+                return absentOrTombstoned(id);
             }
             if (sourceRevision <= current.propertiesSourceRevision()) {
                 return CompletableFuture.completedFuture(new ActiveStreamConfig(
