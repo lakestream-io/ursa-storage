@@ -24,12 +24,54 @@ final class BoundedParallel {
         if (limit <= 0) {
             throw new IllegalArgumentException("limit must be positive");
         }
-        CompletableFuture<Void> result = new CompletableFuture<>();
-        AtomicInteger next = new AtomicInteger();
-        AtomicInteger remaining = new AtomicInteger(count);
-        AtomicReference<Throwable> firstFailure = new AtomicReference<>();
-        Runnable[] launch = new Runnable[1];
-        launch[0] = () -> {
+        Run run = new Run(count, body);
+        for (int i = 0; i < Math.min(limit, count); i++) {
+            run.requestLaunch();
+        }
+        return run.result;
+    }
+
+    private static Throwable unwrap(Throwable failure) {
+        return failure instanceof CompletionException && failure.getCause() != null
+            ? failure.getCause() : failure;
+    }
+
+    /**
+     * One {@link #forEach} invocation. Launches are driven by a trampoline so that bodies which
+     * settle synchronously do not grow the stack: a completion that wants to start the next index
+     * only records the request, and the thread already inside the drain loop performs it.
+     */
+    private static final class Run {
+
+        private final int count;
+        private final IntFunction<CompletableFuture<Void>> body;
+        private final CompletableFuture<Void> result = new CompletableFuture<>();
+        private final AtomicInteger next = new AtomicInteger();
+        private final AtomicInteger remaining;
+        private final AtomicInteger pendingLaunches = new AtomicInteger();
+        private final AtomicReference<Throwable> firstFailure = new AtomicReference<>();
+
+        private Run(int count, IntFunction<CompletableFuture<Void>> body) {
+            this.count = count;
+            this.body = body;
+            this.remaining = new AtomicInteger(count);
+        }
+
+        /**
+         * Asks for one more index to be launched. The first caller becomes the drainer and keeps
+         * launching until every queued request has been served; later callers hand their request
+         * to that drainer and return immediately.
+         */
+        private void requestLaunch() {
+            if (pendingLaunches.incrementAndGet() > 1) {
+                return;
+            }
+            do {
+                launchOne();
+            } while (pendingLaunches.decrementAndGet() > 0);
+        }
+
+        private void launchOne() {
             int index = next.getAndIncrement();
             if (index >= count) {
                 return;
@@ -53,17 +95,8 @@ final class BoundedParallel {
                     }
                     return;
                 }
-                launch[0].run();
+                requestLaunch();
             });
-        };
-        for (int i = 0; i < Math.min(limit, count); i++) {
-            launch[0].run();
         }
-        return result;
-    }
-
-    private static Throwable unwrap(Throwable failure) {
-        return failure instanceof CompletionException && failure.getCause() != null
-            ? failure.getCause() : failure;
     }
 }

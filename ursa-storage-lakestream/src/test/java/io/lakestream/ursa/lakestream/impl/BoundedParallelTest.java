@@ -5,6 +5,7 @@
 package io.lakestream.ursa.lakestream.impl;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import java.util.List;
@@ -41,10 +42,49 @@ class BoundedParallelTest {
 
     @Test
     void failureOfOneBodyFailsTheWholeRunAfterOthersFinish() {
-        CompletableFuture<Void> all = BoundedParallel.forEach(3, 3, i -> i == 1
-            ? CompletableFuture.failedFuture(new IllegalStateException("boom"))
-            : CompletableFuture.completedFuture(null));
+        AtomicInteger invocations = new AtomicInteger();
+        CompletableFuture<Void> failingGate = new CompletableFuture<>();
+        CompletableFuture<Void> all = BoundedParallel.forEach(3, 3, i -> {
+            invocations.incrementAndGet();
+            return i == 1 ? failingGate : CompletableFuture.completedFuture(null);
+        });
+        // Every index runs even though one of them is destined to fail.
+        assertEquals(3, invocations.get());
+        // The run stays pending while the failing body is still in flight.
+        assertFalse(all.isDone());
+        failingGate.completeExceptionally(new IllegalStateException("boom"));
         ExecutionException failure = assertThrows(ExecutionException.class, () -> all.get(10, TimeUnit.SECONDS));
         assertEquals("boom", failure.getCause().getMessage());
+        assertEquals(3, invocations.get());
+    }
+
+    @Test
+    void failureIsReportedOnlyAfterASlowerBodySettles() {
+        AtomicInteger invocations = new AtomicInteger();
+        CompletableFuture<Void> straggler = new CompletableFuture<>();
+        CompletableFuture<Void> all = BoundedParallel.forEach(3, 3, i -> {
+            invocations.incrementAndGet();
+            if (i == 0) {
+                return CompletableFuture.failedFuture(new IllegalStateException("boom"));
+            }
+            return i == 1 ? straggler : CompletableFuture.completedFuture(null);
+        });
+        assertEquals(3, invocations.get());
+        // The failure is already recorded, but the run must not settle while work is in flight.
+        assertFalse(all.isDone());
+        straggler.complete(null);
+        ExecutionException failure = assertThrows(ExecutionException.class, () -> all.get(10, TimeUnit.SECONDS));
+        assertEquals("boom", failure.getCause().getMessage());
+    }
+
+    @Test
+    void largeSynchronousRunDoesNotOverflowTheStack() throws Exception {
+        AtomicInteger invocations = new AtomicInteger();
+        CompletableFuture<Void> all = BoundedParallel.forEach(200_000, 4, i -> {
+            invocations.incrementAndGet();
+            return CompletableFuture.completedFuture(null);
+        });
+        all.get(10, TimeUnit.SECONDS);
+        assertEquals(200_000, invocations.get());
     }
 }
