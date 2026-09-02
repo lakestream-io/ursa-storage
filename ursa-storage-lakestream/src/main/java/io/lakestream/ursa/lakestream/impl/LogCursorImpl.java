@@ -580,36 +580,14 @@ public class LogCursorImpl implements LogCursor {
 
     @Override
     public void close() throws Exception {
+        if (!durable) {
+            clearPrefetchCache();
+            return;
+        }
         persistState().get(SYNC_TIMEOUT_SECONDS, TimeUnit.SECONDS);
     }
 
     // --- Ack set and batch helpers ---
-
-    /**
-     * Returns the acknowledgement set for a batched entry position.
-     */
-    public long[] getBatchPositionAckSet(long offset, int length) {
-        return individualAcksTracker.getBatchPositionAckSet(markDeleteOffset, offset, length);
-    }
-
-    /**
-     * Returns the last individually deleted range, or null if none.
-     */
-    public IndividualAcksTracker.OffsetRange lastIndividualDeletedRange() {
-        lock.readLock().lock();
-        try {
-            return individualAcksTracker.lastRange();
-        } finally {
-            lock.readLock().unlock();
-        }
-    }
-
-    /**
-     * Clears individual acks after the given offset.
-     */
-    public void clearIndividualAcksAfterOffset(long offset) {
-        individualAcksTracker.clearAfterOffset(offset);
-    }
 
     /**
      * Flushes individual acks tracker if persistence rate allows.

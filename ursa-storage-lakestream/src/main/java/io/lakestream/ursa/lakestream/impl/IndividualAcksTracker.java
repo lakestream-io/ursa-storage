@@ -16,7 +16,6 @@ import io.oxia.client.api.options.RangeScanOption;
 import io.oxia.client.api.options.defs.OptionPartitionKey;
 import java.io.Closeable;
 import java.io.IOException;
-import java.util.BitSet;
 import java.util.Collections;
 import java.util.LinkedList;
 import java.util.List;
@@ -27,7 +26,6 @@ import java.util.concurrent.CompletableFuture;
 import javax.annotation.Nullable;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
-import org.roaringbitmap.RoaringBitmap;
 
 @Slf4j
 @Getter
@@ -200,23 +198,6 @@ public class IndividualAcksTracker implements Closeable {
                 }
             }
         }
-    }
-
-    public long[] getBatchPositionAckSet(long markDeleteOffset, long offset, int length) {
-        IndividualAcksTrackerSegment segment = getSegment(offset);
-        if (segment == null) {
-            return new long[0];
-        }
-        BitSet bitSet = new BitSet(length);
-        int delta = (int) (offset - segment.getBaseOffset());
-        RoaringBitmap bitmap = segment.getBitmap();
-
-        for (int i = 0; i < length; i++) {
-            if (delta + i <= markDeleteOffset || bitmap.contains(delta + i)) {
-                bitSet.set(i);
-            }
-        }
-        return bitSet.toLongArray();
     }
 
     public record OffsetRange(long start, long end) {

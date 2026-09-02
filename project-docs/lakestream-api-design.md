@@ -96,7 +96,14 @@ The default catalog layout uses Ursa-owned paths:
 /admin/streams/{namespace}/{stream}
 /admin/streams/_namespaces/{namespace}
 /admin/streams/_tablecatalogs/{catalog}
+/admin/streams/_tombstones/{namespace}/{stream}
 ```
+
+The leading-underscore segments — `_namespaces`, `_tablecatalogs`,
+`_tombstones` — sit where a namespace name would, so `CatalogPaths` reserves
+them: a stream namespace must never be named after one, or its streams would
+collide with those records. Tombstones live outside the per-namespace stream
+prefix on purpose, so listing a namespace never reads completed deletions.
 
 Exact serialization and transactional update rules are implementation details
 of `ursa-storage-lakestream`. Readers must reject incompatible metadata

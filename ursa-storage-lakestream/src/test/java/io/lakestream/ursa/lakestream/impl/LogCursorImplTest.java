@@ -6,6 +6,7 @@ package io.lakestream.ursa.lakestream.impl;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -17,6 +18,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import io.lakestream.api.EntryHeader;
@@ -37,6 +39,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -518,6 +521,27 @@ class LogCursorImplTest {
 
         assertEquals(5, result.size());
         assertEquals(5, cursor.readOffset());
+    }
+
+    // --- Ephemeral cursor lifecycle ---
+
+    @Test
+    void ephemeralCursorCloseDropsThePrefetchCacheInsteadOfPersisting() throws Exception {
+        Log log = mock(Log.class);
+        LogCursorImpl cursor = new LogCursorImpl("scan", log, 0L, -1L);
+        cursor.getPrefetchedIndexes().add(makeRawEntryIndex(0, 1));
+        cursor.getPrefetchedIndexes().add(makeRawEntryIndex(1, 1));
+        cursor.setPrefetchedMessageCount(2);
+        cursor.setNextReadIndex(CompletableFuture.completedFuture(makeRawEntryIndex(0, 1)));
+
+        cursor.close();
+
+        // An ephemeral cursor has no durable state to write, so closing it only drops what it
+        // prefetched: the cache is empty and the pre-resolved next index is back to nothing.
+        assertTrue(cursor.getPrefetchedIndexes().isEmpty());
+        assertEquals(0, cursor.getPrefetchedMessageCount());
+        assertNull(cursor.getNextReadIndex().get(5, TimeUnit.SECONDS));
+        verifyNoInteractions(log);
     }
 
     // --- Helpers ---

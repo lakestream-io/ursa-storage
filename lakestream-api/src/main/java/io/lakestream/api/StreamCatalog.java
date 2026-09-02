@@ -266,6 +266,8 @@ public interface StreamCatalog extends AutoCloseable {
      * @param identifier the stream to expand
      * @param targetPartitionCount the desired total partition count
      * @return a future resolving to the resulting committed stream metadata
+     * @throws io.lakestream.api.exception.NoSuchStreamException if the stream is not active
+     * @throws io.lakestream.api.exception.StreamPermanentlyDeletedException if the identifier is tombstoned
      */
     CompletableFuture<StreamMetadata> increasePartitions(
         StreamIdentifier identifier, int targetPartitionCount);
@@ -279,6 +281,8 @@ public interface StreamCatalog extends AutoCloseable {
      * @param properties the complete replacement property snapshot
      * @param sourceRevision the external source revision associated with the snapshot
      * @return a future resolving to the resulting stream metadata
+     * @throws io.lakestream.api.exception.NoSuchStreamException if the stream is not active
+     * @throws io.lakestream.api.exception.StreamPermanentlyDeletedException if the identifier is tombstoned
      */
     CompletableFuture<StreamMetadata> replaceStreamProperties(
         StreamIdentifier identifier, Map<String, String> properties, long sourceRevision);
@@ -359,6 +363,32 @@ public interface StreamCatalog extends AutoCloseable {
      * @throws IllegalArgumentException if the log ID is not in the committed stream layout
      */
     CompletableFuture<Log> openLog(StreamIdentifier identifier, LogId logId);
+
+    /**
+     * Opens the log for one committed partition index.
+     *
+     * <p>Equivalent to loading the stream layout and calling {@link #openLog(StreamIdentifier, LogId)}
+     * with the log at {@code partitionIndex}, but implementations read catalog metadata once.
+     *
+     * @param id the stream identifier
+     * @param partitionIndex the zero-based index of a partition in the committed layout
+     * @return a future resolving to the opened log
+     * @throws io.lakestream.api.exception.NoSuchStreamException if the stream is not active
+     * @throws io.lakestream.api.exception.StreamPermanentlyDeletedException if the identifier is tombstoned
+     * @throws IllegalArgumentException if the index is outside the committed layout
+     */
+    default CompletableFuture<Log> openLog(StreamIdentifier id, int partitionIndex) {
+        return loadStream(id)
+            .thenCompose(metadata -> metadata.layout().logIds())
+            .thenCompose(logIds -> {
+                if (partitionIndex < 0 || partitionIndex >= logIds.size()) {
+                    return CompletableFuture.failedFuture(new IllegalArgumentException(
+                        "Partition " + partitionIndex + " is not in the committed layout of "
+                            + id.fullName() + " (" + logIds.size() + " logs)"));
+                }
+                return openLog(id, logIds.get(partitionIndex));
+            });
+    }
 
     /**
      * Opens a writer for the stream.

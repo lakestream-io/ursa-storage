@@ -110,6 +110,8 @@ public interface Log extends AutoCloseable {
     /**
      * Returns the offset information of the first entry in the log.
      *
+     * <p>Implementations that hold the only write lease for the log may serve this from memory.
+     *
      * @return a future resolving to the first offset
      */
     CompletableFuture<LogOffset> getFirstOffset();
@@ -125,6 +127,8 @@ public interface Log extends AutoCloseable {
 
     /**
      * Returns the offset information of the last entry in the log.
+     *
+     * <p>Implementations that hold the only write lease for the log may serve this from memory.
      *
      * @return a future resolving to the last offset
      */
@@ -179,6 +183,32 @@ public interface Log extends AutoCloseable {
      */
     void fence();
 
+    /**
+     * Closes this log, reporting the outcome through a future instead of throwing.
+     *
+     * <p>This default implementation is a thin wrapper: it calls {@link #close()} synchronously on
+     * the calling thread, does not retry, and returns an already-completed future. It is therefore
+     * exactly as blocking as the implementation's own {@code close()}.
+     *
+     * <p>Implementations that own a durable lease (such as the catalog's leased log) override this
+     * to return before the close finishes and to retry internally until the log and its lease are
+     * released, so their callers may drop the returned future. A caller that needs a non-blocking,
+     * self-retrying close must rely on such an implementation; only implementations that document
+     * that behavior provide it, and it must not be assumed from this interface.
+     *
+     * <p>This method never throws; a close failure is reported through the returned future.
+     *
+     * @return a future that completes when the log is fully closed
+     */
+    default CompletableFuture<Void> closeAsync() {
+        try {
+            close();
+            return CompletableFuture.completedFuture(null);
+        } catch (Throwable failure) {
+            return CompletableFuture.failedFuture(failure);
+        }
+    }
+
     // --- Cursor management ---
 
     /**
@@ -196,6 +226,9 @@ public interface Log extends AutoCloseable {
      * Opens an ephemeral (non-persistent) cursor for temporary reads.
      * The cursor tracks read position in memory only — no Oxia persistence.
      * Suitable for fetch reads, timestamp scanning, and replay operations.
+     *
+     * <p>Creating an ephemeral cursor allocates only in-memory state; callers should open
+     * one per read rather than pool them.
      *
      * @param name the cursor name
      * @param initialOffset the initial read offset

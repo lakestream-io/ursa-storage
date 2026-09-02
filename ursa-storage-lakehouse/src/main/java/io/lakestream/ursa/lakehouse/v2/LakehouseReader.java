@@ -47,11 +47,15 @@ public class LakehouseReader implements AutoCloseable {
 
     private static final String SERDE_TYPE = "entrySerDeType";
 
-    // Shared thread pool for all LakehouseReader instances.
+    // Shared thread pool for all LakehouseReader instances: one idle-timeout thread serves every
+    // reader, where a per-instance scheduler would cost a thread per partition. Its thread is
+    // pinned to this class's own loader, so whichever reader happens to create the pool cannot
+    // leave its caller's context class loader behind on a thread that outlives that caller.
     private static final ScheduledExecutorService IDLE_TIMEOUT_SCHEDULER =
         Executors.newScheduledThreadPool(1, r -> {
             Thread t = new Thread(r, "LakehouseReader-IdleTimeout");
             t.setDaemon(true);
+            t.setContextClassLoader(LakehouseReader.class.getClassLoader());
             return t;
         });
     // Default idle timeout in seconds (1 minutes)

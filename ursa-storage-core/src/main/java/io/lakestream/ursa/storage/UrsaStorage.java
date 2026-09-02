@@ -13,6 +13,7 @@ import io.lakestream.ursa.storage.impl.StorageConfig;
 import io.lakestream.ursa.storage.impl.StorageFormat;
 import io.lakestream.ursa.storage.impl.StreamStateManagerImpl;
 import io.lakestream.ursa.storage.impl.WalStorageFactory;
+import io.lakestream.ursa.utils.EventualRetry;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.opentelemetry.api.OpenTelemetry;
@@ -27,7 +28,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -47,17 +47,6 @@ import org.apache.commons.lang3.tuple.Pair;
 public class UrsaStorage implements AutoCloseable {
 
     private static final Duration DEFAULT_CLOSE_TIMEOUT = Duration.ofSeconds(10);
-    private static final long FAILED_DATA_PLANE_CLOSE_INITIAL_RETRY_MILLIS = 100L;
-    private static final long FAILED_DATA_PLANE_CLOSE_MAX_RETRY_MILLIS =
-        TimeUnit.SECONDS.toMillis(10);
-    private static final ExecutorService FAILED_DATA_PLANE_CLOSE_EXECUTOR =
-        new ThreadPoolExecutor(
-            2, 2, 0L, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(64), task -> {
-                Thread thread = new Thread(task, "ursa-failed-data-plane-close");
-                thread.setDaemon(true);
-                thread.setContextClassLoader(UrsaStorage.class.getClassLoader());
-                return thread;
-            }, new ThreadPoolExecutor.AbortPolicy());
 
     @FunctionalInterface
     interface DataPlaneFactory {
@@ -83,6 +72,7 @@ public class UrsaStorage implements AutoCloseable {
     private final LazyWalStorage defaultWalStorage;
     private final Object dataPlaneLock = new Object();
     private final long closeTimeoutNanos;
+    private final ExecutorService failedDataPlaneCloseExecutor;
 
     private final boolean internalCreatedOxia;
     private final AsyncOxiaClient oxiaClient;
@@ -104,12 +94,16 @@ public class UrsaStorage implements AutoCloseable {
 
     public UrsaStorage(StorageConfig config, OpenTelemetry otel,
                        AsyncOxiaClient client) throws Exception {
-        this(config, otel, client, UrsaStorage::createDataPlane);
+        // No injected factory: the full constructor falls back to the real data plane.
+        this(config, otel, client, null, DEFAULT_CLOSE_TIMEOUT, false);
     }
 
+    /** Builds a runtime whose data plane comes from the given factory, which is required. */
     UrsaStorage(StorageConfig config, OpenTelemetry otel, AsyncOxiaClient client,
                 DataPlaneFactory dataPlaneFactory) throws Exception {
-        this(config, otel, client, dataPlaneFactory, DEFAULT_CLOSE_TIMEOUT, false);
+        this(config, otel, client,
+            Objects.requireNonNull(dataPlaneFactory, "dataPlaneFactory"),
+            DEFAULT_CLOSE_TIMEOUT, false);
     }
 
     UrsaStorage(StorageConfig config, OpenTelemetry otel, AsyncOxiaClient client,
@@ -117,7 +111,6 @@ public class UrsaStorage implements AutoCloseable {
                 boolean ownsProvidedOxiaClient) throws Exception {
         this.config = Objects.requireNonNull(config, "config");
         Objects.requireNonNull(otel, "otel");
-        this.dataPlaneFactory = Objects.requireNonNull(dataPlaneFactory, "dataPlaneFactory");
         this.closeTimeoutNanos = positiveDurationNanos(closeTimeout, "closeTimeout");
         this.internalCreatedOxia = client == null || ownsProvidedOxiaClient;
         this.oxiaClient = client == null ? createOxiaClient(config, otel) : client;
@@ -128,9 +121,18 @@ public class UrsaStorage implements AutoCloseable {
         this.defaultStorageApi = new PersistStorageApi(
             config, oxiaClient, defaultWalStorage, instrumentProvider,
             storageFormat, streamStateManager);
+        this.failedDataPlaneCloseExecutor = new ThreadPoolExecutor(
+            2, 2, 0L, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(64), task -> {
+                Thread thread = new Thread(task, "ursa-failed-data-plane-close");
+                thread.setDaemon(true);
+                thread.setContextClassLoader(UrsaStorage.class.getClassLoader());
+                return thread;
+            }, new ThreadPoolExecutor.AbortPolicy());
+        this.dataPlaneFactory = dataPlaneFactory != null
+            ? dataPlaneFactory : this::createDataPlane;
     }
 
-    private static DataPlane createDataPlane(
+    private DataPlane createDataPlane(
             StorageConfig config, InstrumentProvider instrumentProvider,
             AsyncOxiaClient oxiaClient, StorageFormat storageFormat,
             LogStateManager streamStateManager) throws Exception {
@@ -146,7 +148,8 @@ public class UrsaStorage implements AutoCloseable {
             walStorage.initialize();
             return new DataPlane(fileStorage, walStorage);
         } catch (Exception | Error failure) {
-            closeDataPlaneAfterFailure(fileStorage, walStorage, failure);
+            closeDataPlaneAfterFailure(
+                fileStorage, walStorage, failure, failedDataPlaneCloseExecutor);
             throw failure;
         }
     }
@@ -170,15 +173,17 @@ public class UrsaStorage implements AutoCloseable {
     }
 
     private static void closeDataPlaneAfterFailure(
-            FileStorage fileStorage, WalStorage walStorage, Throwable failure) {
+            FileStorage fileStorage, WalStorage walStorage, Throwable failure,
+            ExecutorService executor) {
         closeDataPlaneAfterFailure(
-            fileStorage, walStorage, failure, DEFAULT_CLOSE_TIMEOUT);
+            fileStorage, walStorage, failure, DEFAULT_CLOSE_TIMEOUT, executor);
     }
 
     static void closeDataPlaneAfterFailure(
             FileStorage fileStorage, WalStorage walStorage, Throwable failure,
-            Duration closeTimeout) {
+            Duration closeTimeout, ExecutorService executor) {
         Objects.requireNonNull(failure, "failure");
+        Objects.requireNonNull(executor, "executor");
         long timeoutNanos = positiveDurationNanos(closeTimeout, "closeTimeout");
         if (walStorage == null) {
             closeFileStorageAfterFailure(fileStorage, failure);
@@ -186,7 +191,7 @@ public class UrsaStorage implements AutoCloseable {
         }
 
         FailedDataPlaneCleanup cleanup = new FailedDataPlaneCleanup(
-            fileStorage, walStorage, failure);
+            fileStorage, walStorage, failure, executor);
         CompletableFuture<Void> cleanupFuture = cleanup.start();
 
         try {
@@ -196,6 +201,17 @@ public class UrsaStorage implements AutoCloseable {
         } catch (Exception | Error closeFailure) {
             addSuppressed(failure, closeFailure);
         }
+    }
+
+    /**
+     * Test-only entry point that starts a {@link FailedDataPlaneCleanup} and exposes its
+     * completion future directly, bypassing {@link #closeDataPlaneAfterFailure}'s own bounded
+     * wait so tests can observe the cleanup settle (or fail) on their own schedule.
+     */
+    static CompletableFuture<Void> startFailedDataPlaneCleanupForTesting(
+            FileStorage fileStorage, WalStorage walStorage, Throwable failure,
+            ExecutorService executor) {
+        return new FailedDataPlaneCleanup(fileStorage, walStorage, failure, executor).start();
     }
 
     private static long positiveDurationNanos(Duration duration, String name) {
@@ -226,99 +242,108 @@ public class UrsaStorage implements AutoCloseable {
         private final FileStorage fileStorage;
         private final WalStorage walStorage;
         private final Throwable initializationFailure;
+        private final ExecutorService executor;
         private final CompletableFuture<Void> completion = new CompletableFuture<>();
         private boolean cleanupFailureRecorded;
 
         private FailedDataPlaneCleanup(
                 FileStorage fileStorage,
                 WalStorage walStorage,
-                Throwable initializationFailure) {
+                Throwable initializationFailure,
+                ExecutorService executor) {
             this.fileStorage = fileStorage;
             this.walStorage = walStorage;
             this.initializationFailure = initializationFailure;
+            this.executor = executor;
         }
 
         private CompletableFuture<Void> start() {
-            attemptWalClose(0);
+            closeWalStorage();
             return completion;
         }
 
-        private void attemptWalClose(int retryAttempt) {
-            try {
-                FAILED_DATA_PLANE_CLOSE_EXECUTOR.execute(() -> {
-                    final CompletableFuture<Void> walClose;
-                    try {
-                        walClose = Objects.requireNonNull(
-                            walStorage.close(), "WAL close future");
-                    } catch (Throwable closeFailure) {
-                        scheduleWalCloseRetry(retryAttempt, closeFailure);
-                        return;
-                    }
-                    walClose.whenComplete((ignored, closeFailure) -> {
-                        if (closeFailure == null) {
-                            attemptFileStorageClose(0);
-                        } else {
-                            scheduleWalCloseRetry(
-                                retryAttempt, unwrapCompletionFailure(closeFailure));
-                        }
-                    });
+        private void closeWalStorage() {
+            CompletableFuture<Void> walClosed = new CompletableFuture<>();
+            EventualRetry.start(
+                executor, "closing the WAL after data-plane initialization failed",
+                () -> Objects.requireNonNull(walStorage.close(), "WAL close future"),
+                walClosed, this::recordCleanupFailure,
+                rejection -> {
+                    failRejectedCleanup(rejection, true);
+                    walClosed.completeExceptionally(rejection);
                 });
-            } catch (RejectedExecutionException rejection) {
-                scheduleWalCloseRetry(retryAttempt, rejection);
-            } catch (Throwable schedulingFailure) {
-                recordCleanupFailure(schedulingFailure);
-                completion.completeExceptionally(schedulingFailure);
-            }
+            walClosed.whenComplete((ignored, failure) -> {
+                if (failure == null) {
+                    closeFileStorage();
+                } else {
+                    completion.completeExceptionally(failure);
+                }
+            });
         }
 
-        private void attemptFileStorageClose(int retryAttempt) {
+        private void closeFileStorage() {
             if (fileStorage == null) {
                 completion.complete(null);
                 return;
             }
+            EventualRetry.start(
+                executor, "closing file storage after WAL cleanup",
+                () -> {
+                    fileStorage.close();
+                    return null;
+                },
+                completion, this::recordCleanupFailure,
+                rejection -> failRejectedCleanup(rejection, false));
+        }
+
+        /**
+         * A rejection while {@link #executor} has already been shut down (the owning
+         * {@link UrsaStorage} is closing) will never succeed on retry, unlike a transient
+         * "queue full" rejection. Give up and report failure instead of retrying forever
+         * against a permanently rejecting executor.
+         *
+         * <p>Nothing else will close the data plane afterwards, so both storages are closed
+         * here on the calling thread as a last resort. Their failures are only logged: the
+         * rejection is what the caller has to see.
+         *
+         * @param rejection the rejection that ended the retry chain
+         * @param walStillOpen whether the WAL close had not already succeeded
+         */
+        private void failRejectedCleanup(Throwable rejection, boolean walStillOpen) {
+            if (walStillOpen) {
+                closeWalStorageOnGiveUp();
+            }
+            closeFileStorageOnGiveUp();
+            recordCleanupFailure(rejection);
+            completion.completeExceptionally(rejection);
+        }
+
+        private void closeWalStorageOnGiveUp() {
             try {
-                FAILED_DATA_PLANE_CLOSE_EXECUTOR.execute(() -> {
-                    try {
-                        fileStorage.close();
-                        completion.complete(null);
-                    } catch (Throwable closeFailure) {
-                        scheduleFileStorageCloseRetry(retryAttempt, closeFailure);
-                    }
-                });
-            } catch (RejectedExecutionException rejection) {
-                scheduleFileStorageCloseRetry(retryAttempt, rejection);
-            } catch (Throwable schedulingFailure) {
-                recordCleanupFailure(schedulingFailure);
-                completion.completeExceptionally(schedulingFailure);
+                CompletableFuture<Void> walClose = walStorage.close();
+                if (walClose != null) {
+                    walClose.whenComplete((ignored, closeFailure) -> {
+                        if (closeFailure != null) {
+                            log.warn("Failed to close the WAL while giving up on data-plane "
+                                + "cleanup", closeFailure);
+                        }
+                    });
+                }
+            } catch (Throwable closeFailure) {
+                log.warn("Failed to close the WAL while giving up on data-plane cleanup",
+                    closeFailure);
             }
         }
 
-        private void scheduleWalCloseRetry(int retryAttempt, Throwable failure) {
-            recordCleanupFailure(failure);
-            int nextAttempt = nextRetryAttempt(retryAttempt);
-            long delayMillis = failedDataPlaneCloseRetryDelayMillis(retryAttempt);
-            log.warn("Failed to close WAL after data-plane initialization failure; "
-                    + "retrying in {} ms (attempt {})", delayMillis, nextAttempt, failure);
-            scheduleRetry(() -> attemptWalClose(nextAttempt), delayMillis, failure);
-        }
-
-        private void scheduleFileStorageCloseRetry(int retryAttempt, Throwable failure) {
-            recordCleanupFailure(failure);
-            int nextAttempt = nextRetryAttempt(retryAttempt);
-            long delayMillis = failedDataPlaneCloseRetryDelayMillis(retryAttempt);
-            log.warn("Failed to close file storage after WAL cleanup; "
-                    + "retrying in {} ms (attempt {})", delayMillis, nextAttempt, failure);
-            scheduleRetry(() -> attemptFileStorageClose(nextAttempt), delayMillis, failure);
-        }
-
-        private void scheduleRetry(Runnable retry, long delayMillis, Throwable failure) {
+        private void closeFileStorageOnGiveUp() {
+            if (fileStorage == null) {
+                return;
+            }
             try {
-                CompletableFuture.delayedExecutor(delayMillis, TimeUnit.MILLISECONDS)
-                    .execute(retry);
-            } catch (Throwable schedulingFailure) {
-                failure.addSuppressed(schedulingFailure);
-                recordCleanupFailure(schedulingFailure);
-                completion.completeExceptionally(failure);
+                fileStorage.close();
+            } catch (Throwable closeFailure) {
+                log.warn("Failed to close file storage while giving up on data-plane cleanup",
+                    closeFailure);
             }
         }
 
@@ -328,26 +353,6 @@ public class UrsaStorage implements AutoCloseable {
                 cleanupFailureRecorded = true;
             }
         }
-    }
-
-    private static int nextRetryAttempt(int retryAttempt) {
-        return retryAttempt == Integer.MAX_VALUE
-            ? Integer.MAX_VALUE : retryAttempt + 1;
-    }
-
-    private static long failedDataPlaneCloseRetryDelayMillis(int retryAttempt) {
-        int shift = Math.min(Math.max(retryAttempt, 0), 30);
-        long exponentialDelay = FAILED_DATA_PLANE_CLOSE_INITIAL_RETRY_MILLIS << shift;
-        return Math.min(exponentialDelay, FAILED_DATA_PLANE_CLOSE_MAX_RETRY_MILLIS);
-    }
-
-    private static Throwable unwrapCompletionFailure(Throwable failure) {
-        Throwable current = failure;
-        while ((current instanceof CompletionException || current instanceof ExecutionException)
-                && current.getCause() != null) {
-            current = current.getCause();
-        }
-        return current;
     }
 
     private static void addSuppressed(Throwable failure, Throwable closeFailure) {
@@ -438,6 +443,12 @@ public class UrsaStorage implements AutoCloseable {
             oxiaClientClosed = true;
         }
         resourcesClosed = true;
+        failedDataPlaneCloseExecutor.shutdown();
+    }
+
+    /** Test-only accessor for the instance-owned cleanup executor. */
+    ExecutorService failedDataPlaneCloseExecutorForTesting() {
+        return failedDataPlaneCloseExecutor;
     }
 
     private static void awaitWalClose(

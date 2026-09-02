@@ -9,8 +9,16 @@ package io.lakestream.api;
  *
  * <p>Catalog deployments can use different key prefixes for storing stream metadata in Oxia.
  * This interface keeps path construction separate from catalog behavior.
+ *
+ * <p>Reserved namespace segments: {@code _tombstones} holds permanent-deletion tombstones, just as
+ * {@code _tablecatalogs} holds registered table catalogs and {@code _namespaces} holds namespace
+ * records. A stream namespace must never be named after a reserved segment, or its streams would
+ * collide with those records.
  */
 public interface CatalogPaths {
+
+    /** Reserved namespace segment holding permanent-deletion tombstones. */
+    String TOMBSTONE_SEGMENT = "_tombstones";
 
     /**
      * Path for stream metadata.
@@ -75,6 +83,34 @@ public interface CatalogPaths {
      * @return the stream config scan prefix (e.g., "/admin/streams/default/")
      */
     String streamConfigPrefix(String namespace);
+
+    /**
+     * Prefix under which every permanent-deletion tombstone is stored.
+     *
+     * <p>The default places the reserved {@link #TOMBSTONE_SEGMENT} segment where a namespace would
+     * go, which keeps tombstones outside every real namespace's {@link #streamConfigPrefix(String)}
+     * while sharing the same root (e.g., "/admin/streams/_tombstones/").
+     *
+     * @return the tombstone scan prefix
+     */
+    default String streamTombstonePrefix() {
+        return streamConfigPrefix(TOMBSTONE_SEGMENT);
+    }
+
+    /**
+     * Key of the permanent-deletion tombstone for a stream identity.
+     *
+     * <p>Tombstones live outside {@link #streamConfigPrefix(String)} so listing a namespace never
+     * reads completed deletions. The default appends the identity below
+     * {@link #streamTombstonePrefix()}; the namespace is joined here rather than passed into
+     * {@code streamConfigPrefix}, which takes a single namespace name and not a multi-segment path.
+     *
+     * @param id the stream identifier
+     * @return the tombstone path (e.g., "/admin/streams/_tombstones/default/my-stream")
+     */
+    default String streamTombstonePath(StreamIdentifier id) {
+        return streamTombstonePrefix() + id.namespace() + "/" + id.name();
+    }
 
     /**
      * Name passed to the compacted-object reader factory for one stream log.

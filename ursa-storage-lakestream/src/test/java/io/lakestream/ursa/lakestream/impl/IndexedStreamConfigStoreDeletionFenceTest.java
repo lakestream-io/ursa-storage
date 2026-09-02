@@ -7,7 +7,9 @@ package io.lakestream.ursa.lakestream.impl;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -28,6 +30,7 @@ import io.lakestream.api.exception.AlreadyExistsException;
 import io.lakestream.api.exception.NoSuchStreamException;
 import io.lakestream.api.exception.StreamPermanentlyDeletedException;
 import io.lakestream.api.materialization.TableMaterializationPolicy;
+import io.lakestream.ursa.lakestream.impl.FakeOxiaRecord.VersionedValue;
 import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.GetResult;
 import io.oxia.client.api.PutResult;
@@ -51,6 +54,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -58,8 +62,8 @@ import org.mockito.junit.jupiter.MockitoExtension;
 class IndexedStreamConfigStoreDeletionFenceTest {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
-    private static final Version VERSION_1 = version(1);
-    private static final Version VERSION_2 = version(2);
+    private static final Version VERSION_1 = FakeOxiaRecord.version(1);
+    private static final Version VERSION_2 = FakeOxiaRecord.version(2);
 
     @Mock
     private AsyncOxiaClient oxiaClient;
@@ -68,6 +72,7 @@ class IndexedStreamConfigStoreDeletionFenceTest {
     private IndexedStreamConfigStore store;
     private DefaultCatalogPaths paths;
     private String configPath;
+    private String tombstonePath;
 
     @BeforeEach
     void setUp() {
@@ -75,6 +80,11 @@ class IndexedStreamConfigStoreDeletionFenceTest {
         id = new StreamIdentifier("public/default", "orders-topic-id");
         store = new IndexedStreamConfigStore(oxiaClient, paths);
         configPath = paths.streamConfigPath(id);
+        tombstonePath = paths.streamTombstonePath(id);
+        // Records that a test does not stub explicitly are absent, including the tombstone the
+        // config store now consults whenever the config record is missing.
+        lenient().when(oxiaClient.get(anyString()))
+            .thenReturn(CompletableFuture.completedFuture(null));
     }
 
     @Test
@@ -109,6 +119,55 @@ class IndexedStreamConfigStoreDeletionFenceTest {
         ArgumentCaptor<byte[]> write = ArgumentCaptor.forClass(byte[].class);
         verify(oxiaClient).put(eq(configPath), write.capture(), eq(createOnly));
         assertThat(json(write.getValue()).path("_ownerGeneration").asLong()).isEqualTo(1L);
+    }
+
+    @Test
+    void creationClaimIsRolledBackWhenTheDeletionFenceLandsDuringTheWrite() {
+        Set<PutOption> createOnly = Set.of(PutOption.IfRecordDoesNotExist);
+        byte[] tombstone = streamConfigBytes(
+            0, Map.of(), "dropped-incarnation", "drop-owner", 2L, "create-owner", 1L,
+            IndexedStreamConfigStore.CreationKind.NATIVE_CREATE,
+            IndexedStreamConfigStore.ProvisioningState.DROPPED);
+        when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(null));
+        // The fence is absent when creation checks it and present by the time the claim lands.
+        when(oxiaClient.get(tombstonePath))
+            .thenReturn(CompletableFuture.completedFuture(null))
+            .thenReturn(CompletableFuture.completedFuture(
+                new GetResult(tombstonePath, tombstone, VERSION_2)));
+        when(oxiaClient.put(eq(configPath), any(byte[].class), eq(createOnly)))
+            .thenReturn(CompletableFuture.completedFuture(
+                new PutResult(configPath, VERSION_1)));
+        when(oxiaClient.delete(eq(configPath), any()))
+            .thenReturn(CompletableFuture.completedFuture(true));
+
+        assertThatThrownBy(() ->
+                store.claimCreation(id, 1, Map.of(), Optional.empty(), "attempt").join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(StreamPermanentlyDeletedException.class);
+
+        verify(oxiaClient).delete(configPath,
+            Set.of(DeleteOption.IfVersionIdEquals(VERSION_1.versionId())));
+        verify(oxiaClient, times(2)).get(tombstonePath);
+    }
+
+    @Test
+    void creationClaimRevalidatesTheDeletionFenceOnceAfterWriting() {
+        Set<PutOption> createOnly = Set.of(PutOption.IfRecordDoesNotExist);
+        when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(null));
+        when(oxiaClient.put(eq(configPath), any(byte[].class), eq(createOnly)))
+            .thenReturn(CompletableFuture.completedFuture(
+                new PutResult(configPath, VERSION_1)));
+
+        IndexedStreamConfigStore.ProvisioningClaim claim = store.claimCreation(
+            id, 1, Map.of(), Optional.empty(), "attempt").join();
+
+        assertThat(claim.versionId()).isEqualTo(VERSION_1.versionId());
+        InOrder order = inOrder(oxiaClient);
+        order.verify(oxiaClient).get(tombstonePath);
+        order.verify(oxiaClient).put(eq(configPath), any(byte[].class), eq(createOnly));
+        order.verify(oxiaClient).get(tombstonePath);
+        verify(oxiaClient, times(2)).get(tombstonePath);
+        verify(oxiaClient, never()).delete(eq(configPath), any());
     }
 
     @Test
@@ -307,22 +366,6 @@ class IndexedStreamConfigStoreDeletionFenceTest {
     }
 
     @Test
-    void activeSnapshotVerificationRejectsSameLifecycleAtNewVersion() {
-        when(oxiaClient.get(configPath))
-            .thenReturn(CompletableFuture.completedFuture(
-                nativeActive(VERSION_1, 1, "owner", 1L, Map.of())))
-            .thenReturn(CompletableFuture.completedFuture(
-                nativeActive(VERSION_2, 2, "owner", 1L, Map.of())));
-
-        IndexedStreamConfigStore.ActiveStreamConfig snapshot =
-            store.readActive(id).join();
-
-        assertThatThrownBy(() -> store.verifyActiveOwnership(id, snapshot).join())
-            .isInstanceOf(CompletionException.class)
-            .hasCauseInstanceOf(NoSuchStreamException.class);
-    }
-
-    @Test
     void conflictingConfigUpdateWaitsForAsynchronousRetryAndThenSucceeds() {
         List<Long> backoffs = new ArrayList<>();
         CompletableFuture<Void> retryGate = new CompletableFuture<>();
@@ -342,7 +385,7 @@ class IndexedStreamConfigStoreDeletionFenceTest {
         when(oxiaClient.put(eq(configPath), any(byte[].class),
                 eq(Set.of(PutOption.IfVersionIdEquals(VERSION_2.versionId())))))
             .thenReturn(CompletableFuture.completedFuture(
-                new PutResult(configPath, version(3))));
+                new PutResult(configPath, FakeOxiaRecord.version(3))));
 
         CompletableFuture<Void> update = store.setProperties(id, Map.of("tier", "hot"));
 
@@ -479,7 +522,7 @@ class IndexedStreamConfigStoreDeletionFenceTest {
                 "\"text\"".getBytes(StandardCharsets.UTF_8),
                 "null".getBytes(StandardCharsets.UTF_8))) {
             current.set(invalid);
-            assertThatThrownBy(() -> store.read(id).join())
+            assertThatThrownBy(() -> store.readActive(id).join())
                 .isInstanceOf(CompletionException.class)
                 .hasRootCauseInstanceOf(IllegalArgumentException.class);
             assertThatThrownBy(() -> store.exists(id).join())
@@ -518,23 +561,23 @@ class IndexedStreamConfigStoreDeletionFenceTest {
                 1, Map.of("state", "active"), "active-incarnation", "active-owner", 1L,
                 IndexedStreamConfigStore.NO_METADATA_GENERATION,
                 IndexedStreamConfigStore.CreationKind.NATIVE_CREATE,
-                IndexedStreamConfigStore.ProvisioningState.ACTIVE), version(10))));
+                IndexedStreamConfigStore.ProvisioningState.ACTIVE), FakeOxiaRecord.version(10))));
         when(oxiaClient.get(creatingKey)).thenReturn(CompletableFuture.completedFuture(
             new GetResult(creatingKey, streamConfigBytes(
                 1, Map.of("state", "creating"), "creating-incarnation", "creating-owner", 1L,
                 IndexedStreamConfigStore.NO_METADATA_GENERATION,
                 IndexedStreamConfigStore.CreationKind.NATIVE_CREATE,
-                IndexedStreamConfigStore.ProvisioningState.PROVISIONING), version(11))));
+                IndexedStreamConfigStore.ProvisioningState.PROVISIONING), FakeOxiaRecord.version(11))));
         when(oxiaClient.get(deletingKey)).thenReturn(CompletableFuture.completedFuture(
             new GetResult(deletingKey, streamConfigBytes(
                 1, Map.of("state", "deleting"), "deleting-incarnation", "delete-owner", 2L,
                 "create-owner", 1L, IndexedStreamConfigStore.CreationKind.NATIVE_CREATE,
-                IndexedStreamConfigStore.ProvisioningState.ABORTING), version(12))));
+                IndexedStreamConfigStore.ProvisioningState.ABORTING), FakeOxiaRecord.version(12))));
         when(oxiaClient.get(droppedKey)).thenReturn(CompletableFuture.completedFuture(
             new GetResult(droppedKey, streamConfigBytes(
                 1, Map.of("state", "dropped"), "dropped-incarnation", "delete-owner", 2L,
                 "create-owner", 1L, IndexedStreamConfigStore.CreationKind.NATIVE_CREATE,
-                IndexedStreamConfigStore.ProvisioningState.DROPPED), version(13))));
+                IndexedStreamConfigStore.ProvisioningState.DROPPED), FakeOxiaRecord.version(13))));
         when(oxiaClient.get(disappearedKey)).thenReturn(CompletableFuture.completedFuture(null));
 
         List<StreamCatalogEntry> entries = store.listStreamEntries(id.namespace()).join();
@@ -591,6 +634,8 @@ class IndexedStreamConfigStoreDeletionFenceTest {
             + "\"_creationKind\":\"NATIVE_CREATE\"}")
             .getBytes(StandardCharsets.UTF_8);
         AtomicReference<VersionedValue> state = mockVersionedRecord(activeConfig);
+        AtomicReference<VersionedValue> tombstone =
+            mockVersionedRecord(tombstonePath, null);
 
         IndexedStreamConfigStore.DropClaim stale =
             store.beginDrop(id, "drop-a").join().orElseThrow();
@@ -621,8 +666,9 @@ class IndexedStreamConfigStoreDeletionFenceTest {
 
         store.verifyAbortingOwnership(id, current).join();
         store.completeDrop(id, current).join();
-        assertThat(state.get()).isNotNull();
-        assertThat(json(state.get().value()).path("_provisioningState").asText())
+        assertThat(state.get()).isNull();
+        assertThat(tombstone.get()).isNotNull();
+        assertThat(json(tombstone.get().value()).path("_provisioningState").asText())
             .isEqualTo("DROPPED");
         assertThat(store.exists(id).join()).isFalse();
     }
@@ -636,6 +682,8 @@ class IndexedStreamConfigStoreDeletionFenceTest {
             + "\"_creationKind\":\"NATIVE_CREATE\"}")
             .getBytes(StandardCharsets.UTF_8);
         AtomicReference<VersionedValue> state = mockVersionedRecord(activeConfig);
+        AtomicReference<VersionedValue> tombstone =
+            mockVersionedRecord(tombstonePath, null);
 
         IndexedStreamConfigStore.DropClaim first =
             store.beginDrop(id, "drop-a", true).join().orElseThrow();
@@ -646,7 +694,8 @@ class IndexedStreamConfigStoreDeletionFenceTest {
         assertThat(takeover.config().purgeRequested()).isTrue();
         store.completeDrop(id, takeover).join();
 
-        assertThat(json(state.get().value()).path("_purgeRequested").asBoolean())
+        assertThat(state.get()).isNull();
+        assertThat(json(tombstone.get().value()).path("_purgeRequested").asBoolean())
             .isTrue();
         IndexedStreamConfigStore.CompletedDrop completed =
             store.readCompletedPurgingDrop(id).join().orElseThrow();
@@ -769,9 +818,12 @@ class IndexedStreamConfigStoreDeletionFenceTest {
             new IndexedStreamConfigStore.DropClaim(
                 aborting, "drop-owner", VERSION_1.versionId());
         RuntimeException writeFailure = new RuntimeException("drop completion failed");
-        Set<PutOption> expectedVersion =
-            Set.of(PutOption.IfVersionIdEquals(VERSION_1.versionId()));
-        when(oxiaClient.put(eq(configPath), any(byte[].class), eq(expectedVersion)))
+        when(oxiaClient.put(eq(tombstonePath), any(byte[].class),
+                eq(Set.of(PutOption.IfRecordDoesNotExist))))
+            .thenReturn(CompletableFuture.completedFuture(
+                new PutResult(tombstonePath, VERSION_1)));
+        when(oxiaClient.delete(eq(configPath), eq(Set.of(
+                DeleteOption.IfVersionIdEquals(VERSION_1.versionId())))))
             .thenReturn(CompletableFuture.failedFuture(writeFailure));
         when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(
             aborting(VERSION_1, "drop-owner")));
@@ -820,6 +872,231 @@ class IndexedStreamConfigStoreDeletionFenceTest {
         assertThat(outcome.active()).isFalse();
         assertThat(outcome.failure()).isSameAs(ambiguous);
         assertThat(ambiguous.getSuppressed()).contains(readFailure);
+    }
+
+    @Test
+    void resumedProvisioningClaimIsRolledBackWhenTheIdentityIsAlreadyTombstoned() {
+        when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(
+            provisioning(VERSION_1, "attempt-1")));
+        when(oxiaClient.get(tombstonePath)).thenReturn(CompletableFuture.completedFuture(
+            new GetResult(tombstonePath, completedDropBytes(1), VERSION_2)));
+        when(oxiaClient.delete(eq(configPath), any()))
+            .thenReturn(CompletableFuture.completedFuture(true));
+
+        assertThatThrownBy(() -> store.claimCreation(
+                id, 1, Map.of(), Optional.empty(), "attempt-2").join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(StreamPermanentlyDeletedException.class);
+
+        verify(oxiaClient).delete(configPath,
+            Set.of(DeleteOption.IfVersionIdEquals(VERSION_1.versionId())));
+        verify(oxiaClient, never()).put(eq(configPath), any(byte[].class), any());
+    }
+
+    @Test
+    void fencedClaimRollbackToleratesAVersionMismatchOnTheOrphanedRecord() {
+        Set<PutOption> createOnly = Set.of(PutOption.IfRecordDoesNotExist);
+        when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(null));
+        when(oxiaClient.get(tombstonePath))
+            .thenReturn(CompletableFuture.completedFuture(null))
+            .thenReturn(CompletableFuture.completedFuture(
+                new GetResult(tombstonePath, completedDropBytes(1), VERSION_2)));
+        when(oxiaClient.put(eq(configPath), any(byte[].class), eq(createOnly)))
+            .thenReturn(CompletableFuture.completedFuture(
+                new PutResult(configPath, VERSION_1)));
+        when(oxiaClient.delete(eq(configPath), any()))
+            .thenReturn(CompletableFuture.failedFuture(
+                new UnexpectedVersionIdException(configPath, VERSION_1.versionId())));
+
+        assertThatThrownBy(() -> store.claimCreation(
+                id, 1, Map.of(), Optional.empty(), "attempt").join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(StreamPermanentlyDeletedException.class)
+            .cause()
+            // A version mismatch means the record already moved on; the fence still stands, so
+            // the rollback is not worth reporting as a secondary failure.
+            .satisfies(fenced -> assertThat(fenced.getSuppressed()).isEmpty());
+    }
+
+    @Test
+    void readActivePrefersPermanentDeletionForANonActiveRecord() {
+        when(oxiaClient.get(configPath))
+            .thenReturn(CompletableFuture.completedFuture(aborting(VERSION_1, "drop-owner")))
+            .thenReturn(CompletableFuture.completedFuture(
+                provisioning(VERSION_1, "create-owner")));
+        when(oxiaClient.get(tombstonePath)).thenReturn(CompletableFuture.completedFuture(
+            new GetResult(tombstonePath, completedDropBytes(1), VERSION_2)));
+
+        assertThatThrownBy(() -> store.readActive(id).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(StreamPermanentlyDeletedException.class);
+        assertThatThrownBy(() -> store.readActive(id).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(StreamPermanentlyDeletedException.class);
+    }
+
+    @Test
+    void readActiveNeverReadsTheTombstoneForAnActiveRecord() {
+        when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(
+            nativeActive(VERSION_1, 1, "owner", 1L, Map.of())));
+
+        store.readActive(id).join();
+
+        verify(oxiaClient, never()).get(tombstonePath);
+    }
+
+    @Test
+    void creationPrefersPermanentDeletionOverAnAbortingRecord() {
+        when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(
+            aborting(VERSION_1, "drop-owner")));
+        when(oxiaClient.get(tombstonePath)).thenReturn(CompletableFuture.completedFuture(
+            new GetResult(tombstonePath, completedDropBytes(1), VERSION_2)));
+
+        assertThatThrownBy(() -> store.ensureCreatable(id).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(StreamPermanentlyDeletedException.class);
+        assertThatThrownBy(() -> store.claimCreation(
+                id, 1, Map.of(), Optional.empty(), "attempt").join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(StreamPermanentlyDeletedException.class);
+        verify(oxiaClient, never()).put(eq(configPath), any(byte[].class), any());
+    }
+
+    @Test
+    void creationStillReportsAlreadyExistsForAnAbortingRecordWithoutATombstone() {
+        when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(
+            aborting(VERSION_1, "drop-owner")));
+
+        assertThatThrownBy(() -> store.ensureCreatable(id).join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(AlreadyExistsException.class);
+        assertThatThrownBy(() -> store.claimCreation(
+                id, 1, Map.of(), Optional.empty(), "attempt").join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(AlreadyExistsException.class);
+    }
+
+    @Test
+    void completeDropUpgradesTheEmptyTombstoneLeftByAnAbsentStreamDrop() {
+        AtomicReference<VersionedValue> config = mockVersionedRecord(configPath, null);
+        AtomicReference<VersionedValue> tombstone =
+            mockVersionedRecord(tombstonePath, null);
+
+        // Dropping an identity whose config record is absent fences it with a zero-partition
+        // tombstone that carries no partitions to clean up.
+        assertThat(store.beginDrop(id, "drop-a").join()).isEmpty();
+        assertThat(json(tombstone.get().value()).path("partitions").asInt()).isZero();
+
+        // The real stream turns up afterwards and is dropped for real.
+        config.set(new VersionedValue(activeConfigBytes(3), VERSION_1));
+        IndexedStreamConfigStore.DropClaim claim =
+            store.beginDrop(id, "drop-b").join().orElseThrow();
+        assertThat(claim.config().partitions()).isEqualTo(3);
+        store.completeDrop(id, claim).join();
+
+        assertThat(config.get()).isNull();
+        assertThat(json(tombstone.get().value()).path("partitions").asInt()).isEqualTo(3);
+        assertThat(json(tombstone.get().value()).path("_provisioningState").asText())
+            .isEqualTo("DROPPED");
+        IndexedStreamConfigStore.CompletedDrop completed =
+            store.readCompletedDrop(id).join().orElseThrow();
+        assertThat(completed.config().partitions()).isEqualTo(3);
+        store.verifyCompletedDrop(id, completed).join();
+    }
+
+    @Test
+    void completeDropKeepsAPurgeRequestedByTheEmptyTombstone() {
+        AtomicReference<VersionedValue> config = mockVersionedRecord(configPath, null);
+        AtomicReference<VersionedValue> tombstone =
+            mockVersionedRecord(tombstonePath, null);
+
+        assertThat(store.beginDrop(id, "drop-a", true).join()).isEmpty();
+        config.set(new VersionedValue(activeConfigBytes(2), VERSION_1));
+        IndexedStreamConfigStore.DropClaim claim =
+            store.beginDrop(id, "drop-b", false).join().orElseThrow();
+        store.completeDrop(id, claim).join();
+
+        assertThat(json(tombstone.get().value()).path("partitions").asInt()).isEqualTo(2);
+        assertThat(json(tombstone.get().value()).path("_purgeRequested").asBoolean()).isTrue();
+    }
+
+    @Test
+    void absentStreamPurgeUpgradeRereadsTheConfigRecordBeforeRetrying() {
+        List<Long> backoffs = new ArrayList<>();
+        CompletableFuture<Void> retryGate = new CompletableFuture<>();
+        store = new IndexedStreamConfigStore(oxiaClient, paths, delayMillis -> {
+            backoffs.add(delayMillis);
+            return retryGate;
+        });
+        AtomicReference<VersionedValue> config = mockVersionedRecord(configPath, null);
+        when(oxiaClient.put(eq(tombstonePath), any(byte[].class),
+                eq(Set.of(PutOption.IfRecordDoesNotExist))))
+            .thenReturn(CompletableFuture.failedFuture(
+                new KeyAlreadyExistsException(tombstonePath)));
+        // The conflicting tombstone is gone by the time the purge upgrade reads it back.
+        when(oxiaClient.get(tombstonePath))
+            .thenReturn(CompletableFuture.completedFuture(null));
+
+        CompletableFuture<Optional<IndexedStreamConfigStore.DropClaim>> drop =
+            store.beginDrop(id, "drop-owner", true);
+
+        assertThat(drop).isNotDone();
+        assertThat(backoffs).containsExactly(
+            IndexedStreamConfigStore.INITIAL_RETRY_BACKOFF_MILLIS);
+        // A creation wins the race for the identity while the purge upgrade waits to retry.
+        config.set(new VersionedValue(activeConfigBytes(3), VERSION_1));
+        retryGate.complete(null);
+
+        IndexedStreamConfigStore.DropClaim claim = drop.join().orElseThrow();
+        assertThat(claim.config().partitions()).isEqualTo(3);
+        assertThat(claim.config().purgeRequested()).isTrue();
+        verify(oxiaClient, times(1)).put(eq(tombstonePath), any(byte[].class),
+            eq(Set.of(PutOption.IfRecordDoesNotExist)));
+    }
+
+    @Test
+    void absentStreamPurgeUpgradeEscalatesItsBackoffAndGivesUpAtTheRetryLimit() {
+        List<Long> backoffs = new ArrayList<>();
+        store = new IndexedStreamConfigStore(oxiaClient, paths, delayMillis -> {
+            backoffs.add(delayMillis);
+            return CompletableFuture.completedFuture(null);
+        });
+        when(oxiaClient.put(eq(tombstonePath), any(byte[].class),
+                eq(Set.of(PutOption.IfRecordDoesNotExist))))
+            .thenReturn(CompletableFuture.failedFuture(
+                new KeyAlreadyExistsException(tombstonePath)));
+        // The conflicting fence is gone again every time the purge upgrade reads it back, so each
+        // attempt loses the same race and has to carry its retry count into the next one.
+        when(oxiaClient.get(tombstonePath))
+            .thenReturn(CompletableFuture.completedFuture(null));
+
+        assertThatThrownBy(() -> store.beginDrop(id, "drop-owner", true).join())
+            .isInstanceOf(CompletionException.class)
+            .hasRootCauseInstanceOf(KeyAlreadyExistsException.class);
+
+        assertThat(backoffs).containsExactly(
+            IndexedStreamConfigStore.INITIAL_RETRY_BACKOFF_MILLIS,
+            IndexedStreamConfigStore.INITIAL_RETRY_BACKOFF_MILLIS << 1,
+            IndexedStreamConfigStore.INITIAL_RETRY_BACKOFF_MILLIS << 2);
+        verify(oxiaClient, times(IndexedStreamConfigStore.MAX_CONFIG_WRITE_RETRIES + 1))
+            .put(eq(tombstonePath), any(byte[].class),
+                eq(Set.of(PutOption.IfRecordDoesNotExist)));
+    }
+
+    private static byte[] activeConfigBytes(int partitions) {
+        return ("{\"partitions\":" + partitions + ",\"properties\":{},"
+            + "\"_incarnationId\":\"incarnation\","
+            + "\"_ownerToken\":\"create-owner\","
+            + "\"_ownerGeneration\":1,"
+            + "\"_creationKind\":\"NATIVE_CREATE\"}")
+            .getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static byte[] completedDropBytes(int partitions) {
+        return streamConfigBytes(
+            partitions, Map.of(), "dropped-incarnation", "drop-owner", 2L, "create-owner", 1L,
+            IndexedStreamConfigStore.CreationKind.NATIVE_CREATE,
+            IndexedStreamConfigStore.ProvisioningState.DROPPED);
     }
 
     private GetResult provisioning(Version version, String attempt) {
@@ -952,15 +1229,6 @@ class IndexedStreamConfigStoreDeletionFenceTest {
                 IndexedStreamConfigStore.ProvisioningOwnershipLostException.class);
     }
 
-    private static void assertMetadataSourceOwner(
-            byte[] value, String expectedOwnerToken, long expectedGeneration) {
-        JsonNode config = json(value);
-        assertThat(config.path("_metadataSourceOwnerToken").asText())
-            .isEqualTo(expectedOwnerToken);
-        assertThat(config.path("_metadataSourceGeneration").asLong())
-            .isEqualTo(expectedGeneration);
-    }
-
     private InitialClaimRace mockInitiallyAbsentClaimRace() {
         Set<PutOption> createOnly = Set.of(PutOption.IfRecordDoesNotExist);
         List<CompletableFuture<GetResult>> initialReads = List.of(
@@ -998,7 +1266,7 @@ class IndexedStreamConfigStoreDeletionFenceTest {
                             configPath, current == null
                                 ? -1L : current.version().versionId()));
                 }
-                Version next = version(current.version().versionId() + 1L);
+                Version next = FakeOxiaRecord.version(current.version().versionId() + 1L);
                 state.set(new VersionedValue(value.clone(), next));
                 return CompletableFuture.completedFuture(new PutResult(configPath, next));
             });
@@ -1035,7 +1303,7 @@ class IndexedStreamConfigStoreDeletionFenceTest {
                         new UnexpectedVersionIdException(
                             configPath, current.version().versionId()));
                 }
-                Version next = version(nextVersion.incrementAndGet());
+                Version next = FakeOxiaRecord.version(nextVersion.incrementAndGet());
                 byte[] value = invocation.getArgument(1, byte[].class);
                 state.set(new VersionedValue(value.clone(), next));
                 return CompletableFuture.completedFuture(new PutResult(configPath, next));
@@ -1044,46 +1312,28 @@ class IndexedStreamConfigStoreDeletionFenceTest {
     }
 
     private AtomicReference<VersionedValue> mockVersionedRecord(byte[] initialValue) {
-        AtomicReference<VersionedValue> state = new AtomicReference<>(
-            new VersionedValue(initialValue.clone(), VERSION_1));
-        AtomicLong nextVersion = new AtomicLong(VERSION_1.versionId());
-        lenient().when(oxiaClient.get(configPath)).thenAnswer(ignored -> {
-            VersionedValue current = state.get();
-            return CompletableFuture.completedFuture(current == null ? null
-                : new GetResult(configPath, current.value(), current.version()));
-        });
-        lenient().when(oxiaClient.put(eq(configPath), any(byte[].class), any()))
-            .thenAnswer(invocation -> {
-                @SuppressWarnings("unchecked")
-                Set<PutOption> options = invocation.getArgument(2, Set.class);
-                VersionedValue current = state.get();
-                if (current == null || !options.contains(
-                        PutOption.IfVersionIdEquals(current.version().versionId()))) {
-                    return CompletableFuture.failedFuture(
-                        new UnexpectedVersionIdException(
-                            configPath, current == null
-                                ? -1L : current.version().versionId()));
-                }
-                Version next = version(nextVersion.incrementAndGet());
-                byte[] value = invocation.getArgument(1, byte[].class);
-                state.set(new VersionedValue(value.clone(), next));
-                return CompletableFuture.completedFuture(new PutResult(configPath, next));
-            });
-        lenient().when(oxiaClient.delete(eq(configPath), any())).thenAnswer(invocation -> {
-            @SuppressWarnings("unchecked")
-            Set<DeleteOption> options = invocation.getArgument(1, Set.class);
-            VersionedValue current = state.get();
-            if (current == null || !options.contains(
-                    DeleteOption.IfVersionIdEquals(current.version().versionId()))) {
-                return CompletableFuture.completedFuture(false);
-            }
-            state.set(null);
-            return CompletableFuture.completedFuture(true);
-        });
-        return state;
+        return mockVersionedRecord(configPath, initialValue);
     }
 
-    private record VersionedValue(byte[] value, Version version) {
+    private AtomicReference<VersionedValue> mockVersionedRecord(
+            String path, byte[] initialValue) {
+        FakeOxiaRecord record =
+            new FakeOxiaRecord(path, initialValue, VERSION_1.versionId());
+        lenient().when(oxiaClient.get(path))
+            .thenAnswer(ignored -> CompletableFuture.completedFuture(record.applyGet()));
+        lenient().when(oxiaClient.put(eq(path), any(byte[].class), any()))
+            .thenAnswer(invocation -> {
+                byte[] value = invocation.getArgument(1, byte[].class);
+                @SuppressWarnings("unchecked")
+                Set<PutOption> options = invocation.getArgument(2, Set.class);
+                return FakeOxiaRecord.settle(() -> record.applyPut(value, options));
+            });
+        lenient().when(oxiaClient.delete(eq(path), any())).thenAnswer(invocation -> {
+            @SuppressWarnings("unchecked")
+            Set<DeleteOption> options = invocation.getArgument(1, Set.class);
+            return FakeOxiaRecord.settle(() -> record.applyDelete(options));
+        });
+        return record.state();
     }
 
     private record InitialClaimRace(
@@ -1106,7 +1356,4 @@ class IndexedStreamConfigStoreDeletionFenceTest {
         }
     }
 
-    private static Version version(long id) {
-        return new Version(id, 0, 0, 0, Optional.empty(), Optional.empty());
-    }
 }

@@ -6,6 +6,7 @@ package io.lakestream.ursa.storage;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTimeout;
@@ -46,14 +47,32 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
 
 class UrsaStorageLazyInitializationTest {
+
+    /** The executor the failed-data-plane cleanup runs on; one per test, torn down after it. */
+    private ExecutorService cleanupExecutor;
+
+    @BeforeEach
+    void startCleanupExecutor() {
+        cleanupExecutor = Executors.newSingleThreadExecutor();
+    }
+
+    @AfterEach
+    void stopCleanupExecutor() {
+        cleanupExecutor.shutdownNow();
+    }
 
     @Test
     void metadataFacadeAndCloseDoNotInitializeDataPlane() throws Exception {
@@ -465,7 +484,7 @@ class UrsaStorageLazyInitializationTest {
         assertTimeout(Duration.ofSeconds(2), () ->
             UrsaStorage.closeDataPlaneAfterFailure(
                 fileStorage, walStorage, initializationFailure,
-                Duration.ofMillis(100)));
+                Duration.ofMillis(100), cleanupExecutor));
 
         verify(walStorage).close();
         verify(fileStorage, never()).close();
@@ -496,7 +515,7 @@ class UrsaStorageLazyInitializationTest {
         assertTimeout(Duration.ofSeconds(2), () ->
             UrsaStorage.closeDataPlaneAfterFailure(
                 fileStorage, walStorage, initializationFailure,
-                Duration.ofSeconds(1)));
+                Duration.ofSeconds(1), cleanupExecutor));
 
         InOrder closeOrder = inOrder(walStorage, fileStorage);
         closeOrder.verify(walStorage, times(2)).close();
@@ -520,13 +539,55 @@ class UrsaStorageLazyInitializationTest {
         assertTimeout(Duration.ofSeconds(2), () ->
             UrsaStorage.closeDataPlaneAfterFailure(
                 fileStorage, walStorage, initializationFailure,
-                Duration.ofSeconds(1)));
+                Duration.ofSeconds(1), cleanupExecutor));
 
         InOrder closeOrder = inOrder(walStorage, fileStorage);
         closeOrder.verify(walStorage, times(2)).close();
         closeOrder.verify(fileStorage).close();
         assertEquals(1, initializationFailure.getSuppressed().length);
         assertSame(closeFailure, initializationFailure.getSuppressed()[0]);
+    }
+
+    @Test
+    void failedDataPlaneCleanupStopsRetryingOnceStorageCloseShutsDownExecutor()
+            throws Exception {
+        AsyncOxiaClient oxiaClient = mock(AsyncOxiaClient.class);
+        UrsaStorage.DataPlaneFactory dataPlaneFactory =
+            mock(UrsaStorage.DataPlaneFactory.class);
+        UrsaStorage storage = new UrsaStorage(
+            config("LOCAL"), OpenTelemetry.noop(), oxiaClient, dataPlaneFactory);
+
+        FileStorage fileStorage = mock(FileStorage.class);
+        WalStorage walStorage = mock(WalStorage.class);
+        IllegalStateException closeFailure =
+            new IllegalStateException("perpetually failing WAL close");
+        when(walStorage.close()).thenThrow(closeFailure);
+        IllegalStateException initializationFailure =
+            new IllegalStateException("injected initialization failure");
+
+        // Start a failed-data-plane cleanup directly against the storage's own executor, using
+        // the package-private test hooks (the cleanup never reaches this executor through
+        // dataPlaneFactory, since that is mocked). The WAL close fails on every attempt, so a
+        // retry is scheduled via the executor before the storage is closed.
+        CompletableFuture<Void> cleanupCompletion =
+            UrsaStorage.startFailedDataPlaneCleanupForTesting(
+                fileStorage, walStorage, initializationFailure,
+                storage.failedDataPlaneCloseExecutorForTesting());
+
+        verify(walStorage, timeout(5000).atLeastOnce()).close();
+        assertFalse(cleanupCompletion.isDone());
+
+        storage.close();
+
+        // Before the fix this future never completed: the scheduled retry kept hitting
+        // RejectedExecutionException from the now-shut-down executor and rescheduling itself
+        // forever. Bounding the wait turns "would hang forever" into a clear test failure.
+        ExecutionException rejected = assertThrows(ExecutionException.class,
+            () -> cleanupCompletion.get(5, TimeUnit.SECONDS));
+        assertInstanceOf(RejectedExecutionException.class, rejected.getCause());
+        // Nothing else will close the data plane once the retry chain gives up, so the give-up
+        // branch closes both storages itself before reporting the rejection.
+        verify(fileStorage).close();
     }
 
     @Test

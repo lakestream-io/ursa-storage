@@ -119,6 +119,10 @@ public record TableMaterializationPolicy(
      * <p>The helper is pure: all I/O (catalog lookup) is delegated through the
      * {@code catalogLookup} callback.
      *
+     * <p>Equivalent to {@link #resolve(Optional, Optional, StreamIdentifier, Function, Map)}
+     * with no stream properties available; a namespace {@link TableNaming} template
+     * referencing {@code ${stream.property.<key>}} is therefore rejected.
+     *
      * @param namespacePolicy the namespace baseline (may be empty)
      * @param streamPolicy    the stream override (may be empty)
      * @param streamId        the stream being resolved (used for template interpolation)
@@ -132,10 +136,59 @@ public record TableMaterializationPolicy(
             Optional<TableMaterializationPolicy> streamPolicy,
             StreamIdentifier streamId,
             Function<String, Optional<TableCatalog>> catalogLookup) {
+        return resolve(namespacePolicy, streamPolicy, streamId, catalogLookup, Map.of());
+    }
+
+    /**
+     * Resolves the effective materialization for {@code streamId} by deep-merging
+     * the namespace and stream policies, looking up the referenced catalog via
+     * {@code catalogLookup}, and deriving the table identifier from the
+     * stream's explicit override (preferred) or from the namespace's
+     * {@link TableNaming} template applied together with {@code properties}.
+     *
+     * <p>Merge rules (stream wins, namespace as baseline):
+     * <ul>
+     *   <li>{@code enabled}: if {@code streamPolicy.enabled() == Optional.of(false)},
+     *       the stream short-circuits with {@link Optional#empty()}.
+     *       Namespace {@code enabled} is intentionally ignored.</li>
+     *   <li>{@code catalogRef}: stream-over-namespace; required for resolution.</li>
+     *   <li>{@code tableIdentifier}: stream's explicit value wins; otherwise the
+     *       namespace's {@link TableNaming} is applied to {@code streamId} and
+     *       {@code properties}.</li>
+     *   <li>Sub-records ({@code framework}, {@code evolution}, {@code table}):
+     *       merged field-by-field with stream-over-namespace semantics.</li>
+     *   <li>{@code primaryKey} / {@code partitionBy} / {@code sortBy}: stream's
+     *       list <em>replaces</em> namespace's (no concatenation).</li>
+     *   <li>{@code connectionOverrides}: stream-only; namespace's is ignored.</li>
+     *   <li>{@code tableNaming}: namespace-only; preserved on the effective
+     *       policy for inspection.</li>
+     * </ul>
+     *
+     * <p>The helper is pure: all I/O (catalog lookup) is delegated through the
+     * {@code catalogLookup} callback.
+     *
+     * @param namespacePolicy the namespace baseline (may be empty)
+     * @param streamPolicy    the stream override (may be empty)
+     * @param streamId        the stream being resolved (used for template interpolation)
+     * @param catalogLookup   callback returning the named {@link TableCatalog}, or empty
+     * @param properties      the stream's properties, consulted by the namespace's
+     *                        {@link TableNaming} template for {@code ${stream.property.<key>}}
+     *                        variables
+     * @return the resolved materialization, or {@link Optional#empty()} if the
+     *     stream is not materialized (disabled, no catalog ref, missing catalog,
+     *     or no derivable table identifier)
+     */
+    public static Optional<ResolvedMaterialization> resolve(
+            Optional<TableMaterializationPolicy> namespacePolicy,
+            Optional<TableMaterializationPolicy> streamPolicy,
+            StreamIdentifier streamId,
+            Function<String, Optional<TableCatalog>> catalogLookup,
+            Map<String, String> properties) {
         Objects.requireNonNull(namespacePolicy, "namespacePolicy");
         Objects.requireNonNull(streamPolicy, "streamPolicy");
         Objects.requireNonNull(streamId, "streamId");
         Objects.requireNonNull(catalogLookup, "catalogLookup");
+        Objects.requireNonNull(properties, "properties");
 
         TableMaterializationPolicy namespace = namespacePolicy.orElse(empty());
         TableMaterializationPolicy stream = streamPolicy.orElse(empty());
@@ -162,7 +215,7 @@ public record TableMaterializationPolicy(
         Optional<TableIdentifier> effectiveTableIdentifier = stream.tableIdentifier();
         if (effectiveTableIdentifier.isEmpty()) {
             effectiveTableIdentifier = namespace.tableNaming()
-                    .map(naming -> naming.toTableIdentifier(streamId));
+                    .map(naming -> naming.toTableIdentifier(streamId, properties));
         }
         if (effectiveTableIdentifier.isEmpty()) {
             return Optional.empty();

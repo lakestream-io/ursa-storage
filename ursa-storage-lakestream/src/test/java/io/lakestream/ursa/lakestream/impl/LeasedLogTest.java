@@ -6,6 +6,7 @@ package io.lakestream.ursa.lakestream.impl;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -23,6 +24,7 @@ import io.lakestream.api.LogCursor;
 import io.lakestream.api.LogEntry;
 import io.lakestream.api.LogEntryHeader;
 import io.lakestream.api.LogId;
+import io.lakestream.api.LogOffset;
 import io.lakestream.ursa.storage.StorageApi.StreamWriteLease;
 import io.netty.buffer.Unpooled;
 import java.io.IOException;
@@ -32,7 +34,9 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -44,13 +48,13 @@ class LeasedLogTest {
 
     @Test
     void closeDrainsAcceptedAppendBeforeDelegateAndLease() throws Exception {
-        Log delegate = mock(Log.class);
-        StreamWriteLease lease = lease(17L);
+        LeasedLogFixture fixture = newLog(17L);
+        Log delegate = fixture.delegate();
+        StreamWriteLease lease = fixture.lease();
         CompletableFuture<LogEntryHeader> pendingAppend = new CompletableFuture<>();
-        when(delegate.id()).thenReturn(LogId.of(17L));
         when(delegate.append(1, Unpooled.EMPTY_BUFFER)).thenReturn(pendingAppend);
         when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease);
+        LeasedLog log = fixture.log();
 
         CompletableFuture<LogEntryHeader> append = log.append(1, Unpooled.EMPTY_BUFFER);
         CompletableFuture<Void> close = CompletableFuture.runAsync(() -> {
@@ -82,14 +86,14 @@ class LeasedLogTest {
     @Test
     void appendRejectsCancellationUntilCallerBufferIsNoLongerInUse()
             throws Exception {
-        Log delegate = mock(Log.class);
-        StreamWriteLease lease = lease(21L);
+        LeasedLogFixture fixture = newLog(21L);
+        Log delegate = fixture.delegate();
+        StreamWriteLease lease = fixture.lease();
         CompletableFuture<LogEntryHeader> pendingAppend = new CompletableFuture<>();
-        when(delegate.id()).thenReturn(LogId.of(21L));
         var payload = Unpooled.buffer(1).writeByte(9);
         when(delegate.append(1, payload)).thenReturn(pendingAppend);
         when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease);
+        LeasedLog log = fixture.log();
 
         CompletableFuture<LogEntryHeader> callerFuture = log.append(1, payload);
         assertFalse(callerFuture.cancel(false));
@@ -120,14 +124,14 @@ class LeasedLogTest {
     @Test
     void closeTimesOutOnCanceledPendingReadAndRetriesAfterEntryCleanup()
             throws Exception {
-        Log delegate = mock(Log.class);
-        StreamWriteLease lease = lease(33L);
+        LeasedLogFixture fixture = newLog(33L, 25L, Runnable::run);
+        Log delegate = fixture.delegate();
+        StreamWriteLease lease = fixture.lease();
         LogEntry entry = mock(LogEntry.class);
         CompletableFuture<List<LogEntry>> pendingRead = new CompletableFuture<>();
-        when(delegate.id()).thenReturn(LogId.of(33L));
         when(delegate.readEntries(0L, 1, 1024L)).thenReturn(pendingRead);
         when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease, 25L);
+        LeasedLog log = fixture.log();
 
         CompletableFuture<List<LogEntry>> read = log.readEntries(0L, 1, 1024L);
         assertTrue(read.cancel(false));
@@ -151,13 +155,13 @@ class LeasedLogTest {
 
     @Test
     void closeDrainsAcceptedTrimBeforeReleasingLease() throws Exception {
-        Log delegate = mock(Log.class);
-        StreamWriteLease lease = lease(22L);
+        LeasedLogFixture fixture = newLog(22L);
+        Log delegate = fixture.delegate();
+        StreamWriteLease lease = fixture.lease();
         CompletableFuture<Long> pendingTrim = new CompletableFuture<>();
-        when(delegate.id()).thenReturn(LogId.of(22L));
         when(delegate.softTrim(9L)).thenReturn(pendingTrim);
         when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease);
+        LeasedLog log = fixture.log();
 
         CompletableFuture<Long> trim = log.softTrim(9L);
         CompletableFuture<Void> close = CompletableFuture.runAsync(() -> {
@@ -179,13 +183,13 @@ class LeasedLogTest {
 
     @Test
     void synchronousAppendFailureDoesNotBlockClose() throws Exception {
-        Log delegate = mock(Log.class);
-        StreamWriteLease lease = lease(18L);
+        LeasedLogFixture fixture = newLog(18L);
+        Log delegate = fixture.delegate();
+        StreamWriteLease lease = fixture.lease();
         RuntimeException appendFailure = new RuntimeException("append failed");
-        when(delegate.id()).thenReturn(LogId.of(18L));
         when(delegate.append(1, Unpooled.EMPTY_BUFFER)).thenThrow(appendFailure);
         when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease);
+        LeasedLog log = fixture.log();
 
         assertSame(appendFailure,
             assertThrows(RuntimeException.class,
@@ -198,13 +202,13 @@ class LeasedLogTest {
 
     @Test
     void delegateCloseFailureRetainsLeaseUntilRetrySucceeds() throws Exception {
-        Log delegate = mock(Log.class);
-        StreamWriteLease lease = lease(19L);
+        LeasedLogFixture fixture = newLog(19L);
+        Log delegate = fixture.delegate();
+        StreamWriteLease lease = fixture.lease();
         IOException delegateFailure = new IOException("delegate close failed");
-        when(delegate.id()).thenReturn(LogId.of(19L));
         doThrow(delegateFailure).doNothing().when(delegate).close();
         when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease);
+        LeasedLog log = fixture.log();
 
         assertSame(delegateFailure, assertThrows(IOException.class, log::close));
         verify(lease, never()).closeAsync();
@@ -218,14 +222,14 @@ class LeasedLogTest {
 
     @Test
     void transientLeaseReleaseFailureCanBeRetried() throws Exception {
-        Log delegate = mock(Log.class);
-        StreamWriteLease lease = lease(20L);
+        LeasedLogFixture fixture = newLog(20L);
+        Log delegate = fixture.delegate();
+        StreamWriteLease lease = fixture.lease();
         RuntimeException leaseFailure = new RuntimeException("temporary Oxia failure");
-        when(delegate.id()).thenReturn(LogId.of(20L));
         when(lease.closeAsync())
             .thenReturn(CompletableFuture.failedFuture(leaseFailure))
             .thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease);
+        LeasedLog log = fixture.log();
 
         assertSame(leaseFailure, assertThrows(RuntimeException.class, log::close));
         log.close();
@@ -237,15 +241,15 @@ class LeasedLogTest {
 
     @Test
     void cursorCannotExposeUnfencedDelegateLog() throws Exception {
-        Log delegate = mock(Log.class);
+        LeasedLogFixture fixture = newLog(23L);
+        Log delegate = fixture.delegate();
         LogCursor delegateCursor = mock(LogCursor.class);
-        StreamWriteLease lease = lease(23L);
-        when(delegate.id()).thenReturn(LogId.of(23L));
+        StreamWriteLease lease = fixture.lease();
         when(delegate.openEphemeralCursor("reader", 0L))
             .thenReturn(CompletableFuture.completedFuture(delegateCursor));
         when(delegateCursor.log()).thenReturn(delegate);
         when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease);
+        LeasedLog log = fixture.log();
 
         LogCursor cursor = log.openEphemeralCursor("reader", 0L).get();
 
@@ -261,17 +265,17 @@ class LeasedLogTest {
     @Test
     void closeWaitsForPendingCursorReadAndOpenCursorHandleBeforeRetry()
             throws Exception {
-        Log delegate = mock(Log.class);
+        LeasedLogFixture fixture = newLog(34L, 25L, Runnable::run);
+        Log delegate = fixture.delegate();
         LogCursor delegateCursor = mock(LogCursor.class);
-        StreamWriteLease lease = lease(34L);
+        StreamWriteLease lease = fixture.lease();
         LogEntry entry = mock(LogEntry.class);
         CompletableFuture<List<LogEntry>> pendingRead = new CompletableFuture<>();
-        when(delegate.id()).thenReturn(LogId.of(34L));
         when(delegate.openEphemeralCursor("reader", 0L))
             .thenReturn(CompletableFuture.completedFuture(delegateCursor));
         when(delegateCursor.readEntries(1, 1024L)).thenReturn(pendingRead);
         when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease, 25L);
+        LeasedLog log = fixture.log();
         LogCursor cursor = log.openEphemeralCursor("reader", 0L).get();
 
         CompletableFuture<List<LogEntry>> read = cursor.readEntries(1, 1024L);
@@ -303,16 +307,16 @@ class LeasedLogTest {
 
     @Test
     void closeDrainsCursorPersistenceAndRejectsLaterCursorMutations() throws Exception {
-        Log delegate = mock(Log.class);
+        LeasedLogFixture fixture = newLog(27L);
+        Log delegate = fixture.delegate();
         LogCursor delegateCursor = mock(LogCursor.class);
-        StreamWriteLease lease = lease(27L);
+        StreamWriteLease lease = fixture.lease();
         CompletableFuture<Void> pendingPersistence = new CompletableFuture<>();
-        when(delegate.id()).thenReturn(LogId.of(27L));
         when(delegate.openEphemeralCursor("reader", 0L))
             .thenReturn(CompletableFuture.completedFuture(delegateCursor));
         when(delegateCursor.persistState()).thenReturn(pendingPersistence);
         when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease);
+        LeasedLog log = fixture.log();
         LogCursor cursor = log.openEphemeralCursor("reader", 0L).get();
 
         CompletableFuture<Void> persistence = cursor.persistState();
@@ -342,16 +346,16 @@ class LeasedLogTest {
 
     @Test
     void failedCursorCloseKeepsHandleActiveAndCanBeRetriedOnce() throws Exception {
-        Log delegate = mock(Log.class);
+        LeasedLogFixture fixture = newLog(35L, 25L, Runnable::run);
+        Log delegate = fixture.delegate();
         LogCursor delegateCursor = mock(LogCursor.class);
-        StreamWriteLease lease = lease(35L);
+        StreamWriteLease lease = fixture.lease();
         IOException cursorCloseFailure = new IOException("cursor close failed");
-        when(delegate.id()).thenReturn(LogId.of(35L));
         when(delegate.openEphemeralCursor("reader", 0L))
             .thenReturn(CompletableFuture.completedFuture(delegateCursor));
         doThrow(cursorCloseFailure).doNothing().when(delegateCursor).close();
         when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease, 25L);
+        LeasedLog log = fixture.log();
         LogCursor cursor = log.openEphemeralCursor("reader", 0L).get();
 
         assertSame(cursorCloseFailure, assertThrows(IOException.class, cursor::close));
@@ -371,18 +375,36 @@ class LeasedLogTest {
 
     @Test
     void eventualCloseRetriesWithoutDroppingTheLeaseGuard() throws Exception {
-        Log delegate = mock(Log.class);
-        StreamWriteLease lease = lease(28L);
-        when(delegate.id()).thenReturn(LogId.of(28L));
+        LeasedLogFixture fixture = newLog(28L);
+        Log delegate = fixture.delegate();
+        StreamWriteLease lease = fixture.lease();
         doThrow(new IOException("transient close failure"))
             .doNothing().when(delegate).close();
         when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease);
+        LeasedLog log = fixture.log();
 
         log.closeEventually(Runnable::run).get(5, TimeUnit.SECONDS);
 
         verify(delegate, times(2)).close();
         verify(lease).closeAsync();
+    }
+
+    @Test
+    void closeAsyncIsTheSupervisedCloseAndIsIdempotent() throws Exception {
+        LeasedLogFixture fixture = newLog(41L);
+        StreamWriteLease lease = fixture.lease();
+        when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
+        LeasedLog log = fixture.log();
+
+        CompletableFuture<Void> closed = log.closeAsync();
+
+        closed.get(10, TimeUnit.SECONDS);
+        verify(fixture.delegate()).close();
+        verify(lease, times(1)).closeAsync();
+        // closeAsync is closeEventually on the log's own close executor, so the retrying is that
+        // method's business and every caller gets back the one supervised close.
+        assertSame(closed, log.closeAsync(), "closeAsync is idempotent");
+        assertSame(closed, log.closeEventually(Runnable::run));
     }
 
     @Test
@@ -435,13 +457,13 @@ class LeasedLogTest {
     @Test
     void closeTimesOutWithoutReleasingLeaseWhileAcceptedOperationIsPending()
             throws Exception {
-        Log delegate = mock(Log.class);
-        StreamWriteLease lease = lease(24L);
+        LeasedLogFixture fixture = newLog(24L, 25L, Runnable::run);
+        Log delegate = fixture.delegate();
+        StreamWriteLease lease = fixture.lease();
         CompletableFuture<LogEntryHeader> pendingAppend = new CompletableFuture<>();
-        when(delegate.id()).thenReturn(LogId.of(24L));
         when(delegate.append(1, Unpooled.EMPTY_BUFFER)).thenReturn(pendingAppend);
         when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease, 25L);
+        LeasedLog log = fixture.log();
         log.append(1, Unpooled.EMPTY_BUFFER);
 
         IOException timeout = assertThrows(IOException.class, log::close);
@@ -472,30 +494,39 @@ class LeasedLogTest {
             return null;
         }).when(delegate).close();
         when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease, 25L);
+        // A real background executor is required here: the delegate close is deliberately
+        // blocked on allowDelegateClose, which this same (calling) thread releases below. An
+        // inline (Runnable::run) executor would run delegate.close() synchronously and deadlock.
+        ExecutorService delegateCloseExecutor = Executors.newSingleThreadExecutor();
+        try {
+            LeasedLog log = new LeasedLog(delegate, lease, 25L, delegateCloseExecutor);
 
-        IOException timeout = assertThrows(IOException.class, log::close);
+            IOException timeout = assertThrows(IOException.class, log::close);
 
-        assertTrue(timeout.getMessage().contains("delegate log"));
-        assertTrue(delegateCloseStarted.await(5, TimeUnit.SECONDS));
-        verify(lease, never()).closeAsync();
+            assertTrue(timeout.getMessage().contains("delegate log"));
+            assertTrue(delegateCloseStarted.await(5, TimeUnit.SECONDS));
+            verify(lease, never()).closeAsync();
 
-        allowDelegateClose.countDown();
-        assertTrue(delegateCloseFinished.await(5, TimeUnit.SECONDS));
-        log.close();
-        verify(delegate, times(1)).close();
-        verify(lease).closeAsync();
+            allowDelegateClose.countDown();
+            assertTrue(delegateCloseFinished.await(5, TimeUnit.SECONDS));
+            log.close();
+            verify(delegate, times(1)).close();
+            verify(lease).closeAsync();
+        } finally {
+            allowDelegateClose.countDown();
+            delegateCloseExecutor.shutdownNow();
+        }
     }
 
     @Test
     void closeTimesOutOnLeaseReleaseAndContinuesSameAttemptOnRetry()
             throws Exception {
-        Log delegate = mock(Log.class);
-        StreamWriteLease lease = lease(26L);
+        LeasedLogFixture fixture = newLog(26L, 25L, Runnable::run);
+        Log delegate = fixture.delegate();
+        StreamWriteLease lease = fixture.lease();
         CompletableFuture<Void> pendingRelease = new CompletableFuture<>();
-        when(delegate.id()).thenReturn(LogId.of(26L));
         when(lease.closeAsync()).thenReturn(pendingRelease);
-        LeasedLog log = new LeasedLog(delegate, lease, 25L);
+        LeasedLog log = fixture.log();
 
         IOException timeout = assertThrows(IOException.class, log::close);
 
@@ -568,9 +599,285 @@ class LeasedLogTest {
         }
     }
 
+    @Test
+    void lastOffsetIsServedFromCacheAfterAppend() throws Exception {
+        LeasedLogFixture fixture = newLog(51L);
+        Log delegate = fixture.delegate();
+        StreamWriteLease lease = fixture.lease();
+        LogEntryHeader header = mock(LogEntryHeader.class);
+        when(header.offset()).thenReturn(10L);
+        when(header.numberOfRecords()).thenReturn(3);
+        when(header.timestamp()).thenReturn(1234L);
+        when(header.entrySize()).thenReturn(100);
+        when(header.cumulativeSize()).thenReturn(1000L);
+        when(delegate.append(3, Unpooled.EMPTY_BUFFER))
+            .thenReturn(CompletableFuture.completedFuture(header));
+        LeasedLog log = fixture.log();
+
+        log.append(3, Unpooled.EMPTY_BUFFER).get(10, TimeUnit.SECONDS);
+        LogOffset last = log.getLastOffset().get(10, TimeUnit.SECONDS);
+
+        assertEquals(new LogOffset(10L, 3, 1234L, 100, 1000L), last);
+        verify(delegate, never()).getLastOffset();
+    }
+
+    @Test
+    void firstOffsetIsCachedUntilSoftTrim() throws Exception {
+        LeasedLogFixture fixture = newLog(52L);
+        Log delegate = fixture.delegate();
+        StreamWriteLease lease = fixture.lease();
+        LogOffset first = new LogOffset(4L, 2, 1L);
+        LogOffset afterTrim = new LogOffset(9L, 1, 2L);
+        when(delegate.getFirstOffset())
+            .thenReturn(CompletableFuture.completedFuture(first))
+            .thenReturn(CompletableFuture.completedFuture(afterTrim));
+        when(delegate.softTrim(8L)).thenReturn(CompletableFuture.completedFuture(9L));
+        LeasedLog log = fixture.log();
+
+        assertEquals(first, log.getFirstOffset().get());
+        assertEquals(first, log.getFirstOffset().get());
+        verify(delegate, times(1)).getFirstOffset();
+
+        log.softTrim(8L).get();
+        assertEquals(afterTrim, log.getFirstOffset().get());
+        verify(delegate, times(2)).getFirstOffset();
+    }
+
+    @Test
+    void failedOffsetReadInvalidatesCache() throws Exception {
+        LeasedLogFixture fixture = newLog(53L);
+        Log delegate = fixture.delegate();
+        StreamWriteLease lease = fixture.lease();
+        LogOffset last = new LogOffset(7L, 1, 1L);
+        when(delegate.getLastOffset())
+            .thenReturn(CompletableFuture.completedFuture(last))
+            .thenReturn(CompletableFuture.failedFuture(new IOException("boom")))
+            .thenReturn(CompletableFuture.completedFuture(last));
+        LeasedLog log = fixture.log();
+
+        assertEquals(last, log.getLastOffset().get());
+        log.invalidateCache();
+        assertThrows(ExecutionException.class, () -> log.getLastOffset().get());
+        assertEquals(last, log.getLastOffset().get());
+        verify(delegate, times(3)).getLastOffset();
+    }
+
+    @Test
+    void appendRepairsCachedEmptyFirstOffset() throws Exception {
+        LeasedLogFixture fixture = newLog(54L);
+        Log delegate = fixture.delegate();
+        StreamWriteLease lease = fixture.lease();
+        when(delegate.getFirstOffset())
+            .thenReturn(CompletableFuture.completedFuture(LogOffset.NOT_FOUND));
+        LogEntryHeader header = mock(LogEntryHeader.class);
+        when(header.offset()).thenReturn(0L);
+        when(header.numberOfRecords()).thenReturn(1);
+        when(header.timestamp()).thenReturn(100L);
+        when(header.entrySize()).thenReturn(50);
+        when(header.cumulativeSize()).thenReturn(50L);
+        when(delegate.append(1, Unpooled.EMPTY_BUFFER))
+            .thenReturn(CompletableFuture.completedFuture(header));
+        LeasedLog log = fixture.log();
+
+        assertEquals(LogOffset.NOT_FOUND, log.getFirstOffset().get(10, TimeUnit.SECONDS));
+        log.append(1, Unpooled.EMPTY_BUFFER).get(10, TimeUnit.SECONDS);
+
+        assertEquals(new LogOffset(0L, 1, 100L, 50, 50L),
+            log.getFirstOffset().get(10, TimeUnit.SECONDS));
+        verify(delegate, times(1)).getFirstOffset();
+    }
+
+    @Test
+    void staleFirstOffsetReadDoesNotOverrideAppend() throws Exception {
+        LeasedLogFixture fixture = newLog(55L);
+        Log delegate = fixture.delegate();
+        StreamWriteLease lease = fixture.lease();
+        CompletableFuture<LogOffset> pending = new CompletableFuture<>();
+        LogOffset fresh = new LogOffset(0L, 1, 200L, 60, 60L);
+        when(delegate.getFirstOffset())
+            .thenReturn(pending)
+            .thenReturn(CompletableFuture.completedFuture(fresh));
+        LogEntryHeader header = mock(LogEntryHeader.class);
+        when(header.offset()).thenReturn(0L);
+        when(header.numberOfRecords()).thenReturn(1);
+        when(header.timestamp()).thenReturn(200L);
+        when(header.entrySize()).thenReturn(60);
+        when(header.cumulativeSize()).thenReturn(60L);
+        when(delegate.append(1, Unpooled.EMPTY_BUFFER))
+            .thenReturn(CompletableFuture.completedFuture(header));
+        LeasedLog log = fixture.log();
+
+        CompletableFuture<LogOffset> staleRead = log.getFirstOffset();
+        assertFalse(staleRead.isDone());
+
+        log.append(1, Unpooled.EMPTY_BUFFER).get(10, TimeUnit.SECONDS);
+        pending.complete(LogOffset.NOT_FOUND);
+
+        assertEquals(LogOffset.NOT_FOUND, staleRead.get(10, TimeUnit.SECONDS));
+        assertEquals(fresh, log.getFirstOffset().get(10, TimeUnit.SECONDS));
+        verify(delegate, times(2)).getFirstOffset();
+    }
+
+    @Test
+    void staleFirstOffsetReadDoesNotOverrideSoftTrim() throws Exception {
+        LeasedLogFixture fixture = newLog(56L);
+        Log delegate = fixture.delegate();
+        StreamWriteLease lease = fixture.lease();
+        CompletableFuture<LogOffset> pending = new CompletableFuture<>();
+        LogOffset stale = new LogOffset(3L, 1, 1L);
+        LogOffset fresh = new LogOffset(9L, 1, 2L);
+        when(delegate.getFirstOffset())
+            .thenReturn(pending)
+            .thenReturn(CompletableFuture.completedFuture(fresh));
+        when(delegate.softTrim(8L)).thenReturn(CompletableFuture.completedFuture(9L));
+        LeasedLog log = fixture.log();
+
+        CompletableFuture<LogOffset> staleRead = log.getFirstOffset();
+        assertFalse(staleRead.isDone());
+
+        log.softTrim(8L).get(10, TimeUnit.SECONDS);
+        pending.complete(stale);
+
+        assertEquals(stale, staleRead.get(10, TimeUnit.SECONDS));
+        assertEquals(fresh, log.getFirstOffset().get(10, TimeUnit.SECONDS));
+        verify(delegate, times(2)).getFirstOffset();
+    }
+
+    @Test
+    void outOfOrderAppendsKeepTheLowestFirstOffset() throws Exception {
+        LeasedLogFixture fixture = newLog(57L);
+        Log delegate = fixture.delegate();
+        StreamWriteLease lease = fixture.lease();
+        when(delegate.getFirstOffset())
+            .thenReturn(CompletableFuture.completedFuture(LogOffset.NOT_FOUND));
+        CompletableFuture<LogEntryHeader> firstAppend = new CompletableFuture<>();
+        CompletableFuture<LogEntryHeader> secondAppend = new CompletableFuture<>();
+        when(delegate.append(1, Unpooled.EMPTY_BUFFER))
+            .thenReturn(firstAppend)
+            .thenReturn(secondAppend);
+        LeasedLog log = fixture.log();
+
+        assertEquals(LogOffset.NOT_FOUND, log.getFirstOffset().get(10, TimeUnit.SECONDS));
+        CompletableFuture<LogEntryHeader> earlier = log.append(1, Unpooled.EMPTY_BUFFER);
+        CompletableFuture<LogEntryHeader> later = log.append(1, Unpooled.EMPTY_BUFFER);
+
+        // The append at the higher offset completes first, so a last-write-wins cache would keep
+        // it and hide the entry that actually starts the log.
+        secondAppend.complete(header(1L, 1, 200L, 60, 110L));
+        firstAppend.complete(header(0L, 1, 100L, 50, 50L));
+        later.get(10, TimeUnit.SECONDS);
+        earlier.get(10, TimeUnit.SECONDS);
+
+        assertEquals(new LogOffset(0L, 1, 100L, 50, 50L),
+            log.getFirstOffset().get(10, TimeUnit.SECONDS));
+        verify(delegate, times(1)).getFirstOffset();
+    }
+
+    @Test
+    void eventualCloseGivesUpOnceItsExecutorIsShutDown() throws Exception {
+        LeasedLogFixture fixture = newLog(58L);
+        Log delegate = fixture.delegate();
+        StreamWriteLease lease = fixture.lease();
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        executor.shutdown();
+        LeasedLog log = fixture.log();
+
+        // A rejection from a shut-down executor can never succeed on retry. Bounding the wait
+        // turns "would retry forever" into a clear failure.
+        CompletableFuture<Void> close = log.closeEventually(executor);
+
+        ExecutionException rejected = assertThrows(ExecutionException.class,
+            () -> close.get(5, TimeUnit.SECONDS));
+        assertInstanceOf(RejectedExecutionException.class, rejected.getCause());
+        verify(lease, never()).closeAsync();
+    }
+
+    @Test
+    void outOfOrderAppendsKeepTheHighestLastOffset() throws Exception {
+        LeasedLogFixture fixture = newLog(59L);
+        Log delegate = fixture.delegate();
+        StreamWriteLease lease = fixture.lease();
+        CompletableFuture<LogEntryHeader> firstAppend = new CompletableFuture<>();
+        CompletableFuture<LogEntryHeader> secondAppend = new CompletableFuture<>();
+        when(delegate.append(1, Unpooled.EMPTY_BUFFER))
+            .thenReturn(firstAppend)
+            .thenReturn(secondAppend);
+        LeasedLog log = fixture.log();
+
+        CompletableFuture<LogEntryHeader> earlier = log.append(1, Unpooled.EMPTY_BUFFER);
+        CompletableFuture<LogEntryHeader> later = log.append(1, Unpooled.EMPTY_BUFFER);
+
+        // The append at the higher offset completes first, so a last-write-wins cache would be
+        // rewound by the append that started earlier and report a tail that is already stale.
+        secondAppend.complete(header(1L, 1, 200L, 60, 110L));
+        firstAppend.complete(header(0L, 1, 100L, 50, 50L));
+        later.get(10, TimeUnit.SECONDS);
+        earlier.get(10, TimeUnit.SECONDS);
+
+        assertEquals(new LogOffset(1L, 1, 200L, 60, 110L),
+            log.getLastOffset().get(10, TimeUnit.SECONDS));
+        verify(delegate, never()).getLastOffset();
+    }
+
+    @Test
+    void eventualLeaseReleaseGivesUpOnceItsExecutorIsShutDown() throws Exception {
+        StreamWriteLease lease = lease(60L);
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        executor.shutdown();
+
+        // The lease was acquired before its log could be created, so only this supervised release
+        // will ever free it. A rejection from a shut-down executor never succeeds on retry.
+        CompletableFuture<Void> release = LeasedLog.releaseLeaseEventually(lease, executor);
+
+        ExecutionException rejected = assertThrows(ExecutionException.class,
+            () -> release.get(5, TimeUnit.SECONDS));
+        assertInstanceOf(RejectedExecutionException.class, rejected.getCause());
+        verify(lease, never()).closeAsync();
+    }
+
+    private static LogEntryHeader header(
+            long offset, int numberOfRecords, long timestamp, int entrySize,
+            long cumulativeSize) {
+        LogEntryHeader header = mock(LogEntryHeader.class);
+        when(header.offset()).thenReturn(offset);
+        when(header.numberOfRecords()).thenReturn(numberOfRecords);
+        when(header.timestamp()).thenReturn(timestamp);
+        when(header.entrySize()).thenReturn(entrySize);
+        when(header.cumulativeSize()).thenReturn(cumulativeSize);
+        return header;
+    }
+
     private static StreamWriteLease lease(long streamId) {
         StreamWriteLease lease = mock(StreamWriteLease.class);
         when(lease.streamId()).thenReturn(streamId);
         return lease;
+    }
+
+    /** A leased log with the delegate and lease it was built over, for tests that stub both. */
+    private record LeasedLogFixture(LeasedLog log, Log delegate, StreamWriteLease lease) {
+    }
+
+    /** A leased log over a fresh delegate and lease for {@code streamId}, closing inline. */
+    private static LeasedLogFixture newLog(long streamId) {
+        Log delegate = delegate(streamId);
+        StreamWriteLease lease = lease(streamId);
+        return new LeasedLogFixture(
+            new LeasedLog(delegate, lease, Runnable::run, () -> { }), delegate, lease);
+    }
+
+    /** As {@link #newLog(long)}, with the close timeout and delegate-close executor injected. */
+    private static LeasedLogFixture newLog(
+            long streamId, long closeTimeoutMillis, Executor delegateCloseExecutor) {
+        Log delegate = delegate(streamId);
+        StreamWriteLease lease = lease(streamId);
+        return new LeasedLogFixture(
+            new LeasedLog(delegate, lease, closeTimeoutMillis, delegateCloseExecutor),
+            delegate, lease);
+    }
+
+    private static Log delegate(long streamId) {
+        Log delegate = mock(Log.class);
+        when(delegate.id()).thenReturn(LogId.of(streamId));
+        return delegate;
     }
 }

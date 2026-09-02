@@ -68,6 +68,8 @@ public interface LogCursor extends AutoCloseable {
     /**
      * Moves the read position to the given offset.
      *
+     * <p>For ephemeral cursors this only updates the in-memory read position.
+     *
      * @param offset the offset to seek to
      * @return a future that completes when the seek is done
      */
@@ -180,4 +182,20 @@ public interface LogCursor extends AutoCloseable {
     default CompletableFuture<Void> deleteCursor() {
         return CompletableFuture.completedFuture(null);
     }
+
+    /**
+     * Releases this cursor.
+     *
+     * <p>An ephemeral cursor holds in-memory state only, so closing it releases that state and
+     * returns immediately without any catalog or storage round trip. A durable cursor also has to
+     * detach from its persisted state, so its close may block for the length of that round trip;
+     * closing a durable cursor never deletes its persisted state — see {@link #deleteCursor()}.
+     *
+     * <p>The declaration keeps the checked {@code Exception} of {@link AutoCloseable#close()} so a
+     * durable implementation can report a failed detach; the ephemeral case does not throw.
+     *
+     * @throws Exception if a durable cursor fails to detach from its persisted state
+     */
+    @Override
+    void close() throws Exception;
 }
