@@ -52,11 +52,6 @@ public class DefaultCatalogPaths implements CatalogPaths {
     }
 
     @Override
-    public String streamTombstonePath(StreamIdentifier id) {
-        return configPrefix + "/_tombstones/" + id.namespace() + "/" + id.name();
-    }
-
-    @Override
     public String partitionMetadataPath(StreamIdentifier id, int partitionIndex) {
         return metadataPrefix + "/" + id.namespace() + "/" + id.name()
             + "-partition-" + partitionIndex;

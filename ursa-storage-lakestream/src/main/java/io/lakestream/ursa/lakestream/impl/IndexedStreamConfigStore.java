@@ -93,10 +93,6 @@ final class IndexedStreamConfigStore {
     }
 
 
-    CompletableFuture<StreamConfigData> read(StreamIdentifier id) {
-        return readActive(id).thenApply(ActiveStreamConfig::config);
-    }
-
     CompletableFuture<ActiveStreamConfig> readActive(StreamIdentifier id) {
         String path = catalogPaths.streamConfigPath(id);
         return oxiaClient.get(path).thenCompose(result -> {

@@ -590,32 +590,6 @@ public class LogCursorImpl implements LogCursor {
     // --- Ack set and batch helpers ---
 
     /**
-     * Returns the acknowledgement set for a batched entry position.
-     */
-    public long[] getBatchPositionAckSet(long offset, int length) {
-        return individualAcksTracker.getBatchPositionAckSet(markDeleteOffset, offset, length);
-    }
-
-    /**
-     * Returns the last individually deleted range, or null if none.
-     */
-    public IndividualAcksTracker.OffsetRange lastIndividualDeletedRange() {
-        lock.readLock().lock();
-        try {
-            return individualAcksTracker.lastRange();
-        } finally {
-            lock.readLock().unlock();
-        }
-    }
-
-    /**
-     * Clears individual acks after the given offset.
-     */
-    public void clearIndividualAcksAfterOffset(long offset) {
-        individualAcksTracker.clearAfterOffset(offset);
-    }
-
-    /**
      * Flushes individual acks tracker if persistence rate allows.
      */
     public CompletableFuture<Boolean> tryFlushIndividualAcks() {

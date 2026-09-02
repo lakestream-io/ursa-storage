@@ -537,7 +537,7 @@ class IndexedStreamConfigStoreDeletionFenceTest {
                 "\"text\"".getBytes(StandardCharsets.UTF_8),
                 "null".getBytes(StandardCharsets.UTF_8))) {
             current.set(invalid);
-            assertThatThrownBy(() -> store.read(id).join())
+            assertThatThrownBy(() -> store.readActive(id).join())
                 .isInstanceOf(CompletionException.class)
                 .hasRootCauseInstanceOf(IllegalArgumentException.class);
             assertThatThrownBy(() -> store.exists(id).join())
@@ -1213,15 +1213,6 @@ class IndexedStreamConfigStoreDeletionFenceTest {
             .isInstanceOf(CompletionException.class)
             .hasCauseInstanceOf(
                 IndexedStreamConfigStore.ProvisioningOwnershipLostException.class);
-    }
-
-    private static void assertMetadataSourceOwner(
-            byte[] value, String expectedOwnerToken, long expectedGeneration) {
-        JsonNode config = json(value);
-        assertThat(config.path("_metadataSourceOwnerToken").asText())
-            .isEqualTo(expectedOwnerToken);
-        assertThat(config.path("_metadataSourceGeneration").asLong())
-            .isEqualTo(expectedGeneration);
     }
 
     private InitialClaimRace mockInitiallyAbsentClaimRace() {

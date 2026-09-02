@@ -591,7 +591,7 @@ public class IndexedStreamCatalog implements StreamCatalog {
     private CompletableFuture<Void> provisionNativePartition(
             StreamIdentifier id, IndexedStreamConfigStore.ProvisioningClaim claim,
             int partIdx) {
-        String allocationKey = nativePartitionAllocationKey(id, claim, partIdx);
+        String allocationKey = nativePartitionAllocationKey(id, partIdx);
         return streamConfigStore.verifyProvisioningOwnership(id, claim)
             .thenCompose(ignored ->
                 prepareRetiredNativePartition(id, partIdx, claim))
@@ -1106,12 +1106,6 @@ public class IndexedStreamCatalog implements StreamCatalog {
             new IndexedStreamConfigStore.NativeCleanupContext(
                 lifecycle.config(), lifecycle.versionId());
         return () -> streamConfigStore.verifyNativeCleanupContext(id, context);
-    }
-
-    private static String nativePartitionAllocationKey(
-            StreamIdentifier id, IndexedStreamConfigStore.ProvisioningClaim claim,
-            int partitionIndex) {
-        return nativePartitionAllocationKey(id, partitionIndex);
     }
 
     private static String nativePartitionAllocationKey(
@@ -2399,11 +2393,12 @@ public class IndexedStreamCatalog implements StreamCatalog {
             StreamIdentifier id, IndexedStreamConfigStore.DropClaim claim,
             boolean purge, int partitionIndex) {
         return streamConfigStore.verifyAbortingOwnership(id, claim)
-            .thenCompose(ignored -> mappingForDrop(id, partitionIndex, claim))
+            .thenCompose(ignored -> mappingForPartitionDrop(id, partitionIndex))
             .thenCompose(mapping -> tombstoneDroppedPartition(
                 id, partitionIndex, claim, mapping, purge)
-                .thenCompose(tombstone -> cleanupDroppedPartition(
-                    id, partitionIndex, claim, tombstone)));
+                .thenCompose(tombstone -> sweepPartitionAfterTombstone(
+                    id, partitionIndex,
+                    () -> streamConfigStore.verifyAbortingOwnership(id, claim))));
     }
 
     private CompletableFuture<Void> cleanupCompletedDrop(
@@ -2417,30 +2412,13 @@ public class IndexedStreamCatalog implements StreamCatalog {
             StreamIdentifier id, IndexedStreamConfigStore.CompletedDrop completed,
             int partitionIndex) {
         return streamConfigStore.verifyCompletedDrop(id, completed)
-            .thenCompose(ignored -> mappingForCompletedDrop(
-                id, partitionIndex, completed.config()))
+            .thenCompose(ignored -> mappingForPartitionDrop(id, partitionIndex))
             .thenCompose(mapping -> recoverCompletedDroppedPartition(
                 id, partitionIndex, completed, mapping,
                 new PartitionMetadataRetry()))
-            .thenCompose(tombstone -> cleanupCompletedDroppedPartition(
-                id, partitionIndex, completed, tombstone));
-    }
-
-    private CompletableFuture<OptionalLong> mappingForCompletedDrop(
-            StreamIdentifier id, int partitionIndex,
-            IndexedStreamConfigStore.StreamConfigData config) {
-        String mappingKey = dropMappingKey(id, partitionIndex);
-        return streamIdLookup.apply(mappingKey)
-            .handle((streamId, failure) -> {
-                if (failure == null) {
-                    return OptionalLong.of(streamId);
-                }
-                Throwable cause = rootCause(failure);
-                if (cause instanceof NoSuchKeyException) {
-                    return OptionalLong.empty();
-                }
-                throw new CompletionException(cause);
-            });
+            .thenCompose(tombstone -> sweepPartitionAfterTombstone(
+                id, partitionIndex,
+                () -> streamConfigStore.verifyCompletedDrop(id, completed)));
     }
 
     private CompletableFuture<PartitionTombstone> recoverCompletedDroppedPartition(
@@ -2564,19 +2542,23 @@ public class IndexedStreamCatalog implements StreamCatalog {
             });
     }
 
-    private CompletableFuture<Void> cleanupCompletedDroppedPartition(
+    /**
+     * Sweeps a partition's retired allocations once its tombstone is durable.
+     *
+     * <p>The tombstone itself carries nothing the sweep needs; what differs between the drop and
+     * the completed-drop recovery chains is only the lifecycle record the sweep re-verifies its
+     * ownership against, which each caller supplies as {@code ownershipVerifier}.
+     */
+    private CompletableFuture<Void> sweepPartitionAfterTombstone(
             StreamIdentifier id, int partitionIndex,
-            IndexedStreamConfigStore.CompletedDrop completed,
-            PartitionTombstone tombstone) {
-        return sweepRetiredAllocations(
-            id, partitionIndex,
-            () -> streamConfigStore.verifyCompletedDrop(id, completed))
+            Supplier<CompletableFuture<Void>> ownershipVerifier) {
+        return sweepRetiredAllocations(id, partitionIndex, ownershipVerifier)
             .thenApply(ignored -> null);
     }
 
-    private CompletableFuture<OptionalLong> mappingForDrop(
-            StreamIdentifier id, int partitionIndex,
-            IndexedStreamConfigStore.DropClaim claim) {
+    /** Reads the stream-ID mapping a partition drop has to clean up, if one is still registered. */
+    private CompletableFuture<OptionalLong> mappingForPartitionDrop(
+            StreamIdentifier id, int partitionIndex) {
         String mappingKey = dropMappingKey(id, partitionIndex);
         return streamIdLookup.apply(mappingKey)
             .handle((streamId, failure) -> {
@@ -2699,27 +2681,12 @@ public class IndexedStreamCatalog implements StreamCatalog {
 
     private static LogMetadata deletionMetadata(
             long streamId, IndexedStreamConfigStore.DropClaim claim,
-            Set<Long> retiredStreamIds, Set<Long> purgeableRetiredStreamIds) {
-        return deletionMetadata(
-            streamId, claim.config(), retiredStreamIds, purgeableRetiredStreamIds);
-    }
-
-    private static LogMetadata deletionMetadata(
-            long streamId, IndexedStreamConfigStore.DropClaim claim,
             Set<Long> retiredStreamIds, Set<Long> purgeableRetiredStreamIds,
             Set<RetiredStreamMapping> retiredStreamMappings,
             Set<String> retiredMappingKeys) {
         return deletionMetadata(
             streamId, claim.config(), retiredStreamIds, purgeableRetiredStreamIds,
             retiredStreamMappings, retiredMappingKeys);
-    }
-
-    private static LogMetadata deletionMetadata(
-            long streamId, IndexedStreamConfigStore.StreamConfigData config,
-            Set<Long> retiredStreamIds, Set<Long> purgeableRetiredStreamIds) {
-        return deletionMetadata(
-            streamId, config, retiredStreamIds, purgeableRetiredStreamIds,
-            Set.of(), Set.of());
     }
 
     private static LogMetadata deletionMetadata(
@@ -2808,16 +2775,6 @@ public class IndexedStreamCatalog implements StreamCatalog {
             return retiredStreamIdsWith(currentPurgeable, mappedStreamId);
         }
         return currentPurgeable;
-    }
-
-    private CompletableFuture<Void> cleanupDroppedPartition(
-            StreamIdentifier id, int partitionIndex,
-            IndexedStreamConfigStore.DropClaim claim,
-            PartitionTombstone tombstone) {
-        return sweepRetiredAllocations(
-            id, partitionIndex,
-            () -> streamConfigStore.verifyAbortingOwnership(id, claim))
-            .thenApply(ignored -> null);
     }
 
     private record PartitionTombstone(
@@ -3570,11 +3527,6 @@ public class IndexedStreamCatalog implements StreamCatalog {
     }
 
     // --- Internal helpers ---
-
-    private CompletableFuture<Integer> readPartitionCount(StreamIdentifier id) {
-        return streamConfigStore.read(id)
-            .thenApply(IndexedStreamConfigStore.StreamConfigData::partitions);
-    }
 
     private CompletableFuture<LogMetadata> readPartitionMetadata(StreamIdentifier id, int partitionIndex) {
         return streamConfigStore.readActive(id).thenCompose(active ->
