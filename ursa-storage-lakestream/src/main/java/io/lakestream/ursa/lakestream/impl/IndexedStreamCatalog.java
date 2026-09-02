@@ -103,6 +103,7 @@ public class IndexedStreamCatalog implements StreamCatalog {
     private static final LogMetadataSerde LOG_METADATA_SERDE = LogMetadataSerde.INSTANCE;
     private static final int STREAM_VISIBILITY_READ_BATCH_SIZE = 32;
     private static final int MAX_PARTITION_METADATA_WRITE_RETRIES = 3;
+    private static final int PROVISIONING_PARALLELISM = 8;
     private static final long PARTITION_METADATA_RETRY_DELAY_MILLIS = 10L;
     private static final long CATALOG_CLOSE_TIMEOUT_MILLIS = TimeUnit.SECONDS.toMillis(10);
     private static final long ABANDONED_HANDLE_INITIAL_RETRY_MILLIS = 100L;
@@ -580,104 +581,106 @@ public class IndexedStreamCatalog implements StreamCatalog {
 
     private CompletableFuture<Void> createPartitions(
             StreamIdentifier id, IndexedStreamConfigStore.ProvisioningClaim claim) {
-        CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
-        for (int i = 0; i < claim.config().partitions(); i++) {
-            final int partIdx = i;
-            String allocationKey = nativePartitionAllocationKey(id, claim, partIdx);
-            chain = chain
-                .thenCompose(ignored ->
-                    streamConfigStore.verifyProvisioningOwnership(id, claim))
-                .thenCompose(ignored ->
-                    prepareRetiredNativePartition(id, partIdx, claim))
-                .thenCompose(prepared -> allocateNativeKeyedStreamId(
-                    allocationKey, streamIdMappingOwner(claim),
-                    prepared.acknowledgedFence())
-                    .thenApply(streamId -> {
-                        if (prepared.retiredStreamIds().contains(streamId)) {
-                            throw new RetiredStreamIdAllocationException(
-                                new StreamIdAllocation(streamId, false),
-                                "Native partition " + id.fullName() + "-partition-"
-                                    + partIdx
-                                    + " cannot reuse a retired physical stream ID");
-                        }
-                        return streamId;
-                    })
-                    .handle((streamId, failure) -> new NativeAllocationAttempt(
-                        streamId, unwrapNullable(failure))))
-                .thenCompose(attempt -> {
-                    if (attempt.failure() == null) {
-                        return verifyAndWriteNativePartitionAfterAllocation(
-                            id, partIdx, allocationKey, attempt.streamId(), claim);
+        return BoundedParallel.forEach(claim.config().partitions(), PROVISIONING_PARALLELISM,
+            partIdx -> provisionNativePartition(id, claim, partIdx));
+    }
+
+    private CompletableFuture<Void> provisionNativePartition(
+            StreamIdentifier id, IndexedStreamConfigStore.ProvisioningClaim claim,
+            int partIdx) {
+        String allocationKey = nativePartitionAllocationKey(id, claim, partIdx);
+        return streamConfigStore.verifyProvisioningOwnership(id, claim)
+            .thenCompose(ignored ->
+                prepareRetiredNativePartition(id, partIdx, claim))
+            .thenCompose(prepared -> allocateNativeKeyedStreamId(
+                allocationKey, streamIdMappingOwner(claim),
+                prepared.acknowledgedFence())
+                .thenApply(streamId -> {
+                    if (prepared.retiredStreamIds().contains(streamId)) {
+                        throw new RetiredStreamIdAllocationException(
+                            new StreamIdAllocation(streamId, false),
+                            "Native partition " + id.fullName() + "-partition-"
+                                + partIdx
+                                + " cannot reuse a retired physical stream ID");
                     }
-                    Throwable cause = rootCause(attempt.failure());
-                    if (cause instanceof KeyedAllocationInvalidatedException invalidated) {
-                        return compensateRejectedNativeAllocation(
-                            id, partIdx, allocationKey,
-                            invalidated.allocation().streamId(), claim, cause);
-                    }
-                    if (cause instanceof RetiredStreamIdAllocationException retired) {
-                        return compensateRetiredNativeAllocation(
-                            id, partIdx, allocationKey,
-                            retired.allocation().streamId(), claim, cause);
-                    }
-                    return CompletableFuture.failedFuture(cause);
+                    return streamId;
                 })
-                .thenCompose(ignored ->
-                    streamConfigStore.verifyProvisioningOwnership(id, claim));
-        }
-        return chain;
+                .handle((streamId, failure) -> new NativeAllocationAttempt(
+                    streamId, unwrapNullable(failure))))
+            .thenCompose(attempt -> {
+                if (attempt.failure() == null) {
+                    return verifyAndWriteNativePartitionAfterAllocation(
+                        id, partIdx, allocationKey, attempt.streamId(), claim);
+                }
+                Throwable cause = rootCause(attempt.failure());
+                if (cause instanceof KeyedAllocationInvalidatedException invalidated) {
+                    return compensateRejectedNativeAllocation(
+                        id, partIdx, allocationKey,
+                        invalidated.allocation().streamId(), claim, cause);
+                }
+                if (cause instanceof RetiredStreamIdAllocationException retired) {
+                    return compensateRetiredNativeAllocation(
+                        id, partIdx, allocationKey,
+                        retired.allocation().streamId(), claim, cause);
+                }
+                return CompletableFuture.failedFuture(cause);
+            })
+            .thenCompose(ignored ->
+                streamConfigStore.verifyProvisioningOwnership(id, claim));
     }
 
     private CompletableFuture<Void> createExpansionPartitions(
             StreamIdentifier id, IndexedStreamConfigStore.ExpansionClaim claim) {
-        CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
-        for (int i = claim.basePartitions(); i < claim.targetPartitions(); i++) {
-            final int partitionIndex = i;
-            String allocationKey = nativePartitionAllocationKey(id, partitionIndex);
-            chain = chain
-                .thenCompose(ignored -> streamConfigStore.verifyExpansion(id, claim))
-                .thenCompose(ignored -> prepareRetiredNativePartition(
-                    id, partitionIndex, streamIdMappingOwner(claim),
-                    () -> streamConfigStore.verifyExpansion(id, claim)))
-                .thenCompose(prepared -> allocateNativeKeyedStreamId(
-                    allocationKey, streamIdMappingOwner(claim),
-                    prepared.acknowledgedFence())
-                    .thenApply(streamId -> {
-                        if (prepared.retiredStreamIds().contains(streamId)) {
-                            throw new RetiredStreamIdAllocationException(
-                                new StreamIdAllocation(streamId, false),
-                                "Native partition " + id.fullName() + "-partition-"
-                                    + partitionIndex
-                                    + " cannot reuse a retired physical stream ID");
-                        }
-                        return streamId;
-                    })
-                    .handle((streamId, failure) -> new NativeAllocationAttempt(
-                        streamId, unwrapNullable(failure))))
-                .thenCompose(attempt -> {
-                    if (attempt.failure() == null) {
-                        return verifyAndWriteExpansionPartitionAfterAllocation(
-                            id, partitionIndex, allocationKey,
-                            attempt.streamId(), claim);
+        return BoundedParallel.forEach(
+            claim.targetPartitions() - claim.basePartitions(), PROVISIONING_PARALLELISM,
+            i -> expandPartition(id, claim, claim.basePartitions() + i));
+    }
+
+    private CompletableFuture<Void> expandPartition(
+            StreamIdentifier id, IndexedStreamConfigStore.ExpansionClaim claim,
+            int partitionIndex) {
+        String allocationKey = nativePartitionAllocationKey(id, partitionIndex);
+        return streamConfigStore.verifyExpansion(id, claim)
+            .thenCompose(ignored -> prepareRetiredNativePartition(
+                id, partitionIndex, streamIdMappingOwner(claim),
+                () -> streamConfigStore.verifyExpansion(id, claim)))
+            .thenCompose(prepared -> allocateNativeKeyedStreamId(
+                allocationKey, streamIdMappingOwner(claim),
+                prepared.acknowledgedFence())
+                .thenApply(streamId -> {
+                    if (prepared.retiredStreamIds().contains(streamId)) {
+                        throw new RetiredStreamIdAllocationException(
+                            new StreamIdAllocation(streamId, false),
+                            "Native partition " + id.fullName() + "-partition-"
+                                + partitionIndex
+                                + " cannot reuse a retired physical stream ID");
                     }
-                    Throwable cause = rootCause(attempt.failure());
-                    IndexedStreamConfigStore.ProvisioningClaim cleanupClaim =
-                        expansionCleanupClaim(claim);
-                    if (cause instanceof KeyedAllocationInvalidatedException invalidated) {
-                        return compensateRejectedNativeAllocation(
-                            id, partitionIndex, allocationKey,
-                            invalidated.allocation().streamId(), cleanupClaim, cause);
-                    }
-                    if (cause instanceof RetiredStreamIdAllocationException retired) {
-                        return compensateRetiredNativeAllocation(
-                            id, partitionIndex, allocationKey,
-                            retired.allocation().streamId(), cleanupClaim, cause);
-                    }
-                    return CompletableFuture.failedFuture(cause);
+                    return streamId;
                 })
-                .thenCompose(ignored -> streamConfigStore.verifyExpansion(id, claim));
-        }
-        return chain;
+                .handle((streamId, failure) -> new NativeAllocationAttempt(
+                    streamId, unwrapNullable(failure))))
+            .thenCompose(attempt -> {
+                if (attempt.failure() == null) {
+                    return verifyAndWriteExpansionPartitionAfterAllocation(
+                        id, partitionIndex, allocationKey,
+                        attempt.streamId(), claim);
+                }
+                Throwable cause = rootCause(attempt.failure());
+                IndexedStreamConfigStore.ProvisioningClaim cleanupClaim =
+                    expansionCleanupClaim(claim);
+                if (cause instanceof KeyedAllocationInvalidatedException invalidated) {
+                    return compensateRejectedNativeAllocation(
+                        id, partitionIndex, allocationKey,
+                        invalidated.allocation().streamId(), cleanupClaim, cause);
+                }
+                if (cause instanceof RetiredStreamIdAllocationException retired) {
+                    return compensateRetiredNativeAllocation(
+                        id, partitionIndex, allocationKey,
+                        retired.allocation().streamId(), cleanupClaim, cause);
+                }
+                return CompletableFuture.failedFuture(cause);
+            })
+            .thenCompose(ignored -> streamConfigStore.verifyExpansion(id, claim));
     }
 
     private CompletableFuture<Void> verifyAndWriteExpansionPartitionAfterAllocation(
@@ -2385,38 +2388,39 @@ public class IndexedStreamCatalog implements StreamCatalog {
     private CompletableFuture<Void> cleanupDroppedStream(
             StreamIdentifier id, IndexedStreamConfigStore.DropClaim claim,
             boolean purge) {
-        CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
-        for (int i = 0; i < claim.config().partitions(); i++) {
-            int partitionIndex = i;
-            chain = chain
-                .thenCompose(ignored ->
-                    streamConfigStore.verifyAbortingOwnership(id, claim))
-                .thenCompose(ignored -> mappingForDrop(id, partitionIndex, claim))
-                .thenCompose(mapping -> tombstoneDroppedPartition(
-                    id, partitionIndex, claim, mapping, purge)
-                    .thenCompose(tombstone -> cleanupDroppedPartition(
-                        id, partitionIndex, claim, tombstone)));
-        }
-        return chain;
+        return BoundedParallel.forEach(claim.config().partitions(), PROVISIONING_PARALLELISM,
+            partitionIndex -> cleanupDroppedPartitionChain(id, claim, purge, partitionIndex));
+    }
+
+    private CompletableFuture<Void> cleanupDroppedPartitionChain(
+            StreamIdentifier id, IndexedStreamConfigStore.DropClaim claim,
+            boolean purge, int partitionIndex) {
+        return streamConfigStore.verifyAbortingOwnership(id, claim)
+            .thenCompose(ignored -> mappingForDrop(id, partitionIndex, claim))
+            .thenCompose(mapping -> tombstoneDroppedPartition(
+                id, partitionIndex, claim, mapping, purge)
+                .thenCompose(tombstone -> cleanupDroppedPartition(
+                    id, partitionIndex, claim, tombstone)));
     }
 
     private CompletableFuture<Void> cleanupCompletedDrop(
             StreamIdentifier id, IndexedStreamConfigStore.CompletedDrop completed) {
-        CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
-        for (int i = 0; i < completed.config().partitions(); i++) {
-            int partitionIndex = i;
-            chain = chain
-                .thenCompose(ignored ->
-                    streamConfigStore.verifyCompletedDrop(id, completed))
-                .thenCompose(ignored -> mappingForCompletedDrop(
-                    id, partitionIndex, completed.config()))
-                .thenCompose(mapping -> recoverCompletedDroppedPartition(
-                    id, partitionIndex, completed, mapping,
-                    new PartitionMetadataRetry()))
-                .thenCompose(tombstone -> cleanupCompletedDroppedPartition(
-                    id, partitionIndex, completed, tombstone));
-        }
-        return chain;
+        return BoundedParallel.forEach(completed.config().partitions(), PROVISIONING_PARALLELISM,
+            partitionIndex ->
+                recoverCompletedDroppedPartitionChain(id, completed, partitionIndex));
+    }
+
+    private CompletableFuture<Void> recoverCompletedDroppedPartitionChain(
+            StreamIdentifier id, IndexedStreamConfigStore.CompletedDrop completed,
+            int partitionIndex) {
+        return streamConfigStore.verifyCompletedDrop(id, completed)
+            .thenCompose(ignored -> mappingForCompletedDrop(
+                id, partitionIndex, completed.config()))
+            .thenCompose(mapping -> recoverCompletedDroppedPartition(
+                id, partitionIndex, completed, mapping,
+                new PartitionMetadataRetry()))
+            .thenCompose(tombstone -> cleanupCompletedDroppedPartition(
+                id, partitionIndex, completed, tombstone));
     }
 
     private CompletableFuture<OptionalLong> mappingForCompletedDrop(
