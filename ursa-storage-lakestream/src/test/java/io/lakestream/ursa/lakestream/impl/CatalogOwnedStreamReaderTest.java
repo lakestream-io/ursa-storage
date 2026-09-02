@@ -39,7 +39,7 @@ class CatalogOwnedStreamReaderTest {
         when(delegate.read(LogId.of(1L), 0L, 1, 1024L)).thenReturn(source);
         AtomicBoolean handleReleased = new AtomicBoolean();
         CatalogOwnedStreamReader reader = new CatalogOwnedStreamReader(
-            delegate, () -> handleReleased.set(true));
+            delegate, Runnable::run, () -> handleReleased.set(true));
 
         CompletableFuture<StreamReader.ReadResult> exposed =
             reader.read(LogId.of(1L), 0L, 1, 1024L);
@@ -80,7 +80,7 @@ class CatalogOwnedStreamReaderTest {
         when(delegate.read(LogId.of(3L), 0L, 1, 1024L)).thenReturn(source);
         AtomicBoolean handleReleased = new AtomicBoolean();
         CatalogOwnedStreamReader reader = new CatalogOwnedStreamReader(
-            delegate, () -> handleReleased.set(true));
+            delegate, Runnable::run, () -> handleReleased.set(true));
         CompletableFuture<StreamReader.ReadResult> exposed =
             reader.read(LogId.of(3L), 0L, 1, 1024L);
         assertTrue(exposed.cancel(false));
@@ -114,7 +114,7 @@ class CatalogOwnedStreamReaderTest {
         doThrow(closeFailure).doNothing().when(delegate).close();
         AtomicBoolean handleReleased = new AtomicBoolean();
         CatalogOwnedStreamReader reader = new CatalogOwnedStreamReader(
-            delegate, () -> handleReleased.set(true));
+            delegate, Runnable::run, () -> handleReleased.set(true));
 
         assertThrows(IOException.class, reader::close);
         assertFalse(handleReleased.get());
@@ -133,7 +133,7 @@ class CatalogOwnedStreamReaderTest {
         when(delegate.read(LogId.of(2L), 0L, 1, 1024L)).thenReturn(source);
         AtomicBoolean handleReleased = new AtomicBoolean();
         CatalogOwnedStreamReader reader = new CatalogOwnedStreamReader(
-            delegate, () -> handleReleased.set(true));
+            delegate, Runnable::run, () -> handleReleased.set(true));
 
         CompletableFuture<Void> callback = reader.read(LogId.of(2L), 0L, 1, 1024L)
             .thenAccept(result -> {

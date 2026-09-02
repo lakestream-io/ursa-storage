@@ -24,8 +24,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
@@ -46,13 +44,6 @@ final class LeasedLog implements Log {
     private static final long DEFAULT_CLOSE_TIMEOUT_MILLIS = TimeUnit.SECONDS.toMillis(10);
     private static final long EVENTUAL_CLOSE_INITIAL_RETRY_MILLIS = 100L;
     private static final long EVENTUAL_CLOSE_MAX_RETRY_MILLIS = TimeUnit.SECONDS.toMillis(10);
-    private static final ExecutorService DEFAULT_DELEGATE_CLOSE_EXECUTOR =
-        Executors.newFixedThreadPool(2, task -> {
-            Thread thread = new Thread(task, "lakestream-default-log-close");
-            thread.setDaemon(true);
-            thread.setContextClassLoader(LeasedLog.class.getClassLoader());
-            return thread;
-        });
 
     private final Log delegate;
     private final LogId logId;
@@ -118,16 +109,6 @@ final class LeasedLog implements Log {
                 }
             }
         }
-    }
-
-    LeasedLog(Log delegate, StreamWriteLease lease) {
-        this(delegate, lease, DEFAULT_CLOSE_TIMEOUT_MILLIS, true,
-            DEFAULT_DELEGATE_CLOSE_EXECUTOR, () -> { });
-    }
-
-    LeasedLog(Log delegate, StreamWriteLease lease, long closeTimeoutMillis) {
-        this(delegate, lease, closeTimeoutMillis, true,
-            DEFAULT_DELEGATE_CLOSE_EXECUTOR, () -> { });
     }
 
     LeasedLog(

@@ -33,6 +33,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -50,7 +51,7 @@ class LeasedLogTest {
         when(delegate.id()).thenReturn(LogId.of(17L));
         when(delegate.append(1, Unpooled.EMPTY_BUFFER)).thenReturn(pendingAppend);
         when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease);
+        LeasedLog log = new LeasedLog(delegate, lease, Runnable::run, () -> { });
 
         CompletableFuture<LogEntryHeader> append = log.append(1, Unpooled.EMPTY_BUFFER);
         CompletableFuture<Void> close = CompletableFuture.runAsync(() -> {
@@ -89,7 +90,7 @@ class LeasedLogTest {
         var payload = Unpooled.buffer(1).writeByte(9);
         when(delegate.append(1, payload)).thenReturn(pendingAppend);
         when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease);
+        LeasedLog log = new LeasedLog(delegate, lease, Runnable::run, () -> { });
 
         CompletableFuture<LogEntryHeader> callerFuture = log.append(1, payload);
         assertFalse(callerFuture.cancel(false));
@@ -127,7 +128,7 @@ class LeasedLogTest {
         when(delegate.id()).thenReturn(LogId.of(33L));
         when(delegate.readEntries(0L, 1, 1024L)).thenReturn(pendingRead);
         when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease, 25L);
+        LeasedLog log = new LeasedLog(delegate, lease, 25L, Runnable::run);
 
         CompletableFuture<List<LogEntry>> read = log.readEntries(0L, 1, 1024L);
         assertTrue(read.cancel(false));
@@ -157,7 +158,7 @@ class LeasedLogTest {
         when(delegate.id()).thenReturn(LogId.of(22L));
         when(delegate.softTrim(9L)).thenReturn(pendingTrim);
         when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease);
+        LeasedLog log = new LeasedLog(delegate, lease, Runnable::run, () -> { });
 
         CompletableFuture<Long> trim = log.softTrim(9L);
         CompletableFuture<Void> close = CompletableFuture.runAsync(() -> {
@@ -185,7 +186,7 @@ class LeasedLogTest {
         when(delegate.id()).thenReturn(LogId.of(18L));
         when(delegate.append(1, Unpooled.EMPTY_BUFFER)).thenThrow(appendFailure);
         when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease);
+        LeasedLog log = new LeasedLog(delegate, lease, Runnable::run, () -> { });
 
         assertSame(appendFailure,
             assertThrows(RuntimeException.class,
@@ -204,7 +205,7 @@ class LeasedLogTest {
         when(delegate.id()).thenReturn(LogId.of(19L));
         doThrow(delegateFailure).doNothing().when(delegate).close();
         when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease);
+        LeasedLog log = new LeasedLog(delegate, lease, Runnable::run, () -> { });
 
         assertSame(delegateFailure, assertThrows(IOException.class, log::close));
         verify(lease, never()).closeAsync();
@@ -225,7 +226,7 @@ class LeasedLogTest {
         when(lease.closeAsync())
             .thenReturn(CompletableFuture.failedFuture(leaseFailure))
             .thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease);
+        LeasedLog log = new LeasedLog(delegate, lease, Runnable::run, () -> { });
 
         assertSame(leaseFailure, assertThrows(RuntimeException.class, log::close));
         log.close();
@@ -245,7 +246,7 @@ class LeasedLogTest {
             .thenReturn(CompletableFuture.completedFuture(delegateCursor));
         when(delegateCursor.log()).thenReturn(delegate);
         when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease);
+        LeasedLog log = new LeasedLog(delegate, lease, Runnable::run, () -> { });
 
         LogCursor cursor = log.openEphemeralCursor("reader", 0L).get();
 
@@ -271,7 +272,7 @@ class LeasedLogTest {
             .thenReturn(CompletableFuture.completedFuture(delegateCursor));
         when(delegateCursor.readEntries(1, 1024L)).thenReturn(pendingRead);
         when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease, 25L);
+        LeasedLog log = new LeasedLog(delegate, lease, 25L, Runnable::run);
         LogCursor cursor = log.openEphemeralCursor("reader", 0L).get();
 
         CompletableFuture<List<LogEntry>> read = cursor.readEntries(1, 1024L);
@@ -312,7 +313,7 @@ class LeasedLogTest {
             .thenReturn(CompletableFuture.completedFuture(delegateCursor));
         when(delegateCursor.persistState()).thenReturn(pendingPersistence);
         when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease);
+        LeasedLog log = new LeasedLog(delegate, lease, Runnable::run, () -> { });
         LogCursor cursor = log.openEphemeralCursor("reader", 0L).get();
 
         CompletableFuture<Void> persistence = cursor.persistState();
@@ -351,7 +352,7 @@ class LeasedLogTest {
             .thenReturn(CompletableFuture.completedFuture(delegateCursor));
         doThrow(cursorCloseFailure).doNothing().when(delegateCursor).close();
         when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease, 25L);
+        LeasedLog log = new LeasedLog(delegate, lease, 25L, Runnable::run);
         LogCursor cursor = log.openEphemeralCursor("reader", 0L).get();
 
         assertSame(cursorCloseFailure, assertThrows(IOException.class, cursor::close));
@@ -377,7 +378,7 @@ class LeasedLogTest {
         doThrow(new IOException("transient close failure"))
             .doNothing().when(delegate).close();
         when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease);
+        LeasedLog log = new LeasedLog(delegate, lease, Runnable::run, () -> { });
 
         log.closeEventually(Runnable::run).get(5, TimeUnit.SECONDS);
 
@@ -458,7 +459,7 @@ class LeasedLogTest {
         when(delegate.id()).thenReturn(LogId.of(24L));
         when(delegate.append(1, Unpooled.EMPTY_BUFFER)).thenReturn(pendingAppend);
         when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease, 25L);
+        LeasedLog log = new LeasedLog(delegate, lease, 25L, Runnable::run);
         log.append(1, Unpooled.EMPTY_BUFFER);
 
         IOException timeout = assertThrows(IOException.class, log::close);
@@ -489,19 +490,28 @@ class LeasedLogTest {
             return null;
         }).when(delegate).close();
         when(lease.closeAsync()).thenReturn(CompletableFuture.completedFuture(null));
-        LeasedLog log = new LeasedLog(delegate, lease, 25L);
+        // A real background executor is required here: the delegate close is deliberately
+        // blocked on allowDelegateClose, which this same (calling) thread releases below. An
+        // inline (Runnable::run) executor would run delegate.close() synchronously and deadlock.
+        ExecutorService delegateCloseExecutor = Executors.newSingleThreadExecutor();
+        try {
+            LeasedLog log = new LeasedLog(delegate, lease, 25L, delegateCloseExecutor);
 
-        IOException timeout = assertThrows(IOException.class, log::close);
+            IOException timeout = assertThrows(IOException.class, log::close);
 
-        assertTrue(timeout.getMessage().contains("delegate log"));
-        assertTrue(delegateCloseStarted.await(5, TimeUnit.SECONDS));
-        verify(lease, never()).closeAsync();
+            assertTrue(timeout.getMessage().contains("delegate log"));
+            assertTrue(delegateCloseStarted.await(5, TimeUnit.SECONDS));
+            verify(lease, never()).closeAsync();
 
-        allowDelegateClose.countDown();
-        assertTrue(delegateCloseFinished.await(5, TimeUnit.SECONDS));
-        log.close();
-        verify(delegate, times(1)).close();
-        verify(lease).closeAsync();
+            allowDelegateClose.countDown();
+            assertTrue(delegateCloseFinished.await(5, TimeUnit.SECONDS));
+            log.close();
+            verify(delegate, times(1)).close();
+            verify(lease).closeAsync();
+        } finally {
+            allowDelegateClose.countDown();
+            delegateCloseExecutor.shutdownNow();
+        }
     }
 
     @Test
@@ -512,7 +522,7 @@ class LeasedLogTest {
         CompletableFuture<Void> pendingRelease = new CompletableFuture<>();
         when(delegate.id()).thenReturn(LogId.of(26L));
         when(lease.closeAsync()).thenReturn(pendingRelease);
-        LeasedLog log = new LeasedLog(delegate, lease, 25L);
+        LeasedLog log = new LeasedLog(delegate, lease, 25L, Runnable::run);
 
         IOException timeout = assertThrows(IOException.class, log::close);
 

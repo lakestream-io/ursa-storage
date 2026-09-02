@@ -15,8 +15,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
@@ -37,13 +35,6 @@ final class CatalogOwnedStreamReader implements StreamReader {
     private static final long CLOSE_TIMEOUT_MILLIS = TimeUnit.SECONDS.toMillis(10);
     private static final long EVENTUAL_CLOSE_INITIAL_RETRY_MILLIS = 100L;
     private static final long EVENTUAL_CLOSE_MAX_RETRY_MILLIS = TimeUnit.SECONDS.toMillis(10);
-    private static final ExecutorService DEFAULT_DELEGATE_CLOSE_EXECUTOR =
-        Executors.newFixedThreadPool(2, task -> {
-            Thread thread = new Thread(task, "lakestream-default-reader-close");
-            thread.setDaemon(true);
-            thread.setContextClassLoader(CatalogOwnedStreamReader.class.getClassLoader());
-            return thread;
-        });
 
     private final StreamReader delegate;
     private final Executor delegateCloseExecutor;
@@ -102,11 +93,6 @@ final class CatalogOwnedStreamReader implements StreamReader {
                 }
             }
         }
-    }
-
-    CatalogOwnedStreamReader(StreamReader delegate, Runnable onFullyClosed) {
-        this(delegate, DEFAULT_DELEGATE_CLOSE_EXECUTOR, onFullyClosed,
-            CLOSE_TIMEOUT_MILLIS);
     }
 
     CatalogOwnedStreamReader(

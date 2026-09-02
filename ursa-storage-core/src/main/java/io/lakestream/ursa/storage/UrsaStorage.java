@@ -26,6 +26,7 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -50,14 +51,6 @@ public class UrsaStorage implements AutoCloseable {
     private static final long FAILED_DATA_PLANE_CLOSE_INITIAL_RETRY_MILLIS = 100L;
     private static final long FAILED_DATA_PLANE_CLOSE_MAX_RETRY_MILLIS =
         TimeUnit.SECONDS.toMillis(10);
-    private static final ExecutorService FAILED_DATA_PLANE_CLOSE_EXECUTOR =
-        new ThreadPoolExecutor(
-            2, 2, 0L, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(64), task -> {
-                Thread thread = new Thread(task, "ursa-failed-data-plane-close");
-                thread.setDaemon(true);
-                thread.setContextClassLoader(UrsaStorage.class.getClassLoader());
-                return thread;
-            }, new ThreadPoolExecutor.AbortPolicy());
 
     @FunctionalInterface
     interface DataPlaneFactory {
@@ -83,6 +76,7 @@ public class UrsaStorage implements AutoCloseable {
     private final LazyWalStorage defaultWalStorage;
     private final Object dataPlaneLock = new Object();
     private final long closeTimeoutNanos;
+    private final ExecutorService failedDataPlaneCloseExecutor;
 
     private final boolean internalCreatedOxia;
     private final AsyncOxiaClient oxiaClient;
@@ -104,7 +98,7 @@ public class UrsaStorage implements AutoCloseable {
 
     public UrsaStorage(StorageConfig config, OpenTelemetry otel,
                        AsyncOxiaClient client) throws Exception {
-        this(config, otel, client, UrsaStorage::createDataPlane);
+        this(config, otel, client, null);
     }
 
     UrsaStorage(StorageConfig config, OpenTelemetry otel, AsyncOxiaClient client,
@@ -117,7 +111,6 @@ public class UrsaStorage implements AutoCloseable {
                 boolean ownsProvidedOxiaClient) throws Exception {
         this.config = Objects.requireNonNull(config, "config");
         Objects.requireNonNull(otel, "otel");
-        this.dataPlaneFactory = Objects.requireNonNull(dataPlaneFactory, "dataPlaneFactory");
         this.closeTimeoutNanos = positiveDurationNanos(closeTimeout, "closeTimeout");
         this.internalCreatedOxia = client == null || ownsProvidedOxiaClient;
         this.oxiaClient = client == null ? createOxiaClient(config, otel) : client;
@@ -128,12 +121,30 @@ public class UrsaStorage implements AutoCloseable {
         this.defaultStorageApi = new PersistStorageApi(
             config, oxiaClient, defaultWalStorage, instrumentProvider,
             storageFormat, streamStateManager);
+        this.failedDataPlaneCloseExecutor = new ThreadPoolExecutor(
+            2, 2, 0L, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(64), task -> {
+                Thread thread = new Thread(task, "ursa-failed-data-plane-close");
+                thread.setDaemon(true);
+                thread.setContextClassLoader(UrsaStorage.class.getClassLoader());
+                return thread;
+            }, new ThreadPoolExecutor.AbortPolicy());
+        this.dataPlaneFactory = dataPlaneFactory != null
+            ? dataPlaneFactory : this::createDefaultDataPlane;
+    }
+
+    private DataPlane createDefaultDataPlane(
+            StorageConfig dataPlaneConfig, InstrumentProvider dataPlaneInstrumentProvider,
+            AsyncOxiaClient dataPlaneOxiaClient, StorageFormat dataPlaneStorageFormat,
+            LogStateManager dataPlaneStreamStateManager) throws Exception {
+        return createDataPlane(dataPlaneConfig, dataPlaneInstrumentProvider, dataPlaneOxiaClient,
+            dataPlaneStorageFormat, dataPlaneStreamStateManager, failedDataPlaneCloseExecutor);
     }
 
     private static DataPlane createDataPlane(
             StorageConfig config, InstrumentProvider instrumentProvider,
             AsyncOxiaClient oxiaClient, StorageFormat storageFormat,
-            LogStateManager streamStateManager) throws Exception {
+            LogStateManager streamStateManager,
+            Executor failedDataPlaneCloseExecutor) throws Exception {
         FileStorage fileStorage = FileStorage.create(config, instrumentProvider);
         WalStorage walStorage = null;
         try {
@@ -146,7 +157,8 @@ public class UrsaStorage implements AutoCloseable {
             walStorage.initialize();
             return new DataPlane(fileStorage, walStorage);
         } catch (Exception | Error failure) {
-            closeDataPlaneAfterFailure(fileStorage, walStorage, failure);
+            closeDataPlaneAfterFailure(
+                fileStorage, walStorage, failure, failedDataPlaneCloseExecutor);
             throw failure;
         }
     }
@@ -170,15 +182,17 @@ public class UrsaStorage implements AutoCloseable {
     }
 
     private static void closeDataPlaneAfterFailure(
-            FileStorage fileStorage, WalStorage walStorage, Throwable failure) {
+            FileStorage fileStorage, WalStorage walStorage, Throwable failure,
+            Executor executor) {
         closeDataPlaneAfterFailure(
-            fileStorage, walStorage, failure, DEFAULT_CLOSE_TIMEOUT);
+            fileStorage, walStorage, failure, DEFAULT_CLOSE_TIMEOUT, executor);
     }
 
     static void closeDataPlaneAfterFailure(
             FileStorage fileStorage, WalStorage walStorage, Throwable failure,
-            Duration closeTimeout) {
+            Duration closeTimeout, Executor executor) {
         Objects.requireNonNull(failure, "failure");
+        Objects.requireNonNull(executor, "executor");
         long timeoutNanos = positiveDurationNanos(closeTimeout, "closeTimeout");
         if (walStorage == null) {
             closeFileStorageAfterFailure(fileStorage, failure);
@@ -186,7 +200,7 @@ public class UrsaStorage implements AutoCloseable {
         }
 
         FailedDataPlaneCleanup cleanup = new FailedDataPlaneCleanup(
-            fileStorage, walStorage, failure);
+            fileStorage, walStorage, failure, executor);
         CompletableFuture<Void> cleanupFuture = cleanup.start();
 
         try {
@@ -226,16 +240,19 @@ public class UrsaStorage implements AutoCloseable {
         private final FileStorage fileStorage;
         private final WalStorage walStorage;
         private final Throwable initializationFailure;
+        private final Executor executor;
         private final CompletableFuture<Void> completion = new CompletableFuture<>();
         private boolean cleanupFailureRecorded;
 
         private FailedDataPlaneCleanup(
                 FileStorage fileStorage,
                 WalStorage walStorage,
-                Throwable initializationFailure) {
+                Throwable initializationFailure,
+                Executor executor) {
             this.fileStorage = fileStorage;
             this.walStorage = walStorage;
             this.initializationFailure = initializationFailure;
+            this.executor = executor;
         }
 
         private CompletableFuture<Void> start() {
@@ -245,7 +262,7 @@ public class UrsaStorage implements AutoCloseable {
 
         private void attemptWalClose(int retryAttempt) {
             try {
-                FAILED_DATA_PLANE_CLOSE_EXECUTOR.execute(() -> {
+                executor.execute(() -> {
                     final CompletableFuture<Void> walClose;
                     try {
                         walClose = Objects.requireNonNull(
@@ -277,7 +294,7 @@ public class UrsaStorage implements AutoCloseable {
                 return;
             }
             try {
-                FAILED_DATA_PLANE_CLOSE_EXECUTOR.execute(() -> {
+                executor.execute(() -> {
                     try {
                         fileStorage.close();
                         completion.complete(null);
@@ -438,6 +455,7 @@ public class UrsaStorage implements AutoCloseable {
             oxiaClientClosed = true;
         }
         resourcesClosed = true;
+        failedDataPlaneCloseExecutor.shutdown();
     }
 
     private static void awaitWalClose(

@@ -465,7 +465,7 @@ class UrsaStorageLazyInitializationTest {
         assertTimeout(Duration.ofSeconds(2), () ->
             UrsaStorage.closeDataPlaneAfterFailure(
                 fileStorage, walStorage, initializationFailure,
-                Duration.ofMillis(100)));
+                Duration.ofMillis(100), Runnable::run));
 
         verify(walStorage).close();
         verify(fileStorage, never()).close();
@@ -496,7 +496,7 @@ class UrsaStorageLazyInitializationTest {
         assertTimeout(Duration.ofSeconds(2), () ->
             UrsaStorage.closeDataPlaneAfterFailure(
                 fileStorage, walStorage, initializationFailure,
-                Duration.ofSeconds(1)));
+                Duration.ofSeconds(1), Runnable::run));
 
         InOrder closeOrder = inOrder(walStorage, fileStorage);
         closeOrder.verify(walStorage, times(2)).close();
@@ -520,7 +520,7 @@ class UrsaStorageLazyInitializationTest {
         assertTimeout(Duration.ofSeconds(2), () ->
             UrsaStorage.closeDataPlaneAfterFailure(
                 fileStorage, walStorage, initializationFailure,
-                Duration.ofSeconds(1)));
+                Duration.ofSeconds(1), Runnable::run));
 
         InOrder closeOrder = inOrder(walStorage, fileStorage);
         closeOrder.verify(walStorage, times(2)).close();
