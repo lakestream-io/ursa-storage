@@ -15,17 +15,16 @@ import io.lakestream.api.LogStorage;
 import io.lakestream.api.Position;
 import io.lakestream.ursa.storage.OwnedResultFutures;
 import io.lakestream.ursa.storage.StorageApi.StreamWriteLease;
+import io.lakestream.ursa.utils.EventualRetry;
+import io.lakestream.ursa.utils.FutureUtils;
 import io.netty.buffer.ByteBuf;
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
@@ -46,8 +45,6 @@ import lombok.extern.slf4j.Slf4j;
 final class LeasedLog implements Log {
 
     private static final long DEFAULT_CLOSE_TIMEOUT_MILLIS = TimeUnit.SECONDS.toMillis(10);
-    private static final long EVENTUAL_CLOSE_INITIAL_RETRY_MILLIS = 100L;
-    private static final long EVENTUAL_CLOSE_MAX_RETRY_MILLIS = TimeUnit.SECONDS.toMillis(10);
 
     private final Log delegate;
     private final LogId logId;
@@ -192,73 +189,20 @@ final class LeasedLog implements Log {
         Objects.requireNonNull(executor, "executor");
         CompletableFuture<Void> result = new CompletableFuture<>();
         ClassLoader contextClassLoader = Thread.currentThread().getContextClassLoader();
-        attemptEventualLeaseRelease(lease, contextClassLoader, executor, result, 0);
+        EventualRetry.start(
+            executor, "releasing the write lease for log " + lease.streamId(),
+            () -> releaseUnderContextClassLoader(lease, contextClassLoader), result);
         return OwnedResultFutures.nonCancellableCompletion(result);
     }
 
-    private static void attemptEventualLeaseRelease(
-            StreamWriteLease lease,
-            ClassLoader contextClassLoader,
-            Executor executor,
-            CompletableFuture<Void> result,
-            int retryAttempt) {
+    private static CompletableFuture<Void> releaseUnderContextClassLoader(
+            StreamWriteLease lease, ClassLoader contextClassLoader) {
+        ClassLoader previousClassLoader = Thread.currentThread().getContextClassLoader();
+        Thread.currentThread().setContextClassLoader(contextClassLoader);
         try {
-            executor.execute(() -> {
-            ClassLoader previousClassLoader = Thread.currentThread().getContextClassLoader();
-            Thread.currentThread().setContextClassLoader(contextClassLoader);
-            final CompletableFuture<Void> release;
-            try {
-                release = Objects.requireNonNull(lease.closeAsync(), "lease close future");
-            } catch (Throwable failure) {
-                scheduleEventualLeaseReleaseRetry(
-                    lease, contextClassLoader, executor, result, retryAttempt, failure);
-                Thread.currentThread().setContextClassLoader(previousClassLoader);
-                return;
-            }
+            return Objects.requireNonNull(lease.closeAsync(), "lease close future");
+        } finally {
             Thread.currentThread().setContextClassLoader(previousClassLoader);
-            release.whenComplete((ignored, failure) -> {
-                if (failure == null) {
-                    result.complete(null);
-                } else {
-                    scheduleEventualLeaseReleaseRetry(
-                        lease, contextClassLoader, executor, result, retryAttempt,
-                        unwrapCompletionFailure(failure));
-                }
-            });
-            });
-        } catch (Throwable failure) {
-            scheduleEventualLeaseReleaseRetry(
-                lease, contextClassLoader, executor, result, retryAttempt, failure);
-        }
-    }
-
-    private static void scheduleEventualLeaseReleaseRetry(
-            StreamWriteLease lease,
-            ClassLoader contextClassLoader,
-            Executor executor,
-            CompletableFuture<Void> result,
-            int retryAttempt,
-            Throwable failure) {
-        if (isShutDownRejection(executor, failure)) {
-            // The executor is gone, so no retry can ever run. Nothing else will free this lease;
-            // report that rather than rescheduling against a permanently rejecting executor.
-            log.warn("Giving up on releasing the write lease for log {}: its close executor is "
-                + "shut down", lease.streamId(), failure);
-            result.completeExceptionally(failure);
-            return;
-        }
-        int nextAttempt = retryAttempt == Integer.MAX_VALUE
-            ? Integer.MAX_VALUE : retryAttempt + 1;
-        long retryDelayMillis = eventualCloseRetryDelayMillis(retryAttempt);
-        log.warn("Failed to release write lease for log {}; retrying in {} ms (attempt {})",
-            lease.streamId(), retryDelayMillis, nextAttempt, failure);
-        try {
-            CompletableFuture.delayedExecutor(retryDelayMillis, TimeUnit.MILLISECONDS)
-                .execute(() -> attemptEventualLeaseRelease(
-                    lease, contextClassLoader, executor, result, nextAttempt));
-        } catch (Throwable schedulingFailure) {
-            failure.addSuppressed(schedulingFailure);
-            result.completeExceptionally(failure);
         }
     }
 
@@ -679,67 +623,22 @@ final class LeasedLog implements Log {
             return eventualCloseFuture;
         }
         eventualCloseFuture = new CompletableFuture<>();
-        attemptEventualClose(executor, eventualCloseFuture, 0);
+        EventualRetry.start(
+            executor,
+            "closing log " + lease.streamId() + " and releasing its write lease",
+            this::closeUnderContextClassLoader, eventualCloseFuture);
         return eventualCloseFuture;
     }
 
-    private void attemptEventualClose(
-            Executor executor, CompletableFuture<Void> result, int retryAttempt) {
+    private CompletableFuture<Void> closeUnderContextClassLoader() throws Exception {
+        ClassLoader previousClassLoader = Thread.currentThread().getContextClassLoader();
+        Thread.currentThread().setContextClassLoader(contextClassLoader);
         try {
-            executor.execute(() -> {
-            ClassLoader previousClassLoader = Thread.currentThread().getContextClassLoader();
-            Thread.currentThread().setContextClassLoader(contextClassLoader);
-            try {
-                close();
-                result.complete(null);
-            } catch (Throwable failure) {
-                scheduleEventualCloseRetry(executor, result, retryAttempt, failure);
-            } finally {
-                Thread.currentThread().setContextClassLoader(previousClassLoader);
-            }
-            });
-        } catch (Throwable failure) {
-            scheduleEventualCloseRetry(executor, result, retryAttempt, failure);
+            close();
+            return null;
+        } finally {
+            Thread.currentThread().setContextClassLoader(previousClassLoader);
         }
-    }
-
-    private void scheduleEventualCloseRetry(
-            Executor executor,
-            CompletableFuture<Void> result,
-            int retryAttempt,
-            Throwable failure) {
-        if (isShutDownRejection(executor, failure)) {
-            // Unlike a transient "queue full" rejection, one from an already shut-down executor
-            // never succeeds on retry. Give up and report it instead of retrying forever.
-            log.warn("Giving up on closing log {} and releasing its write lease: its close "
-                    + "executor is shut down", lease.streamId(), failure);
-            result.completeExceptionally(failure);
-            return;
-        }
-        int nextAttempt = retryAttempt == Integer.MAX_VALUE
-            ? Integer.MAX_VALUE : retryAttempt + 1;
-        long retryDelayMillis = eventualCloseRetryDelayMillis(retryAttempt);
-        log.warn("Failed to close log {} and release its write lease; retrying in {} ms "
-                + "(attempt {})", lease.streamId(), retryDelayMillis, nextAttempt, failure);
-        try {
-            CompletableFuture.delayedExecutor(retryDelayMillis, TimeUnit.MILLISECONDS)
-                .execute(() -> attemptEventualClose(executor, result, nextAttempt));
-        } catch (Throwable schedulingFailure) {
-            failure.addSuppressed(schedulingFailure);
-            result.completeExceptionally(failure);
-        }
-    }
-
-    private static boolean isShutDownRejection(Executor executor, Throwable failure) {
-        return failure instanceof RejectedExecutionException
-            && executor instanceof ExecutorService service
-            && service.isShutdown();
-    }
-
-    private static long eventualCloseRetryDelayMillis(int retryAttempt) {
-        int shift = Math.min(Math.max(retryAttempt, 0), 30);
-        long exponentialDelay = EVENTUAL_CLOSE_INITIAL_RETRY_MILLIS << shift;
-        return Math.min(exponentialDelay, EVENTUAL_CLOSE_MAX_RETRY_MILLIS);
     }
 
     private CompletableFuture<Void> startDelegateClose() {
@@ -779,22 +678,13 @@ final class LeasedLog implements Log {
             Thread.currentThread().interrupt();
             throw new IOException("Interrupted while waiting for " + description, failure);
         } catch (ExecutionException failure) {
-            throwCloseFailure(unwrapCompletionFailure(failure));
+            throwCloseFailure(FutureUtils.unwrapCompletionException(failure));
         }
     }
 
     private IOException closeTimeout(String description, Throwable cause) {
         String message = "Timed out after " + closeTimeoutMillis + " ms waiting for " + description;
         return cause == null ? new IOException(message) : new IOException(message, cause);
-    }
-
-    private static Throwable unwrapCompletionFailure(Throwable failure) {
-        Throwable current = failure;
-        while ((current instanceof CompletionException || current instanceof ExecutionException)
-                && current.getCause() != null) {
-            current = current.getCause();
-        }
-        return current;
     }
 
     private ScopedLogCursor wrapCursor(LogCursor cursor) {

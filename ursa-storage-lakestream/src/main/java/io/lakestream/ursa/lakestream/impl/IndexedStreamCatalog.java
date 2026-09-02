@@ -51,6 +51,8 @@ import io.lakestream.ursa.storage.StorageApi.StreamIdMappingOwner;
 import io.lakestream.ursa.storage.StorageApi.StreamWriteLease;
 import io.lakestream.ursa.storage.impl.EntryIndexCache;
 import io.lakestream.ursa.storage.impl.exception.NoSuchKeyException;
+import io.lakestream.ursa.utils.EventualRetry;
+import io.lakestream.ursa.utils.FutureUtils;
 import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.GetResult;
 import io.oxia.client.api.PutResult;
@@ -108,9 +110,6 @@ public class IndexedStreamCatalog implements StreamCatalog {
     private static final int PROVISIONING_PARALLELISM = 8;
     private static final long PARTITION_METADATA_RETRY_DELAY_MILLIS = 10L;
     private static final long CATALOG_CLOSE_TIMEOUT_MILLIS = TimeUnit.SECONDS.toMillis(10);
-    private static final long ABANDONED_HANDLE_INITIAL_RETRY_MILLIS = 100L;
-    private static final long ABANDONED_HANDLE_MAX_RETRY_MILLIS =
-        TimeUnit.SECONDS.toMillis(10);
     private static final int FAILED_OPEN_CLEANUP_QUEUE_CAPACITY = 64;
     private static final int DELEGATE_CLOSE_THREADS = 2;
 
@@ -655,7 +654,7 @@ public class IndexedStreamCatalog implements StreamCatalog {
                 if (attempt.failure() == null) {
                     return writeAfterAllocation.apply(attempt.streamId());
                 }
-                Throwable cause = rootCause(attempt.failure());
+                Throwable cause = FutureUtils.unwrapCompletionException(attempt.failure());
                 if (cause instanceof KeyedAllocationInvalidatedException invalidated) {
                     return compensateRejectedNativeAllocation(
                         id, partitionIndex, allocationKey,
@@ -681,7 +680,7 @@ public class IndexedStreamCatalog implements StreamCatalog {
                     return writePartitionMetadataForExpansion(
                         id, partitionIndex, streamId, claim).thenApply(ignored -> null);
                 }
-                Throwable cause = rootCause(failure);
+                Throwable cause = FutureUtils.unwrapCompletionException(failure);
                 if (!(cause instanceof IndexedStreamConfigStore
                         .ExpansionOwnershipLostException)) {
                     return CompletableFuture.failedFuture(cause);
@@ -765,7 +764,7 @@ public class IndexedStreamCatalog implements StreamCatalog {
                     return writePartitionMetadataForNativeClaim(
                         id, partitionIndex, streamId, claim).thenApply(ignored -> null);
                 }
-                Throwable cause = rootCause(failure);
+                Throwable cause = FutureUtils.unwrapCompletionException(failure);
                 if (!(cause
                         instanceof IndexedStreamConfigStore.ProvisioningOwnershipLostException)) {
                     return CompletableFuture.failedFuture(cause);
@@ -856,7 +855,7 @@ public class IndexedStreamCatalog implements StreamCatalog {
                         cleanupDisposition, ownershipVerifier))
                     .handle((ignored, cleanupFailure) -> {
                         if (cleanupFailure != null) {
-                            Throwable cause = rootCause(cleanupFailure);
+                            Throwable cause = FutureUtils.unwrapCompletionException(cleanupFailure);
                             if (cause != ownershipFailure) {
                                 ownershipFailure.addSuppressed(cause);
                             }
@@ -1147,7 +1146,7 @@ public class IndexedStreamCatalog implements StreamCatalog {
                 if (attempt.failure() == null) {
                     return CompletableFuture.completedFuture(attempt.metadata());
                 }
-                Throwable cause = rootCause(attempt.failure());
+                Throwable cause = FutureUtils.unwrapCompletionException(attempt.failure());
                 if (!(cause instanceof RetiredCleanupRetryException)
                         || remainingAttempts == 0) {
                     return CompletableFuture.failedFuture(cause);
@@ -1666,15 +1665,6 @@ public class IndexedStreamCatalog implements StreamCatalog {
 
     }
 
-    private static Throwable rootCause(Throwable failure) {
-        Throwable current = failure;
-        while ((current instanceof CompletionException || current instanceof java.util.concurrent.ExecutionException)
-                && current.getCause() != null) {
-            current = current.getCause();
-        }
-        return current;
-    }
-
     private CompletableFuture<LifecycleContextRead> readLifecycleContextForCleanup(
             StreamIdentifier id, Throwable originalFailure) {
         return streamConfigStore.readLifecycleContext(id)
@@ -1697,7 +1687,7 @@ public class IndexedStreamCatalog implements StreamCatalog {
     }
 
     private static void addSuppressed(Throwable target, Throwable failure) {
-        Throwable cause = rootCause(failure);
+        Throwable cause = FutureUtils.unwrapCompletionException(failure);
         if (cause == target) {
             return;
         }
@@ -2193,12 +2183,8 @@ public class IndexedStreamCatalog implements StreamCatalog {
         }
     }
 
-    private static Throwable unwrap(Throwable ex) {
-        return ex instanceof CompletionException && ex.getCause() != null ? ex.getCause() : ex;
-    }
-
     private static Throwable unwrapNullable(Throwable failure) {
-        return failure == null ? null : unwrap(failure);
+        return failure == null ? null : CompletionFailures.unwrap(failure);
     }
 
     @Override
@@ -2244,7 +2230,7 @@ public class IndexedStreamCatalog implements StreamCatalog {
                     if (failure == null) {
                         return namespace.materialization();
                     }
-                    Throwable cause = rootCause(failure);
+                    Throwable cause = FutureUtils.unwrapCompletionException(failure);
                     if (cause instanceof NoSuchNamespaceException) {
                         return Optional.<TableMaterializationPolicy>empty();
                     }
@@ -2534,7 +2520,7 @@ public class IndexedStreamCatalog implements StreamCatalog {
                 if (failure == null) {
                     return OptionalLong.of(streamId);
                 }
-                Throwable cause = rootCause(failure);
+                Throwable cause = FutureUtils.unwrapCompletionException(failure);
                 if (cause instanceof NoSuchKeyException) {
                     return OptionalLong.empty();
                 }
@@ -2943,7 +2929,7 @@ public class IndexedStreamCatalog implements StreamCatalog {
                     .closeEventually(failedOpenCleanupExecutor))
                 .whenComplete((ignored, cleanupFailure) -> {
                     if (cleanupFailure != null) {
-                        Throwable cause = unwrap(cleanupFailure);
+                        Throwable cause = CompletionFailures.unwrap(cleanupFailure);
                         addSuppressed(creationFailure, cause);
                         log.error("Failed to supervise cleanup after opening log {} failed",
                             lease.streamId(), cause);
@@ -2963,7 +2949,7 @@ public class IndexedStreamCatalog implements StreamCatalog {
                     lease, failedOpenCleanupExecutor))
                 .whenComplete((ignored, cleanupFailure) -> {
                     if (cleanupFailure != null) {
-                        Throwable cause = unwrap(cleanupFailure);
+                        Throwable cause = CompletionFailures.unwrap(cleanupFailure);
                         addSuppressed(creationFailure, cause);
                         log.error("Failed to supervise release of write lease for log {}",
                             lease.streamId(), cause);
@@ -2984,7 +2970,7 @@ public class IndexedStreamCatalog implements StreamCatalog {
                 superviseOpenCleanup(opened.closeEventually(failedOpenCleanupExecutor))
                     .whenComplete((ignored, cleanupFailure) -> {
                     if (cleanupFailure != null) {
-                        Throwable cause = unwrap(cleanupFailure);
+                        Throwable cause = CompletionFailures.unwrap(cleanupFailure);
                         addSuppressed(openFailure, cause);
                         log.error("Failed to supervise cleanup of partially opened log {}",
                             opened.id(), cause);
@@ -3011,56 +2997,28 @@ public class IndexedStreamCatalog implements StreamCatalog {
         }
     }
 
-    private void startAbandonedWriterCleanup(StreamWriter writer) {
+    /**
+     * Closes a stream writer whose caller dropped it, retrying until the close succeeds.
+     *
+     * @return the supervised cleanup future, so a test can see how the retry chain ends
+     */
+    CompletableFuture<Void> startAbandonedWriterCleanup(StreamWriter writer) {
         CompletableFuture<Void> completion = new CompletableFuture<>();
         CompletableFuture<Void> guarded =
             OwnedResultFutures.nonCancellableCompletion(completion);
         try {
             superviseOpenCleanup(guarded);
-            attemptAbandonedWriterClose(writer, completion, 0);
+            EventualRetry.start(
+                failedOpenCleanupExecutor, "closing an abandoned stream writer",
+                () -> {
+                    writer.close();
+                    return null;
+                }, completion);
         } catch (RuntimeException | Error cleanupFailure) {
             log.error("Failed to start cleanup of abandoned stream writer", cleanupFailure);
             completion.completeExceptionally(cleanupFailure);
         }
-    }
-
-    private void attemptAbandonedWriterClose(
-            StreamWriter writer, CompletableFuture<Void> completion, int retryAttempt) {
-        try {
-            failedOpenCleanupExecutor.execute(() -> {
-                try {
-                    writer.close();
-                    completion.complete(null);
-                } catch (Throwable failure) {
-                    scheduleAbandonedWriterCloseRetry(
-                        writer, completion, retryAttempt, failure);
-                }
-            });
-        } catch (Throwable failure) {
-            scheduleAbandonedWriterCloseRetry(writer, completion, retryAttempt, failure);
-        }
-    }
-
-    private void scheduleAbandonedWriterCloseRetry(
-            StreamWriter writer,
-            CompletableFuture<Void> completion,
-            int retryAttempt,
-            Throwable failure) {
-        int nextAttempt = retryAttempt == Integer.MAX_VALUE
-            ? Integer.MAX_VALUE : retryAttempt + 1;
-        int shift = Math.min(retryAttempt, 6);
-        long delayMillis = Math.min(
-            ABANDONED_HANDLE_INITIAL_RETRY_MILLIS << shift,
-            ABANDONED_HANDLE_MAX_RETRY_MILLIS);
-        log.warn("Failed to close abandoned stream writer; retrying in {} ms (attempt {})",
-            delayMillis, nextAttempt, failure);
-        try {
-            CompletableFuture.delayedExecutor(delayMillis, TimeUnit.MILLISECONDS)
-                .execute(() -> attemptAbandonedWriterClose(writer, completion, nextAttempt));
-        } catch (Throwable schedulingFailure) {
-            failure.addSuppressed(schedulingFailure);
-            completion.completeExceptionally(failure);
-        }
+        return guarded;
     }
 
     private void startAbandonedReaderCleanup(StreamReader opened) {
@@ -3144,7 +3102,7 @@ public class IndexedStreamCatalog implements StreamCatalog {
             if (failure == null) {
                 return CompletableFuture.completedFuture(writer);
             }
-            Throwable cause = unwrap(failure);
+            Throwable cause = CompletionFailures.unwrap(failure);
             startFailedWriterCleanup(opened, cause);
             return CompletableFuture.<StreamWriter>failedFuture(cause);
         }).thenCompose(Function.identity());

@@ -5,6 +5,7 @@
 package io.lakestream.ursa.lakestream.impl;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.doAnswer;
@@ -23,13 +24,33 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
 
 class CatalogOwnedStreamReaderTest {
+
+    @Test
+    void eventualCloseGivesUpOnceItsExecutorIsShutDown() throws Exception {
+        StreamReader delegate = mock(StreamReader.class);
+        CatalogOwnedStreamReader reader = new CatalogOwnedStreamReader(
+            delegate, Runnable::run, () -> { });
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        executor.shutdown();
+
+        // A rejection from a shut-down executor can never succeed on retry. Bounding the wait
+        // turns "would retry forever" into a clear failure.
+        CompletableFuture<Void> close = reader.closeEventually(executor);
+
+        ExecutionException rejected = assertThrows(ExecutionException.class,
+            () -> close.get(5, TimeUnit.SECONDS));
+        assertInstanceOf(RejectedExecutionException.class, rejected.getCause());
+        verify(delegate, never()).close();
+    }
 
     @Test
     void canceledReadStillDrainsAndReleasesLateEntriesBeforeClose() throws Exception {

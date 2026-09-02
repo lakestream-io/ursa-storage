@@ -6,7 +6,6 @@ package io.lakestream.ursa.lakestream.impl;
 
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.IntFunction;
@@ -29,11 +28,6 @@ final class BoundedParallel {
             run.requestLaunch();
         }
         return run.result;
-    }
-
-    private static Throwable unwrap(Throwable failure) {
-        return failure instanceof CompletionException && failure.getCause() != null
-            ? failure.getCause() : failure;
     }
 
     /**
@@ -92,7 +86,7 @@ final class BoundedParallel {
             }
             step.whenComplete((ignored, failure) -> {
                 if (failure != null) {
-                    firstFailure.compareAndSet(null, unwrap(failure));
+                    firstFailure.compareAndSet(null, CompletionFailures.unwrap(failure));
                 }
                 if (!settle(1)) {
                     requestLaunch();

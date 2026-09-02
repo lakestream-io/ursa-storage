@@ -87,6 +87,7 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -1861,6 +1862,21 @@ class IndexedStreamCatalogTest {
             () -> catalog.openLog(streamId, 4).get(10, TimeUnit.SECONDS));
         assertEquals(IllegalArgumentException.class, outOfRange.getCause().getClass());
         opened.close();
+    }
+
+    @Test
+    void abandonedWriterCleanupGivesUpOnceItsExecutorIsShutDown() throws Exception {
+        StreamWriter writer = mock(StreamWriter.class);
+        // Closing the catalog shuts the cleanup executor down. A rejection from it can never
+        // succeed on retry, so bounding the wait turns "would retry forever" into a failure.
+        catalog.close();
+
+        CompletableFuture<Void> cleanup = catalog.startAbandonedWriterCleanup(writer);
+
+        ExecutionException rejected = assertThrows(ExecutionException.class,
+            () -> cleanup.get(5, TimeUnit.SECONDS));
+        assertInstanceOf(RejectedExecutionException.class, rejected.getCause());
+        verify(writer, never()).close();
     }
 
     @Test

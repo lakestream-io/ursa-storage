@@ -37,7 +37,6 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
 import java.util.function.LongFunction;
 import java.util.function.Predicate;
@@ -1307,7 +1306,7 @@ final class IndexedStreamConfigStore {
                     if (failure == null) {
                         return CompletableFuture.completedFuture(null);
                     }
-                    Throwable cause = unwrap(failure);
+                    Throwable cause = CompletionFailures.unwrap(failure);
                     if (cause instanceof UnexpectedVersionIdException) {
                         return retryAfterConflict(
                             id, "stream config update", retryCount, cause,
@@ -1541,13 +1540,8 @@ final class IndexedStreamConfigStore {
             operation, id.fullName(), versionId, writeFailure.toString());
     }
 
-    private static Throwable unwrap(Throwable failure) {
-        return failure instanceof CompletionException && failure.getCause() != null
-            ? failure.getCause() : failure;
-    }
-
     private static Throwable unwrapNullable(Throwable failure) {
-        return failure == null ? null : unwrap(failure);
+        return failure == null ? null : CompletionFailures.unwrap(failure);
     }
 
     private record ConfigCheck(GetResult config, Throwable failure) {

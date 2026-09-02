@@ -8,11 +8,12 @@ import io.lakestream.api.LogId;
 import io.lakestream.api.StreamLayout;
 import io.lakestream.api.StreamReader;
 import io.lakestream.ursa.storage.OwnedResultFutures;
+import io.lakestream.ursa.utils.EventualRetry;
+import io.lakestream.ursa.utils.FutureUtils;
 import java.io.IOException;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
@@ -33,8 +34,6 @@ import lombok.extern.slf4j.Slf4j;
 final class CatalogOwnedStreamReader implements StreamReader {
 
     private static final long CLOSE_TIMEOUT_MILLIS = TimeUnit.SECONDS.toMillis(10);
-    private static final long EVENTUAL_CLOSE_INITIAL_RETRY_MILLIS = 100L;
-    private static final long EVENTUAL_CLOSE_MAX_RETRY_MILLIS = TimeUnit.SECONDS.toMillis(10);
 
     private final StreamReader delegate;
     private final Executor delegateCloseExecutor;
@@ -211,7 +210,7 @@ final class CatalogOwnedStreamReader implements StreamReader {
                         delegateCloseFuture = null;
                     }
                 }
-                throwFailure(unwrap(failure));
+                throwFailure(FutureUtils.unwrapCompletionException(failure));
             }
             delegateClosed = true;
         }
@@ -255,50 +254,11 @@ final class CatalogOwnedStreamReader implements StreamReader {
             result = new CompletableFuture<>();
             eventualCloseFuture = OwnedResultFutures.nonCancellableCompletion(result);
         }
-        attemptEventualClose(executor, result, 0);
+        EventualRetry.start(executor, "closing an abandoned stream reader", () -> {
+            close();
+            return null;
+        }, result);
         return eventualCloseFuture;
-    }
-
-    private void attemptEventualClose(
-            Executor executor, CompletableFuture<Void> result, int retryAttempt) {
-        try {
-            executor.execute(() -> {
-                try {
-                    close();
-                    result.complete(null);
-                } catch (Throwable failure) {
-                    scheduleEventualCloseRetry(executor, result, retryAttempt, failure);
-                }
-            });
-        } catch (Throwable failure) {
-            scheduleEventualCloseRetry(executor, result, retryAttempt, failure);
-        }
-    }
-
-    private void scheduleEventualCloseRetry(
-            Executor executor,
-            CompletableFuture<Void> result,
-            int retryAttempt,
-            Throwable failure) {
-        int nextAttempt = retryAttempt == Integer.MAX_VALUE
-            ? Integer.MAX_VALUE : retryAttempt + 1;
-        long delayMillis = eventualCloseRetryDelayMillis(retryAttempt);
-        log.warn("Failed to close abandoned stream reader; retrying in {} ms (attempt {})",
-            delayMillis, nextAttempt, failure);
-        try {
-            CompletableFuture.delayedExecutor(delayMillis, TimeUnit.MILLISECONDS)
-                .execute(() -> attemptEventualClose(executor, result, nextAttempt));
-        } catch (Throwable schedulingFailure) {
-            failure.addSuppressed(schedulingFailure);
-            result.completeExceptionally(failure);
-        }
-    }
-
-    private static long eventualCloseRetryDelayMillis(int retryAttempt) {
-        int shift = Math.min(retryAttempt, 6);
-        return Math.min(
-            EVENTUAL_CLOSE_INITIAL_RETRY_MILLIS << shift,
-            EVENTUAL_CLOSE_MAX_RETRY_MILLIS);
     }
 
     private void awaitCompletion(
@@ -331,14 +291,5 @@ final class CatalogOwnedStreamReader implements StreamReader {
             throw exception;
         }
         throw new RuntimeException(cause);
-    }
-
-    private static Throwable unwrap(Throwable failure) {
-        Throwable current = failure;
-        while ((current instanceof CompletionException || current instanceof ExecutionException)
-                && current.getCause() != null) {
-            current = current.getCause();
-        }
-        return current;
     }
 }

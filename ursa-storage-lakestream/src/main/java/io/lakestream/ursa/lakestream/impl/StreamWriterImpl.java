@@ -10,6 +10,7 @@ import io.lakestream.api.RoutingKey;
 import io.lakestream.api.StreamLayout;
 import io.lakestream.api.StreamWriter;
 import io.lakestream.ursa.storage.OwnedResultFutures;
+import io.lakestream.ursa.utils.FutureUtils;
 import io.netty.buffer.ByteBuf;
 import java.io.IOException;
 import java.util.LinkedHashMap;
@@ -17,7 +18,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -143,7 +143,7 @@ public class StreamWriterImpl implements StreamWriter {
                 ownedLogs.get(i).close();
                 releasedLogs[i] = true;
             } catch (Exception | Error closeFailure) {
-                Throwable unwrapped = unwrapCompletionFailure(closeFailure);
+                Throwable unwrapped = FutureUtils.unwrapCompletionException(closeFailure);
                 if (failure == null) {
                     failure = unwrapped;
                 } else if (failure != unwrapped) {
@@ -160,13 +160,5 @@ public class StreamWriterImpl implements StreamWriter {
         if (failure != null) {
             throw new RuntimeException(failure);
         }
-    }
-
-    private static Throwable unwrapCompletionFailure(Throwable failure) {
-        Throwable current = failure;
-        while (current instanceof CompletionException && current.getCause() != null) {
-            current = current.getCause();
-        }
-        return current;
     }
 }
