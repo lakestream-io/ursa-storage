@@ -6,6 +6,7 @@ package io.lakestream.ursa.lakestream.impl;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -738,6 +739,67 @@ class LeasedLogTest {
         assertEquals(stale, staleRead.get(10, TimeUnit.SECONDS));
         assertEquals(fresh, log.getFirstOffset().get(10, TimeUnit.SECONDS));
         verify(delegate, times(2)).getFirstOffset();
+    }
+
+    @Test
+    void outOfOrderAppendsKeepTheLowestFirstOffset() throws Exception {
+        Log delegate = mock(Log.class);
+        StreamWriteLease lease = lease(57L);
+        when(delegate.id()).thenReturn(LogId.of(57L));
+        when(delegate.getFirstOffset())
+            .thenReturn(CompletableFuture.completedFuture(LogOffset.NOT_FOUND));
+        CompletableFuture<LogEntryHeader> firstAppend = new CompletableFuture<>();
+        CompletableFuture<LogEntryHeader> secondAppend = new CompletableFuture<>();
+        when(delegate.append(1, Unpooled.EMPTY_BUFFER))
+            .thenReturn(firstAppend)
+            .thenReturn(secondAppend);
+        LeasedLog log = new LeasedLog(delegate, lease, Runnable::run, () -> { });
+
+        assertEquals(LogOffset.NOT_FOUND, log.getFirstOffset().get(10, TimeUnit.SECONDS));
+        CompletableFuture<LogEntryHeader> earlier = log.append(1, Unpooled.EMPTY_BUFFER);
+        CompletableFuture<LogEntryHeader> later = log.append(1, Unpooled.EMPTY_BUFFER);
+
+        // The append at the higher offset completes first, so a last-write-wins cache would keep
+        // it and hide the entry that actually starts the log.
+        secondAppend.complete(header(1L, 1, 200L, 60, 110L));
+        firstAppend.complete(header(0L, 1, 100L, 50, 50L));
+        later.get(10, TimeUnit.SECONDS);
+        earlier.get(10, TimeUnit.SECONDS);
+
+        assertEquals(new LogOffset(0L, 1, 100L, 50, 50L),
+            log.getFirstOffset().get(10, TimeUnit.SECONDS));
+        verify(delegate, times(1)).getFirstOffset();
+    }
+
+    @Test
+    void eventualCloseGivesUpOnceItsExecutorIsShutDown() throws Exception {
+        Log delegate = mock(Log.class);
+        StreamWriteLease lease = lease(58L);
+        when(delegate.id()).thenReturn(LogId.of(58L));
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        executor.shutdown();
+        LeasedLog log = new LeasedLog(delegate, lease, Runnable::run, () -> { });
+
+        // A rejection from a shut-down executor can never succeed on retry. Bounding the wait
+        // turns "would retry forever" into a clear failure.
+        CompletableFuture<Void> close = log.closeEventually(executor);
+
+        ExecutionException rejected = assertThrows(ExecutionException.class,
+            () -> close.get(5, TimeUnit.SECONDS));
+        assertInstanceOf(RejectedExecutionException.class, rejected.getCause());
+        verify(lease, never()).closeAsync();
+    }
+
+    private static LogEntryHeader header(
+            long offset, int numberOfRecords, long timestamp, int entrySize,
+            long cumulativeSize) {
+        LogEntryHeader header = mock(LogEntryHeader.class);
+        when(header.offset()).thenReturn(offset);
+        when(header.numberOfRecords()).thenReturn(numberOfRecords);
+        when(header.timestamp()).thenReturn(timestamp);
+        when(header.entrySize()).thenReturn(entrySize);
+        when(header.cumulativeSize()).thenReturn(cumulativeSize);
+        return header;
     }
 
     private static StreamWriteLease lease(long streamId) {

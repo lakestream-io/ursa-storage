@@ -585,6 +585,9 @@ class UrsaStorageLazyInitializationTest {
         ExecutionException rejected = assertThrows(ExecutionException.class,
             () -> cleanupCompletion.get(5, TimeUnit.SECONDS));
         assertInstanceOf(RejectedExecutionException.class, rejected.getCause());
+        // Nothing else will close the data plane once the retry chain gives up, so the give-up
+        // branch closes both storages itself before reporting the rejection.
+        verify(fileStorage).close();
     }
 
     @Test

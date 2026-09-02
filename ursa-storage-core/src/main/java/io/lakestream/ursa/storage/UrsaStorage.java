@@ -51,6 +51,14 @@ public class UrsaStorage implements AutoCloseable {
     private static final long FAILED_DATA_PLANE_CLOSE_MAX_RETRY_MILLIS =
         TimeUnit.SECONDS.toMillis(10);
 
+    /**
+     * Sentinel passed where a {@link DataPlaneFactory} would go to select
+     * {@link #createDefaultDataPlane}, which the full constructor substitutes for a missing
+     * factory. Only the production constructors use it; the injecting constructor rejects
+     * {@code null}, so a test cannot get the real data plane by passing one.
+     */
+    private static final DataPlaneFactory DEFAULT_DATA_PLANE_FACTORY = null;
+
     @FunctionalInterface
     interface DataPlaneFactory {
         DataPlane create(StorageConfig config, InstrumentProvider instrumentProvider,
@@ -97,12 +105,15 @@ public class UrsaStorage implements AutoCloseable {
 
     public UrsaStorage(StorageConfig config, OpenTelemetry otel,
                        AsyncOxiaClient client) throws Exception {
-        this(config, otel, client, null);
+        this(config, otel, client, DEFAULT_DATA_PLANE_FACTORY, DEFAULT_CLOSE_TIMEOUT, false);
     }
 
+    /** Builds a runtime whose data plane comes from the given factory, which is required. */
     UrsaStorage(StorageConfig config, OpenTelemetry otel, AsyncOxiaClient client,
                 DataPlaneFactory dataPlaneFactory) throws Exception {
-        this(config, otel, client, dataPlaneFactory, DEFAULT_CLOSE_TIMEOUT, false);
+        this(config, otel, client,
+            Objects.requireNonNull(dataPlaneFactory, "dataPlaneFactory"),
+            DEFAULT_CLOSE_TIMEOUT, false);
     }
 
     UrsaStorage(StorageConfig config, OpenTelemetry otel, AsyncOxiaClient client,
@@ -292,7 +303,7 @@ public class UrsaStorage implements AutoCloseable {
                 });
             } catch (RejectedExecutionException rejection) {
                 if (executor.isShutdown()) {
-                    failRejectedCleanup(rejection);
+                    failRejectedCleanup(rejection, true);
                 } else {
                     scheduleWalCloseRetry(retryAttempt, rejection);
                 }
@@ -318,7 +329,7 @@ public class UrsaStorage implements AutoCloseable {
                 });
             } catch (RejectedExecutionException rejection) {
                 if (executor.isShutdown()) {
-                    failRejectedCleanup(rejection);
+                    failRejectedCleanup(rejection, false);
                 } else {
                     scheduleFileStorageCloseRetry(retryAttempt, rejection);
                 }
@@ -333,10 +344,51 @@ public class UrsaStorage implements AutoCloseable {
          * {@link UrsaStorage} is closing) will never succeed on retry, unlike a transient
          * "queue full" rejection. Give up and report failure instead of retrying forever
          * against a permanently rejecting executor.
+         *
+         * <p>Nothing else will close the data plane afterwards, so both storages are closed
+         * here on the calling thread as a last resort. Their failures are only logged: the
+         * rejection is what the caller has to see.
+         *
+         * @param rejection the rejection that ended the retry chain
+         * @param walStillOpen whether the WAL close had not already succeeded
          */
-        private void failRejectedCleanup(RejectedExecutionException rejection) {
+        private void failRejectedCleanup(
+                RejectedExecutionException rejection, boolean walStillOpen) {
+            if (walStillOpen) {
+                closeWalStorageOnGiveUp();
+            }
+            closeFileStorageOnGiveUp();
             recordCleanupFailure(rejection);
             completion.completeExceptionally(rejection);
+        }
+
+        private void closeWalStorageOnGiveUp() {
+            try {
+                CompletableFuture<Void> walClose = walStorage.close();
+                if (walClose != null) {
+                    walClose.whenComplete((ignored, closeFailure) -> {
+                        if (closeFailure != null) {
+                            log.warn("Failed to close the WAL while giving up on data-plane "
+                                + "cleanup", closeFailure);
+                        }
+                    });
+                }
+            } catch (Throwable closeFailure) {
+                log.warn("Failed to close the WAL while giving up on data-plane cleanup",
+                    closeFailure);
+            }
+        }
+
+        private void closeFileStorageOnGiveUp() {
+            if (fileStorage == null) {
+                return;
+            }
+            try {
+                fileStorage.close();
+            } catch (Throwable closeFailure) {
+                log.warn("Failed to close file storage while giving up on data-plane cleanup",
+                    closeFailure);
+            }
         }
 
         private void scheduleWalCloseRetry(int retryAttempt, Throwable failure) {

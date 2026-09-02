@@ -24,6 +24,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
@@ -269,10 +271,7 @@ final class LeasedLog implements Log {
                 LogOffset appended = new LogOffset(header.offset(), header.numberOfRecords(),
                     header.timestamp(), header.entrySize(), header.cumulativeSize());
                 cachedLastOffset.set(appended);
-                LogOffset first = cachedFirstOffset.get();
-                if (first != null && first.offset() < 0) {
-                    cachedFirstOffset.compareAndSet(first, appended);
-                }
+                repairCachedFirstOffset(appended);
             }));
     }
 
@@ -469,6 +468,25 @@ final class LeasedLog implements Log {
                 cache.compareAndSet(null, value);
             }
         }), ignored -> { });
+    }
+
+    /**
+     * Fills a cached "no first entry" from an append, keeping the lowest candidate.
+     *
+     * <p>Appends may complete out of order, so the last one to arrive is not necessarily the one
+     * that starts the log. Keeping the minimum means a lower offset always wins the repair, and a
+     * cache invalidated in the meantime is left invalid rather than filled from a stale append.
+     */
+    private void repairCachedFirstOffset(LogOffset appended) {
+        cachedFirstOffset.accumulateAndGet(appended, (cached, candidate) -> {
+            if (cached == null) {
+                return null;
+            }
+            if (cached.offset() < 0) {
+                return candidate;
+            }
+            return candidate.offset() < cached.offset() ? candidate : cached;
+        });
     }
 
     private void invalidateOffsetCache() {
@@ -669,6 +687,14 @@ final class LeasedLog implements Log {
             CompletableFuture<Void> result,
             int retryAttempt,
             Throwable failure) {
+        if (isShutDownRejection(executor, failure)) {
+            // Unlike a transient "queue full" rejection, one from an already shut-down executor
+            // never succeeds on retry. Give up and report it instead of retrying forever.
+            log.warn("Giving up on closing log {} and releasing its write lease: its close "
+                    + "executor is shut down", lease.streamId(), failure);
+            result.completeExceptionally(failure);
+            return;
+        }
         int nextAttempt = retryAttempt == Integer.MAX_VALUE
             ? Integer.MAX_VALUE : retryAttempt + 1;
         long retryDelayMillis = eventualCloseRetryDelayMillis(retryAttempt);
@@ -681,6 +707,12 @@ final class LeasedLog implements Log {
             failure.addSuppressed(schedulingFailure);
             result.completeExceptionally(failure);
         }
+    }
+
+    private static boolean isShutDownRejection(Executor executor, Throwable failure) {
+        return failure instanceof RejectedExecutionException
+            && executor instanceof ExecutorService service
+            && service.isShutdown();
     }
 
     private static long eventualCloseRetryDelayMillis(int retryAttempt) {
