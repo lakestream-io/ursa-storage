@@ -1849,7 +1849,7 @@ class IndexedStreamCatalogTest {
         assertNotNull(opened);
         verify(defaultStorage.storageApi()).acquireStreamWriteLease(101L);
         // Opening one partition costs a constant number of catalog reads however wide the stream
-        // is: the active config, that one partition's metadata, and the ownership re-read that
+        // is: the active config, that one partition's metadata, and the lifecycle re-read that
         // fences it. Building the layout instead would read every partition.
         verify(oxiaClient, times(2)).get(catalogPaths.streamConfigPath(streamId));
         verify(oxiaClient).get(catalogPaths.partitionMetadataPath(streamId, 1));
@@ -1862,6 +1862,70 @@ class IndexedStreamCatalogTest {
             () -> catalog.openLog(streamId, 4).get(10, TimeUnit.SECONDS));
         assertEquals(IllegalArgumentException.class, outOfRange.getCause().getClass());
         opened.close();
+    }
+
+    @Test
+    void openLogByPartitionIndexSurvivesAConcurrentPropertyReplace() throws Exception {
+        String configPath = catalogPaths.streamConfigPath(streamId);
+        // Same lifecycle, same committed layout, newer config version: a controller replacing
+        // properties between the catalog read and the partition read is routine on a stream a
+        // broker is opening, and must not fail the open.
+        when(oxiaClient.get(configPath))
+            .thenReturn(CompletableFuture.completedFuture(new GetResult(
+                configPath, streamConfigBytes(2, Map.of(), false), FakeOxiaRecord.version(1))))
+            .thenReturn(CompletableFuture.completedFuture(new GetResult(
+                configPath, streamConfigBytes(2, Map.of("tier", "hot"), false),
+                FakeOxiaRecord.version(2))));
+        mockPartitionMetadata(streamId, 1, 101L, Map.of());
+
+        Log opened = catalog.openLog(streamId, 1).get(10, TimeUnit.SECONDS);
+
+        assertNotNull(opened);
+        verify(defaultStorage.storageApi()).acquireStreamWriteLease(101L);
+        verify(oxiaClient, times(1)).get(catalogPaths.partitionMetadataPath(streamId, 1));
+        opened.close();
+    }
+
+    @Test
+    void openLogByPartitionIndexRereadsThePartitionWhenTheLayoutGrows() throws Exception {
+        String configPath = catalogPaths.streamConfigPath(streamId);
+        // An expansion landing mid-read changes the committed layout the first read was made
+        // against, so the partition is read again under the config that moved it - the same
+        // retry the layout read performs - rather than failing the open.
+        when(oxiaClient.get(configPath))
+            .thenReturn(CompletableFuture.completedFuture(new GetResult(
+                configPath, streamConfigBytes(2, Map.of(), false), FakeOxiaRecord.version(1))))
+            .thenReturn(CompletableFuture.completedFuture(new GetResult(
+                configPath, streamConfigBytes(3, Map.of(), false), FakeOxiaRecord.version(2))));
+        mockPartitionMetadata(streamId, 1, 101L, Map.of());
+
+        Log opened = catalog.openLog(streamId, 1).get(10, TimeUnit.SECONDS);
+
+        assertNotNull(opened);
+        verify(defaultStorage.storageApi()).acquireStreamWriteLease(101L);
+        verify(oxiaClient, times(3)).get(configPath);
+        verify(oxiaClient, times(2)).get(catalogPaths.partitionMetadataPath(streamId, 1));
+        opened.close();
+    }
+
+    @Test
+    void openLogByPartitionIndexFailsWhenTheIdentityIsRecreatedMidRead() throws Exception {
+        String configPath = catalogPaths.streamConfigPath(streamId);
+        // A drop and recreate between the two reads is a different stream identity; the open must
+        // not hand back a log belonging to the incarnation that is gone.
+        when(oxiaClient.get(configPath))
+            .thenReturn(CompletableFuture.completedFuture(new GetResult(
+                configPath, streamConfigBytes(2, Map.of(), false), FakeOxiaRecord.version(1))))
+            .thenReturn(CompletableFuture.completedFuture(new GetResult(
+                configPath, ownedStreamConfigBytes(2, Map.of(), "second-incarnation",
+                    "second-owner", "NATIVE_CREATE"), FakeOxiaRecord.version(2))));
+        mockPartitionMetadata(streamId, 1, 101L, Map.of());
+
+        ExecutionException failure = assertThrows(ExecutionException.class,
+            () -> catalog.openLog(streamId, 1).get(10, TimeUnit.SECONDS));
+
+        assertEquals(NoSuchStreamException.class, failure.getCause().getClass());
+        verify(defaultStorage.storageApi(), never()).acquireStreamWriteLease(anyLong());
     }
 
     @Test
