@@ -9,6 +9,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -52,6 +53,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -116,6 +118,55 @@ class IndexedStreamConfigStoreDeletionFenceTest {
         ArgumentCaptor<byte[]> write = ArgumentCaptor.forClass(byte[].class);
         verify(oxiaClient).put(eq(configPath), write.capture(), eq(createOnly));
         assertThat(json(write.getValue()).path("_ownerGeneration").asLong()).isEqualTo(1L);
+    }
+
+    @Test
+    void creationClaimIsRolledBackWhenTheDeletionFenceLandsDuringTheWrite() {
+        Set<PutOption> createOnly = Set.of(PutOption.IfRecordDoesNotExist);
+        byte[] tombstone = streamConfigBytes(
+            0, Map.of(), "dropped-incarnation", "drop-owner", 2L, "create-owner", 1L,
+            IndexedStreamConfigStore.CreationKind.NATIVE_CREATE,
+            IndexedStreamConfigStore.ProvisioningState.DROPPED);
+        when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(null));
+        // The fence is absent when creation checks it and present by the time the claim lands.
+        when(oxiaClient.get(tombstonePath))
+            .thenReturn(CompletableFuture.completedFuture(null))
+            .thenReturn(CompletableFuture.completedFuture(
+                new GetResult(tombstonePath, tombstone, VERSION_2)));
+        when(oxiaClient.put(eq(configPath), any(byte[].class), eq(createOnly)))
+            .thenReturn(CompletableFuture.completedFuture(
+                new PutResult(configPath, VERSION_1)));
+        when(oxiaClient.delete(eq(configPath), any()))
+            .thenReturn(CompletableFuture.completedFuture(true));
+
+        assertThatThrownBy(() ->
+                store.claimCreation(id, 1, Map.of(), Optional.empty(), "attempt").join())
+            .isInstanceOf(CompletionException.class)
+            .hasCauseInstanceOf(StreamPermanentlyDeletedException.class);
+
+        verify(oxiaClient).delete(configPath,
+            Set.of(DeleteOption.IfVersionIdEquals(VERSION_1.versionId())));
+        verify(oxiaClient, times(2)).get(tombstonePath);
+    }
+
+    @Test
+    void creationClaimRevalidatesTheDeletionFenceOnceAfterWriting() {
+        Set<PutOption> createOnly = Set.of(PutOption.IfRecordDoesNotExist);
+        when(oxiaClient.get(configPath)).thenReturn(CompletableFuture.completedFuture(null));
+        when(oxiaClient.put(eq(configPath), any(byte[].class), eq(createOnly)))
+            .thenReturn(CompletableFuture.completedFuture(
+                new PutResult(configPath, VERSION_1)));
+
+        IndexedStreamConfigStore.ProvisioningClaim claim = store.claimCreation(
+            id, 1, Map.of(), Optional.empty(), "attempt").join();
+
+        assertThat(claim.versionId()).isEqualTo(VERSION_1.versionId());
+        InOrder order = inOrder(oxiaClient);
+        order.verify(oxiaClient).get(tombstonePath);
+        order.verify(oxiaClient).put(eq(configPath), any(byte[].class), eq(createOnly));
+        order.verify(oxiaClient).get(tombstonePath);
+        verify(oxiaClient, times(2)).get(tombstonePath);
+        verify(oxiaClient, never()).delete(eq(configPath), any());
     }
 
     @Test

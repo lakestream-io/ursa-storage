@@ -617,7 +617,42 @@ final class IndexedStreamConfigStore {
             .handle((result, failure) ->
                 new CreateWrite(result, unwrapNullable(failure)))
             .thenCompose(write -> resolveClaimWrite(
-                id, desired, -1L, write, true, retryCount));
+                id, desired, -1L, write, true, retryCount))
+            .thenCompose(claim -> validateDeletionFence(id, claim));
+    }
+
+    /**
+     * Fails a freshly written creation claim when a deletion fence appeared while it was in flight.
+     *
+     * <p>The config record and its tombstone are separate Oxia keys with no cross-key transaction,
+     * so a drop that fences an absent identity can land between this creation's tombstone check and
+     * its claim write. Re-reading the tombstone after the write turns that interleaving into a
+     * losing creation instead of a silently resurrected identity.
+     */
+    private CompletableFuture<ProvisioningClaim> validateDeletionFence(
+            StreamIdentifier id, ProvisioningClaim claim) {
+        return readTombstone(id).thenCompose(tombstone -> tombstone.isEmpty()
+            ? CompletableFuture.completedFuture(claim)
+            : rollBackFencedClaim(id, claim));
+    }
+
+    private CompletableFuture<ProvisioningClaim> rollBackFencedClaim(
+            StreamIdentifier id, ProvisioningClaim claim) {
+        StreamPermanentlyDeletedException fenced = new StreamPermanentlyDeletedException(id);
+        return oxiaClient.delete(catalogPaths.streamConfigPath(id),
+                Set.of(DeleteOption.IfVersionIdEquals(claim.versionId())))
+            .handle((deleted, failure) -> unwrapNullable(failure))
+            .thenCompose(failure -> {
+                // A version mismatch means someone else already moved the record on; the fence
+                // still stands, so only an unexpected failure is worth reporting.
+                if (failure != null && !(failure instanceof UnexpectedVersionIdException)) {
+                    log.warn("Failed to roll back the creation claim for {} that lost a race "
+                            + "with a permanent-deletion fence",
+                        id.fullName(), failure);
+                    fenced.addSuppressed(failure);
+                }
+                return CompletableFuture.<ProvisioningClaim>failedFuture(fenced);
+            });
     }
 
     private CompletableFuture<ProvisioningClaim> resolveClaimWrite(
