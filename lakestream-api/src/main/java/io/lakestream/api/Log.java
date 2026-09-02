@@ -184,11 +184,19 @@ public interface Log extends AutoCloseable {
     void fence();
 
     /**
-     * Closes this log without blocking the caller.
+     * Closes this log, reporting the outcome through a future instead of throwing.
      *
-     * <p>The returned future completes when the log and any durable lease it owns are released.
-     * Implementations retry internally, so callers may drop the returned future. This method
-     * never throws; a close failure is reported through the future.
+     * <p>This default implementation is a thin wrapper: it calls {@link #close()} synchronously on
+     * the calling thread, does not retry, and returns an already-completed future. It is therefore
+     * exactly as blocking as the implementation's own {@code close()}.
+     *
+     * <p>Implementations that own a durable lease (such as the catalog's leased log) override this
+     * to return before the close finishes and to retry internally until the log and its lease are
+     * released, so their callers may drop the returned future. A caller that needs a non-blocking,
+     * self-retrying close must rely on such an implementation; only implementations that document
+     * that behavior provide it, and it must not be assumed from this interface.
+     *
+     * <p>This method never throws; a close failure is reported through the returned future.
      *
      * @return a future that completes when the log is fully closed
      */

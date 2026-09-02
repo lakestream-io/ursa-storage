@@ -366,6 +366,9 @@ public interface StreamCatalog extends AutoCloseable {
      * <p>Equivalent to loading the stream layout and calling {@link #openLog(StreamIdentifier, LogId)}
      * with the log at {@code partitionIndex}, but implementations read catalog metadata once.
      *
+     * @param id the stream identifier
+     * @param partitionIndex the zero-based index of a partition in the committed layout
+     * @return a future resolving to the opened log
      * @throws io.lakestream.api.exception.NoSuchStreamException if the stream is not active
      * @throws io.lakestream.api.exception.StreamPermanentlyDeletedException if the identifier is tombstoned
      * @throws IllegalArgumentException if the index is outside the committed layout
