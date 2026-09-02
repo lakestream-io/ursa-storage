@@ -361,6 +361,29 @@ public interface StreamCatalog extends AutoCloseable {
     CompletableFuture<Log> openLog(StreamIdentifier identifier, LogId logId);
 
     /**
+     * Opens the log for one committed partition index.
+     *
+     * <p>Equivalent to loading the stream layout and calling {@link #openLog(StreamIdentifier, LogId)}
+     * with the log at {@code partitionIndex}, but implementations read catalog metadata once.
+     *
+     * @throws io.lakestream.api.exception.NoSuchStreamException if the stream is not active
+     * @throws io.lakestream.api.exception.StreamPermanentlyDeletedException if the identifier is tombstoned
+     * @throws IllegalArgumentException if the index is outside the committed layout
+     */
+    default CompletableFuture<Log> openLog(StreamIdentifier id, int partitionIndex) {
+        return loadStream(id)
+            .thenCompose(metadata -> metadata.layout().logIds())
+            .thenCompose(logIds -> {
+                if (partitionIndex < 0 || partitionIndex >= logIds.size()) {
+                    return CompletableFuture.failedFuture(new IllegalArgumentException(
+                        "Partition " + partitionIndex + " is not in the committed layout of "
+                            + id.fullName() + " (" + logIds.size() + " logs)"));
+                }
+                return openLog(id, logIds.get(partitionIndex));
+            });
+    }
+
+    /**
      * Opens a writer for the stream.
      *
      * @param identifier the stream to write to

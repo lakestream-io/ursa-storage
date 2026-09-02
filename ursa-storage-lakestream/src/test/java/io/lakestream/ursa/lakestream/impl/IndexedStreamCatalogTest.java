@@ -1751,6 +1751,19 @@ class IndexedStreamCatalogTest {
     }
 
     @Test
+    void openLogByPartitionIndexReadsLayoutOnce() throws Exception {
+        mockStreamConfig(streamId, 2);
+        mockPartitionMetadata(streamId, 0, 100L, Map.of());
+        mockPartitionMetadata(streamId, 1, 101L, Map.of());
+
+        Log opened = catalog.openLog(streamId, 1).get(10, TimeUnit.SECONDS);
+        assertNotNull(opened);
+        ExecutionException outOfRange = assertThrows(ExecutionException.class,
+            () -> catalog.openLog(streamId, 2).get(10, TimeUnit.SECONDS));
+        assertEquals(IllegalArgumentException.class, outOfRange.getCause().getClass());
+    }
+
+    @Test
     void catalogCloseWaitsForReturnedLogHandle() throws Exception {
         mockStreamConfig(streamId, 1);
         mockPartitionMetadata(streamId, 0, 100L, Map.of());

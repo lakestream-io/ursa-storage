@@ -2910,6 +2910,24 @@ public class IndexedStreamCatalog implements StreamCatalog {
         return OwnedResultFutures.transfer(opened, this::startAbandonedLogCleanup);
     }
 
+    @Override
+    public CompletableFuture<Log> openLog(StreamIdentifier id, int partitionIndex) {
+        Objects.requireNonNull(id, "id");
+        CompletableFuture<Log> opened = streamConfigStore.readActive(id)
+            .thenCompose(active -> getLayout(id, active))
+            .thenCompose(layout -> layout.logIds())
+            .thenCompose(logIds -> {
+                if (partitionIndex < 0 || partitionIndex >= logIds.size()) {
+                    return CompletableFuture.<Log>failedFuture(new IllegalArgumentException(
+                        "Partition " + partitionIndex + " is not in the committed layout of "
+                            + id.fullName() + " (" + logIds.size() + " logs)"));
+                }
+                return openCommittedLog(id, partitionIndex, logIds.get(partitionIndex))
+                    .thenApply(Log.class::cast);
+            });
+        return OwnedResultFutures.transfer(opened, this::startAbandonedLogCleanup);
+    }
+
     private CompletableFuture<LeasedLog> openCommittedLog(
             StreamIdentifier id, int partitionIndex, LogId logId) {
         if (writeLeaseStorage == null) {
