@@ -26,7 +26,7 @@ import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.buffer.Unpooled;
 import io.opentelemetry.api.OpenTelemetry;
-import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.sdk.OpenTelemetrySdk;
 import io.opentelemetry.sdk.metrics.SdkMeterProvider;
 import io.opentelemetry.sdk.metrics.data.MetricData;
@@ -66,6 +66,7 @@ public class ObjectWalStorageReadLeaseTest {
         private final AtomicInteger reads = new AtomicInteger();
         private final StorageFormat format;
         private volatile boolean failReads;
+        private volatile boolean throwOnRead;
 
         CountingSegmentFileStorage(StorageFormat format) {
             this.format = format;
@@ -74,6 +75,11 @@ public class ObjectWalStorageReadLeaseTest {
         @Override
         public CompletableFuture<ByteBuf> getAsync(String location) {
             reads.incrementAndGet();
+            if (throwOnRead) {
+                // S3FileStorage throws IllegalStateException on a closed client and GCSFileStorage can
+                // throw RejectedExecutionException, both before any future exists.
+                throw new IllegalStateException("storage client closed");
+            }
             if (failReads) {
                 return CompletableFuture.failedFuture(new IllegalStateException("storage unavailable"));
             }
@@ -273,7 +279,7 @@ public class ObjectWalStorageReadLeaseTest {
     }
 
     @Test
-    void testRetiredSegmentReadFailsWithCacheLifecycleCauseWhenStorageFails() {
+    void testRetiredSegmentReadSurfacesTheStorageFailure() {
         EntryIndex index = indexFor(LOCATION);
         seedRetiredReadCacheSegment(index);
         fileStorage.failReads = true;
@@ -282,10 +288,56 @@ public class ObjectWalStorageReadLeaseTest {
         ExecutionException failure = assertThrows(ExecutionException.class,
             () -> storage.get(List.of(index), entryList).get());
 
-        // The recovery read is what failed, so the storage error is what surfaces -- the read is not
-        // silently swallowed -- and no lease is left behind.
+        // The recovery read is what failed, so the storage error is what surfaces rather than being
+        // swallowed or masked by a cache-lifecycle error.
+        assertTrue(hasCause(failure, IllegalStateException.class), "unexpected failure: " + failure);
+        entryList.clear();
+    }
+
+    /**
+     * Batch with one live location, held under a lease, and one retired location that has to be
+     * recovered from storage. The recovery runs outside the try/finally that guards the read loop, so
+     * it is the path where a failure could strand the live lease.
+     */
+    private List<EntryIndex> liveAndRetiredBatch() {
+        EntryIndex live = indexFor("wal-segment-live", 0);
+        EntryIndex retired = indexFor("wal-segment-retired", MESSAGES_PER_STORED_ENTRY);
+        // Seeded into the write cache so resolving it needs no storage read: the only storage read in
+        // this batch is the recovery of the retired location.
+        seedWriteCacheSegment("wal-segment-live", "live-bytes".getBytes(UTF_8));
+        seedRetiredReadCacheSegment(retired);
+        return List.of(live, retired);
+    }
+
+    @Test
+    void testLiveLeaseIsReleasedWhenRecoveryThrowsSynchronously() {
+        List<EntryIndex> batch = liveAndRetiredBatch();
+        fileStorage.throwOnRead = true;
+
+        EntryList entryList = new EntryList(STREAM_ID, 0, Long.MAX_VALUE, 100, 100_000, null, null);
+        ExecutionException failure = assertThrows(ExecutionException.class,
+            () -> storage.get(batch, entryList).get());
+
+        assertTrue(hasCause(failure, IllegalStateException.class), "unexpected failure: " + failure);
+        // The live location's lease must not survive the synchronous throw; a leaked lease pins that
+        // segment's buffer for the life of the process.
+        assertEquals(0, storage.leasedSegmentsForTest());
+        assertEquals(0, leasedSegmentsGauge());
+        entryList.clear();
+    }
+
+    @Test
+    void testLiveLeaseIsReleasedWhenRecoveryFailsAsynchronously() {
+        List<EntryIndex> batch = liveAndRetiredBatch();
+        fileStorage.failReads = true;
+
+        EntryList entryList = new EntryList(STREAM_ID, 0, Long.MAX_VALUE, 100, 100_000, null, null);
+        ExecutionException failure = assertThrows(ExecutionException.class,
+            () -> storage.get(batch, entryList).get());
+
         assertTrue(hasCause(failure, IllegalStateException.class), "unexpected failure: " + failure);
         assertEquals(0, storage.leasedSegmentsForTest());
+        assertEquals(0, leasedSegmentsGauge());
         entryList.clear();
     }
 
@@ -322,7 +374,7 @@ public class ObjectWalStorageReadLeaseTest {
             .filter(metric -> "ursa.storage.wal.read.cache.missed".equals(metric.getName()))
             .flatMap(metric -> metric.getLongSumData().getPoints().stream())
             .filter(point -> "stale_segment".equals(
-                point.getAttributes().get(io.opentelemetry.api.common.AttributeKey.stringKey("type"))))
+                point.getAttributes().get(AttributeKey.stringKey("type"))))
             .mapToLong(point -> point.getValue())
             .sum();
     }
@@ -332,7 +384,8 @@ public class ObjectWalStorageReadLeaseTest {
         return metrics.stream()
             .filter(metric -> "ursa.storage.wal.cache.leasedSegments".equals(metric.getName()))
             .flatMap(metric -> metric.getLongGaugeData().getPoints().stream())
-            .filter(point -> point.getAttributes().equals(Attributes.empty()))
+            .filter(point -> "simple".equals(
+                point.getAttributes().get(AttributeKey.stringKey("type"))))
             .mapToLong(point -> point.getValue())
             .findFirst()
             .orElseThrow(() -> new AssertionError("leased segments gauge not reported"));

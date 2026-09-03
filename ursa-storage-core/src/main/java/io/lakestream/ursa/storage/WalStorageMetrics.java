@@ -129,7 +129,8 @@ public class WalStorageMetrics {
             .setDescription("The number of cache segments currently held under a read lease")
             .ofLongs()
             .buildWithCallback((gauge) -> {
-                gauge.record(leaseCompute.apply(null));
+                gauge.record(leaseCompute.apply(null),
+                    Attributes.builder().put("type", storageType).build());
             });
     }
 

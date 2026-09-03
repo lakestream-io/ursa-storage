@@ -33,6 +33,12 @@ public interface PersistCache extends Serializable, Closeable {
      * Every successful {@code tryRetain()} needs exactly one matching {@link #release()}, normally in
      * a {@code finally}.
      *
+     * <p><b>The one exception</b> is a batch read that mixes live and retired locations: the leases on
+     * the live segments are held across the storage recovery of the retired ones, one remote GET per
+     * retired location issued in parallel. That single recovery is the bound — the leases are released
+     * immediately after the synchronous read loop, still before any per-entry storage fallback is
+     * awaited. A segment pinned this way only has its close deferred, and no lock is held meanwhile.
+     *
      * @return true when the lease was granted, false when the segment is retired.
      */
     boolean tryRetain();

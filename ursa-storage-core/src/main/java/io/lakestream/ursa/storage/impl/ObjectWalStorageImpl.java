@@ -508,6 +508,13 @@ public class ObjectWalStorageImpl implements WalStorage {
      * the end of the synchronous block that reads from the segment. A lease must never be held across
      * an asynchronous boundary, so a retired segment is pinned for one read call rather than for a
      * whole remote fetch.
+     *
+     * <p><b>One exception</b>, in the batch read only: when some locations in a batch resolve to
+     * retired segments, the leases already granted for that batch's live locations are held across
+     * the storage recovery of the retired ones — a single remote GET per retired location, issued in
+     * parallel. The bound is that one recovery; the leases are released in the same {@code finally}
+     * as always, before any per-entry storage fallback is awaited and before a retry runs. A retired
+     * segment held this way is only deferred from closing, and no lock is held meanwhile.
      */
     private CompletableFuture<PersistCache> getPersistCache(long id, Position position) {
         if (log.isTraceEnabled()) {
@@ -673,8 +680,22 @@ public class ObjectWalStorageImpl implements WalStorage {
             return cachesFuture.thenCompose(__ -> {
                 // A location whose segment retired before it could be leased is an ordinary cache
                 // miss: read it straight from storage rather than failing the batch.
-                CompletableFuture<Map<String, PersistCache>> recoveryFuture =
-                        readRetiredLocationsFromStorage(caches);
+                // The map is owned here, not inside the helper, so a synchronous throw out of the
+                // helper can still close whatever it managed to deserialize.
+                Map<String, PersistCache> pending = new ConcurrentHashMap<>();
+                CompletableFuture<Map<String, PersistCache>> recoveryFuture;
+                try {
+                    recoveryFuture = readRetiredLocationsFromStorage(caches, pending);
+                } catch (RuntimeException | Error lookupFailure) {
+                    // FileStorage implementations can throw synchronously rather than returning a
+                    // failed future (a closed S3 client, a rejected GCS executor). This runs outside
+                    // the try/finally around the read loop, so without this catch every lease held
+                    // for the batch's live locations would leak permanently.
+                    metrics.getGetEntriesDuration().recordFailure(System.nanoTime() - start);
+                    releaseAcquiredCaches(caches);
+                    closeRecoveredSegments(pending);
+                    throw lookupFailure;
+                }
                 recoveryFuture.whenComplete((recovered, e) -> {
                     if (e != null) {
                         metrics.getGetEntriesDuration().recordFailure(System.nanoTime() - start);
@@ -705,7 +726,7 @@ public class ObjectWalStorageImpl implements WalStorage {
      * loop is done with them.
      */
     private CompletableFuture<Map<String, PersistCache>> readRetiredLocationsFromStorage(
-            Map<String, CompletableFuture<PersistCache>> caches) {
+            Map<String, CompletableFuture<PersistCache>> caches, Map<String, PersistCache> recovered) {
         List<String> retired = null;
         for (var e : caches.entrySet()) {
             CompletableFuture<PersistCache> cacheFuture = e.getValue();
@@ -721,14 +742,11 @@ public class ObjectWalStorageImpl implements WalStorage {
             return CompletableFuture.completedFuture(Map.of());
         }
 
-        Map<String, PersistCache> recovered = new ConcurrentHashMap<>();
         List<CompletableFuture<Void>> loads = new ArrayList<>(retired.size());
         for (String location : retired) {
             metrics.getGetEntriesCacheMiss()
                     .increment(Attributes.of(AttributeKey.stringKey("type"), "stale_segment"));
-            loads.add(fileStorage.getAsync(location).thenAccept(byteBuf ->
-                    recovered.put(location, PersistCacheFactory.deserialize(allocator, byteBuf,
-                            config.getIndexSerializeFormatVersion()))));
+            loads.add(readRetiredLocation(location, recovered));
         }
         return FutureUtils.waitForAll(loads)
                 .handle((ignored, failure) -> {
@@ -740,6 +758,24 @@ public class ObjectWalStorageImpl implements WalStorage {
                     }
                     return recovered;
                 });
+    }
+
+    /**
+     * Schedules one recovery read, turning a synchronous throw from the storage layer into a failed
+     * future.
+     *
+     * <p>That matters for cleanup, not just tidiness: loads scheduled before the throw would
+     * otherwise complete into a map nobody waits on, leaking their segments. Failing the future keeps
+     * every load under the shared completion handler below.
+     */
+    private CompletableFuture<Void> readRetiredLocation(String location, Map<String, PersistCache> recovered) {
+        try {
+            return fileStorage.getAsync(location).thenAccept(byteBuf ->
+                    recovered.put(location, PersistCacheFactory.deserialize(allocator, byteBuf,
+                            config.getIndexSerializeFormatVersion())));
+        } catch (RuntimeException | Error storageFailure) {
+            return CompletableFuture.failedFuture(storageFailure);
+        }
     }
 
     private static void closeRecoveredSegments(Map<String, PersistCache> recovered) {
