@@ -15,6 +15,7 @@ import io.lakestream.api.LogId;
 import io.lakestream.api.LogStateManager;
 import io.lakestream.api.LogStorage;
 import io.lakestream.api.Namespace;
+import io.lakestream.api.NativeLogName;
 import io.lakestream.api.Partitioning;
 import io.lakestream.api.PartitioningStrategy;
 import io.lakestream.api.SchemaConfig;
@@ -1087,8 +1088,7 @@ public class IndexedStreamCatalog implements StreamCatalog {
 
     private static String nativePartitionAllocationKey(
             StreamIdentifier id, int partitionIndex) {
-        return "lakestream-native/" + id.fullName()
-            + "/partition-" + partitionIndex;
+        return NativeLogName.of(id, partitionIndex);
     }
 
     private CompletableFuture<Long> allocateNativeKeyedStreamId(

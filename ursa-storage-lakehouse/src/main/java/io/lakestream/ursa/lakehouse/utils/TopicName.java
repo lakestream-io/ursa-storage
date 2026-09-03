@@ -4,6 +4,8 @@
  */
 package io.lakestream.ursa.lakehouse.utils;
 
+import io.lakestream.api.NativeLogName;
+import io.lakestream.api.StreamIdentifier;
 import java.util.Objects;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -12,16 +14,6 @@ import java.util.regex.Pattern;
 public final class TopicName {
     public static final String DEFAULT_NAMESPACE = "default";
     private static final Pattern PARTITION_SUFFIX = Pattern.compile("-partition-(\\d+)$");
-    /**
-     * Prefix of the log names the catalog allocates for Lakestream-native streams, built as
-     * {@code lakestream-native/<namespace>/<name>/partition-N}. Unlike the canonical form, the partition is
-     * its own trailing segment, so {@link #get(String)} reads such a name as the namespace
-     * {@code lakestream-native/<namespace>/<name>} holding a local name of {@code partition-N}. That reading
-     * is what the compacted-object layout is built from and must not change; only identity resolution needs
-     * to see through it.
-     */
-    private static final String NATIVE_NAME_PREFIX = "lakestream-native/";
-    private static final Pattern PARTITION_SEGMENT = Pattern.compile("^partition-(\\d+)$");
 
     private final String namespace;
     private final String localName;
@@ -57,22 +49,14 @@ public final class TopicName {
     public static TopicName getStreamIdentity(String value) {
         Objects.requireNonNull(value, "value");
         String name = value.strip();
-        return name.startsWith(NATIVE_NAME_PREFIX) ? nativeIdentity(name) : getPartitionedTopicName(name);
-    }
-
-    private static TopicName nativeIdentity(String value) {
-        String remainder = value.substring(NATIVE_NAME_PREFIX.length());
-        int partitionStart = remainder.lastIndexOf('/');
-        if (partitionStart < 0
-                || !PARTITION_SEGMENT.matcher(remainder.substring(partitionStart + 1)).matches()) {
-            throw new IllegalArgumentException("Invalid topic name: " + value);
+        if (!NativeLogName.hasNativePrefix(name)) {
+            return getPartitionedTopicName(name);
         }
-        String fullName = remainder.substring(0, partitionStart);
-        int nameStart = fullName.lastIndexOf('/');
-        if (nameStart < 0) {
-            throw new IllegalArgumentException("Invalid topic name: " + value);
-        }
-        return new TopicName(fullName.substring(0, nameStart), fullName.substring(nameStart + 1));
+        // Plain get() reads a native log name as the namespace `lakestream-native/<ns>/<name>` holding a
+        // local name of `partition-N`. That reading is what the compacted-object layout is built from, so
+        // it stays; only identity has to see through the format.
+        StreamIdentifier stream = NativeLogName.parse(name).stream();
+        return new TopicName(stream.namespace(), stream.name());
     }
 
     public String getPartitionedTopicName() {
