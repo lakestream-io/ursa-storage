@@ -201,6 +201,40 @@ public class TestEntryCache extends FileBasedTestClass {
     }
 
     @Test
+    void testGetByEntryIdIsGuardedAfterRecycle() {
+        @Cleanup("release")
+        ByteBuf original = Unpooled.wrappedBuffer("original-entry".getBytes());
+        assertEquals(0, persistCache.put(
+                new PendingAdd(streamId, 10, original, new CompletableFuture<>(), null)));
+        // A flush publishes the segment's first offset, which is what makes it readable by location.
+        ((EntryCache) persistCache).setStartOffsets(streamId, 0);
+
+        ByteBuf payload = persistCache.get(streamId, 0);
+        assertNotNull(payload);
+        assertEquals(original, payload);
+        payload.release();
+
+        // FIFO recycle: clear() drops the start offsets, and the segment is refilled with entirely
+        // different data for the same stream before the next flush publishes a new start offset.
+        persistCache.clear();
+        @Cleanup("release")
+        ByteBuf recycled = Unpooled.wrappedBuffer("a-completely-different-entry".getBytes());
+        assertEquals(0, persistCache.put(
+                new PendingAdd(streamId, 10, recycled, new CompletableFuture<>(), null)));
+
+        // Without the guard this returned the new payload for the old entry id: well formed, wrong
+        // data, no error and no metric. A miss sends the caller to storage instead.
+        assertNull(persistCache.get(streamId, 0));
+
+        // Once the refilled segment is flushed it is readable again, with its own data.
+        ((EntryCache) persistCache).setStartOffsets(streamId, 10);
+        ByteBuf afterFlush = persistCache.get(streamId, 0);
+        assertNotNull(afterFlush);
+        assertEquals(recycled, afterFlush);
+        afterFlush.release();
+    }
+
+    @Test
     void testReleaseWithoutRetainIsRejected() {
         assertThrows(IllegalStateException.class, persistCache::release);
         assertEquals(0, ((EntryCache) persistCache).leaseCount());

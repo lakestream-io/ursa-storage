@@ -367,6 +367,17 @@ public class EntryCache implements PersistCache {
     }
 
     private ByteBuf doGetByEntryId(long streamId, long entryId) {
+        if (!readonly && !startOffsets.containsKey(streamId)) {
+            // Mirrors copy()'s first guard. A writable segment only becomes reachable by location
+            // after a successful flush populated startOffsets, and clear() wipes them again when the
+            // FIFO recycles the segment into the free pool. Without this check a recycled segment
+            // that has been refilled with different data for the same stream returns a well-formed
+            // but wrong payload, with no error and no metric. Reporting a miss instead sends the
+            // caller down the storage read path, which is always correct.
+            log.warn("[{}] Entry cache is not available for read by entry id: "
+                    + "flushed first offset is not set", streamId);
+            return null;
+        }
         var result = this.index.get(streamId);
         if (result == null) {
             return null;
