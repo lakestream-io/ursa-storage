@@ -110,7 +110,10 @@ public interface Log extends AutoCloseable {
     /**
      * Returns the offset information of the first entry in the log.
      *
-     * <p>Implementations that hold the only write lease for the log may serve this from memory.
+     * <p>A log may be written and trimmed by several holders at once, so no handle knows the
+     * whole of its history: another holder can append the entry that starts the log, or trim the
+     * one this handle last saw. Implementations must observe the log's current state on every
+     * call rather than serving a remembered value.
      *
      * @return a future resolving to the first offset
      */
@@ -128,7 +131,10 @@ public interface Log extends AutoCloseable {
     /**
      * Returns the offset information of the last entry in the log.
      *
-     * <p>Implementations that hold the only write lease for the log may serve this from memory.
+     * <p>A log may be written by several holders at once, so a handle's own appends are not the
+     * whole tail: another holder can extend the log without this one hearing about it.
+     * Implementations must observe the log's current state on every call rather than serving a
+     * remembered value.
      *
      * @return a future resolving to the last offset
      */
