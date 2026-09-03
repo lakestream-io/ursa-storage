@@ -12,6 +12,16 @@ import java.util.regex.Pattern;
 public final class TopicName {
     public static final String DEFAULT_NAMESPACE = "default";
     private static final Pattern PARTITION_SUFFIX = Pattern.compile("-partition-(\\d+)$");
+    /**
+     * Prefix of the log names the catalog allocates for Lakestream-native streams, built as
+     * {@code lakestream-native/<namespace>/<name>/partition-N}. Unlike the canonical form, the partition is
+     * its own trailing segment, so {@link #get(String)} reads such a name as the namespace
+     * {@code lakestream-native/<namespace>/<name>} holding a local name of {@code partition-N}. That reading
+     * is what the compacted-object layout is built from and must not change; only identity resolution needs
+     * to see through it.
+     */
+    private static final String NATIVE_NAME_PREFIX = "lakestream-native/";
+    private static final Pattern PARTITION_SEGMENT = Pattern.compile("^partition-(\\d+)$");
 
     private final String namespace;
     private final String localName;
@@ -35,6 +45,34 @@ public final class TopicName {
 
     public static TopicName getPartitionedTopicName(String value) {
         return get(get(value).getPartitionedTopicName());
+    }
+
+    /**
+     * Resolves the stream a name identifies, accepting both the canonical {@code namespace/name-partition-N}
+     * form and the Lakestream-native allocation key {@code lakestream-native/namespace/name/partition-N}.
+     *
+     * <p>The returned local name never carries a partition, because a table is keyed by the stream rather
+     * than by one of its partitions.
+     */
+    public static TopicName getStreamIdentity(String value) {
+        Objects.requireNonNull(value, "value");
+        String name = value.strip();
+        return name.startsWith(NATIVE_NAME_PREFIX) ? nativeIdentity(name) : getPartitionedTopicName(name);
+    }
+
+    private static TopicName nativeIdentity(String value) {
+        String remainder = value.substring(NATIVE_NAME_PREFIX.length());
+        int partitionStart = remainder.lastIndexOf('/');
+        if (partitionStart < 0
+                || !PARTITION_SEGMENT.matcher(remainder.substring(partitionStart + 1)).matches()) {
+            throw new IllegalArgumentException("Invalid topic name: " + value);
+        }
+        String fullName = remainder.substring(0, partitionStart);
+        int nameStart = fullName.lastIndexOf('/');
+        if (nameStart < 0) {
+            throw new IllegalArgumentException("Invalid topic name: " + value);
+        }
+        return new TopicName(fullName.substring(0, nameStart), fullName.substring(nameStart + 1));
     }
 
     public String getPartitionedTopicName() {

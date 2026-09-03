@@ -1384,9 +1384,12 @@ public class IcebergTable {
     }
 
     public static TableIdentifier getTableIdentifierByTopic(String topic) {
-        var partitionedTopicName = TopicName.getPartitionedTopicName(topic);
-        var icebergNs = Namespace.of(partitionedTopicName.getNamespace());
-        var tableName = partitionedTopicName.getLocalName();
+        // Resolves through stream identity rather than plain parsing so a Lakestream-native allocation key
+        // keys the same table the materialization writer creates, instead of a namespace ending in the
+        // stream name and a table called `partition-N`.
+        var identity = TopicName.getStreamIdentity(topic);
+        var icebergNs = Namespace.of(identity.getNamespace());
+        var tableName = identity.getLocalName();
         return TableIdentifier.of(icebergNs, tableName);
     }
 
