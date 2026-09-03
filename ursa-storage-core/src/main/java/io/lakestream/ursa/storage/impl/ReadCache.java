@@ -158,6 +158,28 @@ class ReadCache {
     }
 
     /**
+     * Leased variant of {@link #get(FileInfo, int)}.
+     *
+     * <p>The returned future completes with a segment on which a read lease is already held — the
+     * caller owns that lease and must {@link PersistCache#release()} it — or with {@code null} when
+     * the segment was retired between the lookup and the lease. {@code null} is an ordinary cache
+     * miss that the caller satisfies from storage, not an error: it replaces the
+     * {@code EntryCacheClosedException} a reader used to hit when eviction closed a segment it was
+     * still holding.
+     *
+     * <p>No lock is taken or needed here: {@code tryRetain()} is itself the synchronization point
+     * against the removal listener's close.
+     *
+     * @param fileInfo The location of the persistCache.
+     * @param readEntryRequestsInLocation The number of read entry requests in the location.
+     * @return A future completing with a leased persistCache, or with null on a retirement race.
+     */
+    CompletableFuture<PersistCache> acquire(FileInfo fileInfo, int readEntryRequestsInLocation) {
+        return get(fileInfo, readEntryRequestsInLocation)
+            .thenApply(cache -> cache != null && cache.tryRetain() ? cache : null);
+    }
+
+    /**
      * Processor for handling read cache operations.
      */
     private class ReadCacheProcessor extends

@@ -16,6 +16,7 @@ import io.lakestream.api.Position;
 import io.lakestream.ursa.lakestream.reader.CompactedObjectReader;
 import io.lakestream.ursa.storage.Entry;
 import io.lakestream.ursa.storage.OwnedResultFutures;
+import io.lakestream.ursa.storage.impl.exception.EntryCacheClosedException;
 import io.oxia.client.api.AsyncOxiaClient;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -83,6 +84,8 @@ public class LogCursorImpl implements LogCursor {
     private EntryIndex prefetchedParquetIndex;
     private volatile CompletableFuture<Void> prefetchedParquetIndexFuture =
             CompletableFuture.completedFuture(null);
+    // Bound on how far isCacheLifecycleFailure() walks a wrapped cause chain.
+    private static final int MAX_CAUSE_CHAIN_DEPTH = 16;
     private static final int PARQUET_TOTAL_CACHE_COUNT = 5;
     private static final int TRIGGER_PARQUET_CACHE_ONE_ROUND = 5;
     private final AtomicInteger currentParquetCacheCount = new AtomicInteger(1);
@@ -390,12 +393,45 @@ public class LogCursorImpl implements LogCursor {
             }
         }).exceptionally(ex -> {
             closeEntries(result, 0);
+            if (isCacheLifecycleFailure(ex)) {
+                // A WAL cache segment was closed underneath the read. That is transient and scoped to
+                // one segment, so drop only this cursor's prefetch state: invalidating the log-wide
+                // index cache here would force every other cursor on the log to re-read its indexes
+                // because of a microsecond-scale miss.
+                log.warn("Transient cache lifecycle error reading entries for cursor {}: {}. "
+                    + "Clearing prefetch state.", name, ex.getMessage());
+                clearPrefetchCache();
+                throw new CompletionException(ex);
+            }
             log.warn("Error reading entries for cursor {}: {}. Clearing cache.", name, ex.getMessage());
             // Invalidate shared index cache + all prefetch state
             logDelegate.invalidateCache();
             clearPrefetchCache();
             throw new CompletionException(ex);
         });
+    }
+
+    /**
+     * Reports whether {@code failure} was caused by a WAL cache segment being closed or recycled,
+     * rather than by a genuine index or storage problem.
+     *
+     * <p>Walks a bounded slice of the cause chain because the storage layer wraps the original cause
+     * in {@link CompletionException} and its own exception types. Guards against self-referential and
+     * cyclic causes.
+     */
+    private static boolean isCacheLifecycleFailure(Throwable failure) {
+        Throwable cause = failure;
+        for (int depth = 0; cause != null && depth < MAX_CAUSE_CHAIN_DEPTH; depth++) {
+            if (cause instanceof EntryCacheClosedException) {
+                return true;
+            }
+            Throwable next = cause.getCause();
+            if (next == cause) {
+                break;
+            }
+            cause = next;
+        }
+        return false;
     }
 
     @Override

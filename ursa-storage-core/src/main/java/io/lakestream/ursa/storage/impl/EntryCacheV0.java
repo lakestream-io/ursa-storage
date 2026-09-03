@@ -82,6 +82,29 @@ public class EntryCacheV0 implements PersistCache {
         }
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Legacy V0 segments are not leased: the lease is always granted and {@link #release()} is a
+     * no-op, so segment lifetime here is exactly what it was before segment leases were introduced.
+     * V0 is only selected for {@code indexSerializeFormatVersion} below the protobuf version, which is
+     * not the production path.
+     */
+    @Override
+    public boolean tryRetain() {
+        return true;
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>No-op for legacy V0 segments; see {@link #tryRetain()}.
+     */
+    @Override
+    public void release() {
+        // Intentionally empty: V0 segments do not defer their close.
+    }
+
     private void unsafeClose() {
         unsafeClear();
         cacheBuffer.release();

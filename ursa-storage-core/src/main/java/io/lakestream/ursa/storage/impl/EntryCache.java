@@ -40,6 +40,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -101,6 +102,13 @@ public class EntryCache implements PersistCache {
     }
 
     private volatile boolean closed = false;
+    // Segment lease state. Readers take a lease through tryRetain()/release() so the cache that owns
+    // this segment cannot release cacheBuffer while a read is still in flight. Deliberately lock-free
+    // (one AtomicInteger plus one volatile): a lease may be taken while the owning cache holds its own
+    // lock, and taking this segment's lock there would add a new lock-order edge.
+    private final AtomicInteger leases = new AtomicInteger(0);
+    // Set by close(): no further lease is granted and the last releaser performs the teardown.
+    private volatile boolean retired = false;
     private final ReadWriteLock lock = new ReentrantReadWriteLock();
     @Getter
     private final Map<Long, Value> index;
@@ -146,7 +154,49 @@ public class EntryCache implements PersistCache {
 
 
     @Override
+    public boolean tryRetain() {
+        if (retired) {
+            return false;
+        }
+        leases.incrementAndGet();
+        if (retired) {
+            // Lost the race with close(): back the lease out and report a miss. Both the retired store
+            // and the lease increment are sequentially consistent, so close() either observes this
+            // lease and defers, or this check observes the retirement.
+            release();
+            return false;
+        }
+        return true;
+    }
+
+    @Override
+    public void release() {
+        int remaining = leases.decrementAndGet();
+        if (remaining < 0) {
+            leases.incrementAndGet();
+            throw new IllegalStateException("release() without a matching tryRetain()");
+        }
+        if (remaining == 0 && retired) {
+            doClose();
+        }
+    }
+
+    @VisibleForTesting
+    int leaseCount() {
+        return leases.get();
+    }
+
+    @Override
     public void close() {
+        // Retire first so no new lease can be granted, then let whoever drops the last lease do the
+        // teardown. With nothing leased that is this caller, so close() stays synchronous as before.
+        retired = true;
+        if (leases.get() == 0) {
+            doClose();
+        }
+    }
+
+    private void doClose() {
         lock.writeLock().lock();
         try {
             if (closed) {

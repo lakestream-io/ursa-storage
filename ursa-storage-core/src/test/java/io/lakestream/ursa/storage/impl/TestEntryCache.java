@@ -12,7 +12,6 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
@@ -135,6 +134,10 @@ public class TestEntryCache extends FileBasedTestClass {
 
         EntryList entryList = new EntryList(streamId, 0, Long.MAX_VALUE, 1000, 10000, null, null);
 
+        // The reader holds a lease for the whole copy, so a concurrent close may only retire the
+        // segment: the copy must succeed and the teardown must wait for release().
+        assertTrue(persistCache.tryRetain());
+
         ExecutorService executorA = Executors.newSingleThreadExecutor();
         ExecutorService executorB = Executors.newSingleThreadExecutor();
         CompletableFuture<Void> copyFuture = CompletableFuture.runAsync(() -> {
@@ -153,15 +156,54 @@ public class TestEntryCache extends FileBasedTestClass {
         }, executorB);
 
         closeFuture.join();
-        try {
-            copyFuture.join();
-        } catch (Exception e) {
-            assertEquals(0, entryList.size());
-            if (!(e.getCause() instanceof EntryCacheClosedException
-                    && e.getMessage().contains("already closed"))) {
-                fail(e.getMessage());
-            }
-        }
+        // No EntryCacheClosedException is reachable here any more: the lease outlives the close.
+        copyFuture.join();
+        assertEquals(2, entryList.size());
+        entryList.clear();
+
+        persistCache.release();
+        // The last release runs the deferred teardown.
+        assertThrows(EntryCacheClosedException.class, () -> persistCache.copy(index, entryList));
+        executorA.shutdownNow();
+        executorB.shutdownNow();
+    }
+
+    @Test
+    void testRetainAfterCloseIsRefused() {
+        assertTrue(persistCache.tryRetain());
+        persistCache.release();
+
+        persistCache.close();
+
+        assertFalse(persistCache.tryRetain());
+        assertEquals(0, ((EntryCache) persistCache).leaseCount());
+    }
+
+    @Test
+    void testCloseIsDeferredUntilLastReleaseAndRunsOnce() {
+        assertTrue(persistCache.tryRetain());
+        assertTrue(persistCache.tryRetain());
+        assertEquals(2, ((EntryCache) persistCache).leaseCount());
+
+        persistCache.close();
+        // Retired but not torn down: an in-flight reader can still read.
+        assertEquals(0, persistCache.sizeInBytes());
+
+        persistCache.release();
+        assertEquals(0, persistCache.sizeInBytes());
+
+        persistCache.release();
+        assertThrows(EntryCacheClosedException.class, persistCache::sizeInBytes);
+
+        // Idempotent: a second close (and the tearDown close) must not release the buffer twice.
+        persistCache.close();
+        persistCache.close();
+    }
+
+    @Test
+    void testReleaseWithoutRetainIsRejected() {
+        assertThrows(IllegalStateException.class, persistCache::release);
+        assertEquals(0, ((EntryCache) persistCache).leaseCount());
     }
     @Test
     void testApisAfterClose() throws Exception {
