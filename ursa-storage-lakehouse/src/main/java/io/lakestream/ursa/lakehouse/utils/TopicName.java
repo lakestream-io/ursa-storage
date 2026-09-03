@@ -4,8 +4,6 @@
  */
 package io.lakestream.ursa.lakehouse.utils;
 
-import io.lakestream.api.NativeLogName;
-import io.lakestream.api.StreamIdentifier;
 import java.util.Objects;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -40,23 +38,13 @@ public final class TopicName {
     }
 
     /**
-     * Resolves the stream a name identifies, accepting both the canonical {@code namespace/name-partition-N}
-     * form and the Lakestream-native allocation key {@code lakestream-native/namespace/name/partition-N}.
+     * Resolves the stream identified by a canonical {@code namespace/name-partition-N} log name.
      *
      * <p>The returned local name never carries a partition, because a table is keyed by the stream rather
      * than by one of its partitions.
      */
     public static TopicName getStreamIdentity(String value) {
-        Objects.requireNonNull(value, "value");
-        String name = value.strip();
-        if (!NativeLogName.hasNativePrefix(name)) {
-            return getPartitionedTopicName(name);
-        }
-        // Plain get() reads a native log name as the namespace `lakestream-native/<ns>/<name>` holding a
-        // local name of `partition-N`. That reading is what the compacted-object layout is built from, so
-        // it stays; only identity has to see through the format.
-        StreamIdentifier stream = NativeLogName.parse(name).stream();
-        return new TopicName(stream.namespace(), stream.name());
+        return getPartitionedTopicName(value);
     }
 
     public String getPartitionedTopicName() {

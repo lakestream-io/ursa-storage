@@ -17,7 +17,7 @@ import org.junit.jupiter.api.Test;
 class StreamTableNamingTest {
 
     private static final String LOG_NAME =
-        "lakestream-native/default/orders-topic-id-DoZSD7MWQRGZSg7TTy1u7w/partition-0";
+        "default/orders-topic-id-DoZSD7MWQRGZSg7TTy1u7w-partition-0";
 
     @Test
     void withoutATemplateItNamesTheTableAfterTheStream() {

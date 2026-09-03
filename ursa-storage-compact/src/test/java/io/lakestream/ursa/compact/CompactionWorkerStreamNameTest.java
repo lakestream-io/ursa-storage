@@ -10,16 +10,12 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import io.lakestream.api.StreamIdentifier;
 import org.junit.jupiter.api.Test;
 
-/**
- * Compaction tasks carry the log name the catalog allocated. For Lakestream-native streams that name is
- * {@code lakestream-native/<namespace>/<name>/partition-N}, so the materialization dispatch has to resolve
- * the stream identity out of that shape as well as out of the shorter forms.
- */
+/** Verifies stream identity and partition parsing from canonical compaction-task log names. */
 public class CompactionWorkerStreamNameTest {
 
     @Test
-    public void testNativeAllocationKeyResolvesStreamIdentity() {
-        String topic = "lakestream-native/default/orders-topic-id-Eon_fZE2QTqu_NT0m6fD5Q/partition-3";
+    public void testCanonicalAllocationKeyResolvesStreamIdentity() {
+        String topic = "default/orders-topic-id-Eon_fZE2QTqu_NT0m6fD5Q-partition-3";
 
         assertEquals(StreamIdentifier.of("default", "orders-topic-id-Eon_fZE2QTqu_NT0m6fD5Q"),
                 CompactionWorker.toStreamIdentifier(topic));
@@ -27,8 +23,8 @@ public class CompactionWorkerStreamNameTest {
     }
 
     @Test
-    public void testNativeAllocationKeyKeepsMultiSegmentNamespace() {
-        String topic = "lakestream-native/public/default/orders/partition-0";
+    public void testCanonicalAllocationKeyKeepsMultiSegmentNamespace() {
+        String topic = "public/default/orders-partition-0";
 
         assertEquals(StreamIdentifier.of("public/default", "orders"),
                 CompactionWorker.toStreamIdentifier(topic));
@@ -52,14 +48,14 @@ public class CompactionWorkerStreamNameTest {
     }
 
     @Test
-    public void testUnrecognizedMultiSegmentNameIsRejected() {
+    public void testMalformedNamespaceIsRejected() {
         assertThrows(IllegalArgumentException.class,
-                () -> CompactionWorker.toStreamIdentifier("sales/2026/orders"));
+                () -> CompactionWorker.toStreamIdentifier("sales//orders-partition-0"));
     }
 
     @Test
-    public void testNativePrefixWithoutPartitionSegmentIsRejected() {
+    public void testUriIsRejected() {
         assertThrows(IllegalArgumentException.class,
-                () -> CompactionWorker.toStreamIdentifier("lakestream-native/default/orders"));
+                () -> CompactionWorker.toStreamIdentifier("s3://sales/orders-partition-0"));
     }
 }

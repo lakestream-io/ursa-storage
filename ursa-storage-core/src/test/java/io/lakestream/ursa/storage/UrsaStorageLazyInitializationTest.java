@@ -137,8 +137,8 @@ class UrsaStorageLazyInitializationTest {
         StorageApi storageApi = storage.getDefaultStorageApi();
         StreamIdMappingOwner owner =
             new StreamIdMappingOwner("incarnation-1", "owner-1", 1L);
-        String firstKey = "lakestream-native/public/default/topic/partition-0";
-        String secondKey = "lakestream-native/public/default/topic/partition-1";
+        String firstKey = "public/default/topic-partition-0";
+        String secondKey = "public/default/topic-partition-1";
 
         // StreamCatalogService requests cleanup during bootstrap. The request must remain
         // metadata-only until a reader or writer actually initializes the WAL.

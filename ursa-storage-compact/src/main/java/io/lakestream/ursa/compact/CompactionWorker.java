@@ -5,7 +5,6 @@
 package io.lakestream.ursa.compact;
 
 import io.lakestream.api.LogId;
-import io.lakestream.api.NativeLogName;
 import io.lakestream.api.StreamCatalog;
 import io.lakestream.api.StreamIdentifier;
 import io.lakestream.api.StreamMetadata;
@@ -492,24 +491,11 @@ public class CompactionWorker implements Runnable {
                 throw new IllegalArgumentException("Invalid stream name: " + value);
             }
             String stripped = value.strip();
-            if (NativeLogName.hasNativePrefix(stripped)) {
-                NativeLogName.Parsed parsed = NativeLogName.parse(stripped);
-                String name = parsed.stream().name();
-                return new CanonicalName(parsed.stream().namespace(), name, name, parsed.partition());
-            }
-            String[] parts = stripped.split("/", -1);
-            String namespace;
-            String localName;
-            if (parts.length == 1) {
-                namespace = "default";
-                localName = parts[0];
-            } else if (parts.length == 2) {
-                namespace = parts[0];
-                localName = parts[1];
-            } else {
-                throw new IllegalArgumentException("Invalid stream name: " + value);
-            }
-            if (namespace.isBlank() || localName.isBlank()) {
+            int separator = stripped.lastIndexOf('/');
+            String namespace = separator < 0 ? "default" : stripped.substring(0, separator);
+            String localName = separator < 0 ? stripped : stripped.substring(separator + 1);
+            if (namespace.isBlank() || namespace.startsWith("/") || namespace.endsWith("/")
+                    || namespace.contains("//") || localName.isBlank()) {
                 throw new IllegalArgumentException("Invalid stream name: " + value);
             }
             Matcher matcher = PARTITION_SUFFIX.matcher(localName);
@@ -519,6 +505,5 @@ public class CompactionWorker implements Runnable {
             return new CanonicalName(namespace, localName, localName.substring(0, matcher.start()),
                     Integer.parseInt(matcher.group(1)));
         }
-
     }
 }

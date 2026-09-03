@@ -34,7 +34,7 @@ public final class StreamTableNaming {
     /**
      * Resolves the table for {@code logName}.
      *
-     * @param logName the compaction task's topic, in either the canonical or the native log-name form
+     * @param logName the compaction task's topic in canonical log-name form
      * @param properties the task's effective configuration, which carries both the template and the
      *                   stream properties a template may interpolate
      */
