@@ -17,6 +17,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
 
@@ -27,11 +28,24 @@ public final class StorageTopicManager implements TopicManager {
     private final StorageApi storageApi;
     private final Set<String> excludedNamespaces;
     private final Set<String> excludedTopics;
+    /**
+     * Reads a stream's catalog properties by log name, or null when the deployment has no catalog to
+     * ask. The properties ride along on every compaction task, which is how a sink that names its
+     * table from one - the Kafka topic name behind an incarnation-qualified stream, say - reaches it
+     * on the commit side, where only the log name is otherwise available.
+     */
+    private final Function<String, Map<String, String>> streamPropertiesLookup;
 
     public StorageTopicManager(StorageApi storageApi, StorageConfig storageConfig) {
+        this(storageApi, storageConfig, null);
+    }
+
+    public StorageTopicManager(StorageApi storageApi, StorageConfig storageConfig,
+                               Function<String, Map<String, String>> streamPropertiesLookup) {
         this.storageApi = storageApi;
         this.excludedNamespaces = storageConfig.getBlackNamespaceOfCompact();
         this.excludedTopics = storageConfig.getBlackTopicOfCompact();
+        this.streamPropertiesLookup = streamPropertiesLookup;
     }
 
     @Override
@@ -68,13 +82,27 @@ public final class StorageTopicManager implements TopicManager {
         return storageApi.listStreamsWithProperties().thenApply(streams -> findTopic(streams, topic));
     }
 
-    private static TopicMetadata findTopic(Map<Long, StreamProperties> streams, String topic) {
+    private TopicMetadata findTopic(Map<Long, StreamProperties> streams, String topic) {
         return streams.entrySet().stream()
                 .filter(entry -> topic.equals(entry.getValue().key()))
                 .findFirst()
-                .map(entry -> new TopicMetadata(topic, entry.getKey(), Collections.emptyMap()))
+                .map(entry -> new TopicMetadata(topic, entry.getKey(), streamProperties(topic)))
                 .orElseThrow(() -> new CompletionException(
                         new TopicNotFoundException("The stream " + topic + " does not exist.")));
+    }
+
+    /** Never fails topic discovery over a catalog read: a task without properties still compacts. */
+    private Map<String, String> streamProperties(String topic) {
+        if (streamPropertiesLookup == null) {
+            return Collections.emptyMap();
+        }
+        try {
+            Map<String, String> properties = streamPropertiesLookup.apply(topic);
+            return properties == null ? Collections.emptyMap() : properties;
+        } catch (RuntimeException e) {
+            log.warn("Failed to read catalog properties for stream {}; compacting without them", topic, e);
+            return Collections.emptyMap();
+        }
     }
 
     @Override

@@ -19,6 +19,7 @@ import io.lakestream.api.materialization.TableMode;
 import io.lakestream.api.materialization.TableNaming;
 import io.lakestream.api.materialization.WriteMode;
 import io.lakestream.ursa.compaction.DynamicConfigs;
+import io.lakestream.ursa.lakehouse.utils.StreamTableNaming;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -297,9 +298,8 @@ public final class TableCatalogBootstrap {
         // name: database = clickhouseDatabase (fixed), table = ${stream.namespace}.${stream.name}
         // (the ClickHouse sink turns the namespace path separator '/' into '.'). Iceberg/Delta keep
         // ${stream.name} — they carry the namespace as a real multi-level table namespace instead.
-        String tableNameTemplate = properties.getProperty(TABLE_NAME_TEMPLATE_PROPERTY,
+        String tableNameTemplate = properties.getProperty(StreamTableNaming.TABLE_NAME_TEMPLATE_PROPERTY,
                 clickhouse ? "${stream.namespace}.${stream.name}" : "${stream.name}");
-        requireResolvableTemplate(tableNameTemplate, clickhouse);
 
         // Carry the legacy DynamicConfigs / flat properties into the STRUCTURED policy fields so sinks
         // that read the policy (ClickHouse reads primaryKey / framework.writeMode / commit.batchSize;
@@ -338,34 +338,6 @@ public final class TableCatalogBootstrap {
      * Splits a comma-separated column list into trimmed, non-empty names, mirroring how the lakehouse
      * writers parse {@code identifierFields} ({@code LakehouseConfiguration.getIdentifierFields}).
      */
-    /**
-     * Overrides the table name a synthesized policy derives. Interpolates the {@code TableNaming}
-     * variables, so a deployment whose stream names carry something it does not want in the table name -
-     * a Kafka topic incarnation ID, say - can name the table from a stream property instead.
-     */
-    public static final String TABLE_NAME_TEMPLATE_PROPERTY = "tableNameTemplate";
-
-    private static final String STREAM_PROPERTY_VARIABLE = "${stream.property.";
-
-    /**
-     * Rejects a template the commit path could not follow.
-     *
-     * <p>Iceberg and Delta resolve their table twice: the writer through this policy, and the commit
-     * runner from the log name, which has no access to stream properties. A template that interpolates
-     * one would split those two resolutions apart, and the symptom is silent - data files land in the
-     * warehouse and no snapshot ever references them. Fail at startup instead, until the commit path
-     * resolves identity through the policy as well. Inline-commit sinks such as ClickHouse have no
-     * second resolution and are unaffected.
-     */
-    private static void requireResolvableTemplate(String template, boolean inlineCommitSink) {
-        if (!inlineCommitSink && template.contains(STREAM_PROPERTY_VARIABLE)) {
-            throw new IllegalArgumentException(TABLE_NAME_TEMPLATE_PROPERTY + " may not interpolate "
-                    + STREAM_PROPERTY_VARIABLE + "...} for a managed lakehouse sink: the commit path "
-                    + "resolves the table from the log name and cannot read stream properties. "
-                    + "Template was: " + template);
-        }
-    }
-
     private static List<String> splitColumns(String csv) {
         if (csv == null || csv.isBlank()) {
             return List.of();

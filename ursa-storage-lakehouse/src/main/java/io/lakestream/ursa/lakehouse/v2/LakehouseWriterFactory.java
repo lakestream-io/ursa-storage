@@ -13,6 +13,7 @@ import io.lakestream.api.materialization.TableMode;
 import io.lakestream.ursa.compaction.DynamicConfigs;
 import io.lakestream.ursa.lakehouse.LakehouseConfiguration;
 import io.lakestream.ursa.lakehouse.compact.FailureMessage;
+import io.lakestream.ursa.lakehouse.utils.StreamTableNaming;
 import io.lakestream.ursa.lakehouse.v2.delta.DeltaExternalDLTTableWriter;
 import io.lakestream.ursa.lakehouse.v2.delta.DeltaExternalTableWriter;
 import io.lakestream.ursa.lakehouse.v2.iceberg.IcebergExternalDLTTableWriter;
@@ -46,6 +47,9 @@ import java.util.Properties;
  * {@code LakehouseConfiguration} to consume {@code TableCatalog} natively belongs to T9.
  */
 final class LakehouseWriterFactory {
+
+    /** Namespace of the properties a stream source records about itself, such as its Kafka topic name. */
+    private static final String STREAM_PROPERTY_PREFIX = "lakestream.";
 
     private LakehouseWriterFactory() {
     }
@@ -206,6 +210,7 @@ final class LakehouseWriterFactory {
         // so deployments that drove materialization through task properties behave the same on the
         // policy-based pipeline. Task properties take precedence over the catalog/policy-derived values.
         applyTaskPropertyOverrides(properties, taskProperties);
+        applyTableNaming(properties, policy, taskProperties);
         return new LakehouseConfiguration(properties);
     }
 
@@ -216,6 +221,35 @@ final class LakehouseWriterFactory {
      * ({@code upsertModeEnabled}), and {@code base.schema.version} ({@code baseSchemaVersion}). Applied
      * last so per-task values win over the catalog/policy-derived configuration.
      */
+    /**
+     * Carries the policy's table naming down to the writer.
+     *
+     * <p>The policy decides what a stream's table is called, but the writer resolves that name through
+     * {@code StreamTableNaming}, the same resolver the commit runner uses - one rule, so the table the
+     * writer creates is the table the commit runner adds snapshots to. Project the template and the
+     * stream properties a template may interpolate onto the flat keys that resolver reads.
+     *
+     * <p>Only {@code lakestream.}-prefixed stream properties are projected: they are the ones a stream
+     * source records about itself, and copying the whole task bag would leak storage configuration into
+     * the writer. A template interpolating anything else fails loudly at resolution rather than
+     * silently naming a different table.
+     */
+    private static void applyTableNaming(Properties properties,
+                                         TableMaterializationPolicy policy,
+                                         Map<String, String> taskProperties) {
+        policy.tableNaming().ifPresent(naming ->
+                properties.setProperty(StreamTableNaming.TABLE_NAME_TEMPLATE_PROPERTY,
+                        naming.tableNameTemplate()));
+        if (taskProperties == null) {
+            return;
+        }
+        for (Map.Entry<String, String> entry : taskProperties.entrySet()) {
+            if (entry.getKey().startsWith(STREAM_PROPERTY_PREFIX)) {
+                properties.setProperty(entry.getKey(), entry.getValue());
+            }
+        }
+    }
+
     private static void applyTaskPropertyOverrides(Properties properties, Map<String, String> taskProperties) {
         if (taskProperties == null || taskProperties.isEmpty()) {
             return;

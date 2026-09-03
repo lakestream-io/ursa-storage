@@ -4,6 +4,10 @@
  */
 package io.lakestream.ursa.compact;
 
+import io.lakestream.api.NativeLogName;
+import io.lakestream.api.StreamCatalog;
+import io.lakestream.api.StreamIdentifier;
+import io.lakestream.api.StreamMetadata;
 import io.lakestream.ursa.compact.elect.CompactLeader;
 import io.lakestream.ursa.compact.elect.LeaderElectionService;
 import io.lakestream.ursa.compaction.CompactTaskManager;
@@ -52,6 +56,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
+import java.util.function.Function;
 import javax.annotation.Nullable;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
@@ -232,6 +237,23 @@ public class CompactionScheduler {
      * inner class named {@code Dependencies}; integration modules with different shapes should
      * either follow the same convention or accept the raw {@link StorageConfig}.
      */
+    /**
+     * Reads a stream's catalog properties by log name, for the compaction tasks published against it.
+     *
+     * <p>Resolved lazily rather than captured: the catalog is opened after the storage bindings are
+     * built, so at binding time there is nothing to hand over yet. Returns an empty map when this
+     * deployment has no catalog, or when the name is not one the catalog allocated.
+     */
+    private Map<String, String> lookupStreamProperties(String logName) {
+        StreamCatalog catalog = this.streamCatalog;
+        if (catalog == null || !NativeLogName.hasNativePrefix(logName)) {
+            return Map.of();
+        }
+        StreamIdentifier id = NativeLogName.parse(logName).stream();
+        StreamMetadata metadata = catalog.loadStream(id).join();
+        return metadata == null ? Map.of() : metadata.properties();
+    }
+
     private CompactionStorageBindings buildStorageBindings(StorageConfig storageConfig) {
         String className = storageConfig.getCompactionStorageBindingsClass();
         try {
@@ -252,7 +274,8 @@ public class CompactionScheduler {
                     scanTopicExecutor,
                     publishTaskExecutor,
                     compactedTaskExecutor,
-                    commitParquetFileExecutor);
+                    commitParquetFileExecutor,
+                    (Function<String, Map<String, String>>) this::lookupStreamProperties);
             Constructor<?> ctor = clazz.getConstructor(depsClass);
             return (CompactionStorageBindings) ctor.newInstance(depsInstance);
         } catch (ReflectiveOperationException e) {

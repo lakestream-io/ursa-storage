@@ -5,7 +5,6 @@
 package io.lakestream.ursa.lakehouse.v2;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doAnswer;
@@ -23,6 +22,7 @@ import io.lakestream.api.materialization.TableCatalogType;
 import io.lakestream.api.materialization.TableMaterializationPolicy;
 import io.lakestream.api.materialization.TableMode;
 import io.lakestream.api.materialization.WriteMode;
+import io.lakestream.ursa.lakehouse.utils.StreamTableNaming;
 import io.lakestream.ursa.lakehouse.v2.TableCatalogBootstrap.BootstrapResult;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -318,7 +318,7 @@ class TableCatalogBootstrapTest {
         props.setProperty("materializationDefaultNamespace", "public/default");
         props.setProperty("lakehouseType", "DELTA");
         props.setProperty("streamTableMode", "EXTERNAL");
-        props.setProperty(TableCatalogBootstrap.TABLE_NAME_TEMPLATE_PROPERTY, "${stream.name}_v2");
+        props.setProperty(StreamTableNaming.TABLE_NAME_TEMPLATE_PROPERTY, "${stream.name}_v2");
 
         TableCatalogBootstrap.bootstrap(streamCatalog, props);
 
@@ -328,31 +328,13 @@ class TableCatalogBootstrapTest {
     }
 
     @Test
-    void tableNameTemplateRejectsStreamPropertiesForAManagedLakehouseSink() {
-        // The commit runner resolves the table from the log name and cannot read stream properties, so
-        // such a template would silently split the two resolutions apart. Fail at startup instead.
+    void tableNameTemplateMayInterpolateStreamProperties() {
         Properties props = new Properties();
         props.setProperty("materializationEnabled", "true");
         props.setProperty("materializationDefaultNamespace", "public/default");
         props.setProperty("lakehouseType", "ICEBERG");
         props.setProperty("streamTableMode", "EXTERNAL");
-        props.setProperty(TableCatalogBootstrap.TABLE_NAME_TEMPLATE_PROPERTY,
-                "${stream.property.lakestream.kafka.topic.name}");
-
-        assertThatThrownBy(() -> TableCatalogBootstrap.bootstrap(streamCatalog, props))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining(TableCatalogBootstrap.TABLE_NAME_TEMPLATE_PROPERTY);
-    }
-
-    @Test
-    void tableNameTemplateAllowsStreamPropertiesForAnInlineCommitSink() {
-        Properties props = new Properties();
-        props.setProperty("materializationEnabled", "true");
-        props.setProperty("materializationDefaultNamespace", "public/default");
-        props.setProperty("lakehouseType", "CLICKHOUSE");
-        props.setProperty("streamTableMode", "EXTERNAL");
-        props.setProperty("dsn", "jdbc:ch://clickhouse:8123/default");
-        props.setProperty(TableCatalogBootstrap.TABLE_NAME_TEMPLATE_PROPERTY,
+        props.setProperty(StreamTableNaming.TABLE_NAME_TEMPLATE_PROPERTY,
                 "${stream.property.lakestream.kafka.topic.name}");
 
         TableCatalogBootstrap.bootstrap(streamCatalog, props);

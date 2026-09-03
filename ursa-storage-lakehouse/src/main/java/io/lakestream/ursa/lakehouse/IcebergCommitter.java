@@ -48,7 +48,7 @@ public class IcebergCommitter implements LakehouseCommitter {
     public IcebergCommitter(LakehouseConfiguration config, String parentTopic) {
         this.config = config;
         this.parentTopic = parentTopic;
-        this.identifier = IcebergTable.getTableIdentifierByTopic(parentTopic);
+        this.identifier = IcebergTable.getTableIdentifierByTopic(parentTopic, config);
         this.icebergTable = new IcebergTable(config, identifier);
         this.lakehouseWriterType = getIcebergCommitType(config);
     }
