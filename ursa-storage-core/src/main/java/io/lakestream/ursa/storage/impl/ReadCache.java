@@ -15,6 +15,7 @@ import com.google.common.cache.RemovalNotification;
 import io.lakestream.api.FileInfo;
 import io.lakestream.ursa.storage.FileStorage;
 import io.lakestream.ursa.storage.WalStorageMetrics;
+import io.lakestream.ursa.storage.impl.exception.EntryCacheClosedException;
 import io.lakestream.ursa.storage.impl.exception.OperationRejectException;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
@@ -158,6 +159,28 @@ class ReadCache {
     }
 
     /**
+     * Leased variant of {@link #get(FileInfo, int)}.
+     *
+     * <p>The returned future completes with a segment on which a read lease is already held — the
+     * caller owns that lease and must {@link PersistCache#release()} it — or with {@code null} when
+     * the segment was retired between the lookup and the lease. {@code null} is an ordinary cache
+     * miss that the caller satisfies from storage, not an error: it replaces the
+     * {@code EntryCacheClosedException} a reader used to hit when eviction closed a segment it was
+     * still holding.
+     *
+     * <p>No lock is taken or needed here: {@code tryRetain()} is itself the synchronization point
+     * against the removal listener's close.
+     *
+     * @param fileInfo The location of the persistCache.
+     * @param readEntryRequestsInLocation The number of read entry requests in the location.
+     * @return A future completing with a leased persistCache, or with null on a retirement race.
+     */
+    CompletableFuture<PersistCache> acquire(FileInfo fileInfo, int readEntryRequestsInLocation) {
+        return get(fileInfo, readEntryRequestsInLocation)
+            .thenApply(cache -> cache != null && cache.tryRetain() ? cache : null);
+    }
+
+    /**
      * Processor for handling read cache operations.
      */
     private class ReadCacheProcessor extends
@@ -192,7 +215,12 @@ class ReadCache {
             CompletableFuture<PersistCache> cache = notification.getValue();
             if (cache != null) {
                 cache.thenAccept(c -> {
-                    readCacheSizeInBytes.addAndGet(-c.sizeInBytes());
+                    // Size first, and tolerant of an already-closed segment: sizeInBytes() throws on
+                    // one, and that throw used to skip both the gauge decrement and the close() below,
+                    // permanently drifting the gauge and leaking the segment's retained slice of the
+                    // storage read buffer. A segment that is already closed had its size accounted for
+                    // by the removal that closed it, so there is nothing left to subtract.
+                    readCacheSizeInBytes.addAndGet(-sizeOfClosable(c));
                     if (RemovalCause.SIZE == notification.getCause()) {
                         readCacheEvictionPolicy.onRemoval(notification.getKey().toString(), c);
                     }
@@ -200,6 +228,14 @@ class ReadCache {
                 });
             }
             metrics.getReadCacheEvictionCount().increment();
+        }
+
+        private long sizeOfClosable(PersistCache cache) {
+            try {
+                return cache.sizeInBytes();
+            } catch (EntryCacheClosedException e) {
+                return 0;
+            }
         }
     }
 

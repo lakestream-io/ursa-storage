@@ -119,6 +119,47 @@ public class SlidingWindowPercentileEvictionPolicyTest {
     }
 
     @Test
+    public void test_evictionSurvivesConcurrentClose() throws Exception {
+        int size = cacheSize * 10;
+        for (int i = 0; i < size; i++) {
+            fill(i);
+        }
+        calculatePercentiles();
+
+        // A concurrent Guava eviction closes an entry while the pass is walking the map. Reading its
+        // read statistics used to throw EntryCacheClosedException out of doEvict, silently aborting
+        // the whole pass -- exactly under the load where eviction is needed.
+        var closedSegment = PersistCacheFactory.create(allocator, cacheSize, PROTOBUF_VERSION);
+        closedSegment.close();
+        cache.asMap().put("closed-key", CompletableFuture.completedFuture(closedSegment));
+
+        int evicted = target.tryEvict(cache, cacheSize).join();
+        assertThat(evicted > 0).isTrue();
+    }
+
+    @Test
+    public void test_evictionSurvivesNegativeReadDuration() throws Exception {
+        int size = cacheSize * 10;
+        for (int i = 0; i < size; i++) {
+            fill(i);
+        }
+        calculatePercentiles();
+
+        // A segment that has been read, so the pass does not short-circuit on readCount == 0 and
+        // actually reaches toInt(c.getReadDurationInMillis()). doClear() writes createdTimestamp (a
+        // plain field) before lastReadTimestamp (volatile), so a walker can pair a new
+        // createdTimestamp with a stale lastReadTimestamp and compute a negative duration -- which
+        // toInt() rejects, aborting the whole pass.
+        var torn = cache.get("torn-key").join();
+        torn.get(0, 0).release();
+        ((EntryCache) torn).setCreatedTimestampForTest(System.currentTimeMillis() + 60_000);
+
+        int evicted = target.tryEvict(cache, cacheSize).join();
+        assertThat(evicted > 0).isTrue();
+        assertThat(torn.getReadDurationInMillis()).isNotNegative();
+    }
+
+    @Test
     public void test_whenReadAgain() throws Exception {
         int size = cacheSize * 3;
         for (int i = 0; i < size; i++) {

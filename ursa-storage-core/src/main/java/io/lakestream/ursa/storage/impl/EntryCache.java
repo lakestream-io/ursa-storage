@@ -40,6 +40,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -101,6 +102,13 @@ public class EntryCache implements PersistCache {
     }
 
     private volatile boolean closed = false;
+    // Segment lease state. Readers take a lease through tryRetain()/release() so the cache that owns
+    // this segment cannot release cacheBuffer while a read is still in flight. Deliberately lock-free
+    // (one AtomicInteger plus one volatile): a lease may be taken while the owning cache holds its own
+    // lock, and taking this segment's lock there would add a new lock-order edge.
+    private final AtomicInteger leases = new AtomicInteger(0);
+    // Set by close(): no further lease is granted and the last releaser performs the teardown.
+    private volatile boolean retired = false;
     private final ReadWriteLock lock = new ReentrantReadWriteLock();
     @Getter
     private final Map<Long, Value> index;
@@ -146,7 +154,58 @@ public class EntryCache implements PersistCache {
 
 
     @Override
+    public boolean tryRetain() {
+        if (retired) {
+            return false;
+        }
+        leases.incrementAndGet();
+        if (retired) {
+            // Lost the race with close(): back the lease out and report a miss. Both the retired store
+            // and the lease increment are sequentially consistent, so close() either observes this
+            // lease and defers, or this check observes the retirement.
+            release();
+            return false;
+        }
+        return true;
+    }
+
+    @Override
+    public void release() {
+        int remaining = leases.decrementAndGet();
+        if (remaining < 0) {
+            leases.incrementAndGet();
+            throw new IllegalStateException("release() without a matching tryRetain()");
+        }
+        if (remaining == 0 && retired) {
+            doClose();
+        }
+    }
+
+    @VisibleForTesting
+    int leaseCount() {
+        return leases.get();
+    }
+
+    /**
+     * Reproduces the doClear() write interleaving in which a walker observes the new createdTimestamp
+     * paired with a stale lastReadTimestamp, which is what makes getReadDurationInMillis() negative.
+     */
+    @VisibleForTesting
+    void setCreatedTimestampForTest(long timestamp) {
+        this.createdTimestamp = timestamp;
+    }
+
+    @Override
     public void close() {
+        // Retire first so no new lease can be granted, then let whoever drops the last lease do the
+        // teardown. With nothing leased that is this caller, so close() stays synchronous as before.
+        retired = true;
+        if (leases.get() == 0) {
+            doClose();
+        }
+    }
+
+    private void doClose() {
         lock.writeLock().lock();
         try {
             if (closed) {
@@ -317,6 +376,20 @@ public class EntryCache implements PersistCache {
     }
 
     private ByteBuf doGetByEntryId(long streamId, long entryId) {
+        if (!readonly && !startOffsets.containsKey(streamId)) {
+            // Mirrors copy()'s first guard. A writable segment only becomes reachable by location
+            // after a successful flush populated startOffsets, and clear() wipes them again when the
+            // FIFO recycles the segment into the free pool. Without this check a recycled segment
+            // that has been refilled with different data for the same stream returns a well-formed
+            // but wrong payload, with no error and no metric. Reporting a miss instead sends the
+            // caller down the storage read path, which is always correct.
+            // Debug, not warn: a recycled segment can be hit once per entry in a batch read, and the
+            // outcome is a miss the caller recovers from. The rate is visible through the
+            // "stale_segment" read-cache miss counter the read sites bump on this path.
+            log.debug("[{}] Entry cache is not available for read by entry id: "
+                    + "flushed first offset is not set", streamId);
+            return null;
+        }
         var result = this.index.get(streamId);
         if (result == null) {
             return null;
@@ -695,19 +768,35 @@ public class EntryCache implements PersistCache {
         return composite;
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Deliberately unguarded and lock-free. These read statistics feed the eviction heuristic,
+     * which walks the whole read cache while other threads are evicting from it, and a metric. A
+     * value read from a segment that is closing is stale but harmless; throwing
+     * {@code EntryCacheClosedException} out of the accessor used to abort the entire eviction pass —
+     * precisely under the load where eviction is needed most.
+     */
     @Override
     public long getReadCount() {
-        validateState();
         if (readCount == null) {
             return 0;
         }
         return readCount.sum();
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Unguarded for the same reason as {@link #getReadCount()}.
+     */
     @Override
     public long getReadDurationInMillis() {
-        validateState();
-        return lastReadTimestamp - createdTimestamp;
+        // Clamped, not merely unguarded. doClear() writes createdTimestamp (a plain field) before
+        // lastReadTimestamp (volatile), so a concurrent walker can pair the new createdTimestamp with
+        // the stale, smaller lastReadTimestamp and see a negative duration. The eviction pass feeds
+        // this straight into toInt(), which rejects negatives and would abort the whole pass.
+        return Math.max(0, lastReadTimestamp - createdTimestamp);
     }
 
     @Override
@@ -715,9 +804,13 @@ public class EntryCache implements PersistCache {
         return flushStartTime;
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Unguarded for the same reason as {@link #getReadCount()}.
+     */
     @Override
     public long getLastReadTimestamp() {
-        validateState();
         return lastReadTimestamp;
     }
 

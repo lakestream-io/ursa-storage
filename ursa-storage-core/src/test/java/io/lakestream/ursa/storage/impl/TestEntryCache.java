@@ -12,7 +12,6 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
@@ -135,6 +134,10 @@ public class TestEntryCache extends FileBasedTestClass {
 
         EntryList entryList = new EntryList(streamId, 0, Long.MAX_VALUE, 1000, 10000, null, null);
 
+        // The reader holds a lease for the whole copy, so a concurrent close may only retire the
+        // segment: the copy must succeed and the teardown must wait for release().
+        assertTrue(persistCache.tryRetain());
+
         ExecutorService executorA = Executors.newSingleThreadExecutor();
         ExecutorService executorB = Executors.newSingleThreadExecutor();
         CompletableFuture<Void> copyFuture = CompletableFuture.runAsync(() -> {
@@ -153,15 +156,88 @@ public class TestEntryCache extends FileBasedTestClass {
         }, executorB);
 
         closeFuture.join();
-        try {
-            copyFuture.join();
-        } catch (Exception e) {
-            assertEquals(0, entryList.size());
-            if (!(e.getCause() instanceof EntryCacheClosedException
-                    && e.getMessage().contains("already closed"))) {
-                fail(e.getMessage());
-            }
-        }
+        // No EntryCacheClosedException is reachable here any more: the lease outlives the close.
+        copyFuture.join();
+        assertEquals(2, entryList.size());
+        entryList.clear();
+
+        persistCache.release();
+        // The last release runs the deferred teardown.
+        assertThrows(EntryCacheClosedException.class, () -> persistCache.copy(index, entryList));
+        executorA.shutdownNow();
+        executorB.shutdownNow();
+    }
+
+    @Test
+    void testRetainAfterCloseIsRefused() {
+        assertTrue(persistCache.tryRetain());
+        persistCache.release();
+
+        persistCache.close();
+
+        assertFalse(persistCache.tryRetain());
+        assertEquals(0, ((EntryCache) persistCache).leaseCount());
+    }
+
+    @Test
+    void testCloseIsDeferredUntilLastReleaseAndRunsOnce() {
+        assertTrue(persistCache.tryRetain());
+        assertTrue(persistCache.tryRetain());
+        assertEquals(2, ((EntryCache) persistCache).leaseCount());
+
+        persistCache.close();
+        // Retired but not torn down: an in-flight reader can still read.
+        assertEquals(0, persistCache.sizeInBytes());
+
+        persistCache.release();
+        assertEquals(0, persistCache.sizeInBytes());
+
+        persistCache.release();
+        assertThrows(EntryCacheClosedException.class, persistCache::sizeInBytes);
+
+        // Idempotent: a second close (and the tearDown close) must not release the buffer twice.
+        persistCache.close();
+        persistCache.close();
+    }
+
+    @Test
+    void testGetByEntryIdIsGuardedAfterRecycle() {
+        @Cleanup("release")
+        ByteBuf original = Unpooled.wrappedBuffer("original-entry".getBytes());
+        assertEquals(0, persistCache.put(
+                new PendingAdd(streamId, 10, original, new CompletableFuture<>(), null)));
+        // A flush publishes the segment's first offset, which is what makes it readable by location.
+        ((EntryCache) persistCache).setStartOffsets(streamId, 0);
+
+        ByteBuf payload = persistCache.get(streamId, 0);
+        assertNotNull(payload);
+        assertEquals(original, payload);
+        payload.release();
+
+        // FIFO recycle: clear() drops the start offsets, and the segment is refilled with entirely
+        // different data for the same stream before the next flush publishes a new start offset.
+        persistCache.clear();
+        @Cleanup("release")
+        ByteBuf recycled = Unpooled.wrappedBuffer("a-completely-different-entry".getBytes());
+        assertEquals(0, persistCache.put(
+                new PendingAdd(streamId, 10, recycled, new CompletableFuture<>(), null)));
+
+        // Without the guard this returned the new payload for the old entry id: well formed, wrong
+        // data, no error and no metric. A miss sends the caller to storage instead.
+        assertNull(persistCache.get(streamId, 0));
+
+        // Once the refilled segment is flushed it is readable again, with its own data.
+        ((EntryCache) persistCache).setStartOffsets(streamId, 10);
+        ByteBuf afterFlush = persistCache.get(streamId, 0);
+        assertNotNull(afterFlush);
+        assertEquals(recycled, afterFlush);
+        afterFlush.release();
+    }
+
+    @Test
+    void testReleaseWithoutRetainIsRejected() {
+        assertThrows(IllegalStateException.class, persistCache::release);
+        assertEquals(0, ((EntryCache) persistCache).leaseCount());
     }
     @Test
     void testApisAfterClose() throws Exception {
@@ -231,11 +307,12 @@ public class TestEntryCache extends FileBasedTestClass {
         ex = assertThrows(EntryCacheClosedException.class, () -> persistCache.isEmpty());
         assertEquals("already closed", ex.getMessage());
 
-        ex = assertThrows(EntryCacheClosedException.class, () -> persistCache.getReadCount());
-        assertEquals("already closed", ex.getMessage());
-
-        ex = assertThrows(EntryCacheClosedException.class, () -> persistCache.getLastReadTimestamp());
-        assertEquals("already closed", ex.getMessage());
+        // The read statistics are deliberately unguarded: the eviction pass reads them while walking
+        // a cache other threads are evicting from, and a throw there aborted the whole pass. After a
+        // close they report their last known, harmless values instead.
+        assertEquals(0, persistCache.getReadCount());
+        assertTrue(persistCache.getLastReadTimestamp() > 0);
+        assertEquals(0, persistCache.getReadDurationInMillis());
 
         ex = assertThrows(EntryCacheClosedException.class, () -> persistCache.clear());
         assertEquals("already closed", ex.getMessage());

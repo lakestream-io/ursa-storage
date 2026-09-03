@@ -20,6 +20,38 @@ import java.util.concurrent.CompletableFuture;
 public interface PersistCache extends Serializable, Closeable {
     void close();
 
+    /**
+     * Acquires a read lease so the owning cache cannot tear this segment down while the lease is held.
+     *
+     * <p>A {@code false} result means the segment is retired — evicted, recycled or closed — and its
+     * backing buffer is about to be released. Callers must treat that as an ordinary cache miss and
+     * satisfy the read from storage instead; it is never an error.
+     *
+     * <p><b>Lease discipline.</b> A lease is acquired and released inside a single synchronous block
+     * and must never be held across an asynchronous boundary, so a retired segment stays pinned for
+     * at most one {@code copy()}/{@code get()} call rather than for the duration of a remote read.
+     * Every successful {@code tryRetain()} needs exactly one matching {@link #release()}, normally in
+     * a {@code finally}.
+     *
+     * <p><b>The one exception</b> is a batch read that mixes live and retired locations: the leases on
+     * the live segments are held across the storage recovery of the retired ones, one remote GET per
+     * retired location issued in parallel. That single recovery is the bound — the leases are released
+     * immediately after the synchronous read loop, still before any per-entry storage fallback is
+     * awaited. A segment pinned this way only has its close deferred, and no lock is held meanwhile.
+     *
+     * @return true when the lease was granted, false when the segment is retired.
+     */
+    boolean tryRetain();
+
+    /**
+     * Releases a lease taken by {@link #tryRetain()}. The last release of a retired segment performs
+     * the close that was deferred while readers were still using it.
+     *
+     * <p>Must not be called while holding the owning cache's lock: the deferred close takes this
+     * segment's write lock, and the established lock order is cache lock before segment lock.
+     */
+    void release();
+
     long put(PendingAdd pendingAdd);
 
     boolean copy(EntryIndex compactedIndex, EntryList entryList) throws RetryableException;

@@ -66,6 +66,10 @@ public class TestPersistCache {
         long result = persistCache.put(pendingAdd);
         assertEquals(0, result);
 
+        // A writable segment only becomes readable once a flush has published its first offset;
+        // reads by entry id are guarded on that so a recycled segment cannot serve stale data.
+        ((EntryCache) persistCache).setStartOffsets(streamId, 0);
+
         ByteBuf retrievedEntry = persistCache.get(streamId, entryId);
         assertNotNull(retrievedEntry);
         assertEquals(entry, retrievedEntry);
