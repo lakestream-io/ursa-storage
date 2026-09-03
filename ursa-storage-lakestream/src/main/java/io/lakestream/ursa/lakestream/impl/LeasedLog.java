@@ -27,8 +27,6 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
@@ -40,6 +38,11 @@ import lombok.extern.slf4j.Slf4j;
  * <p>Closing first rejects new operations, waits for operations already handed to the delegate and
  * child cursors to finish, closes the delegate, and only then releases the durable lease. This
  * ordering prevents a controller-side purge from racing work accepted by an already-open handle.
+ *
+ * <p>A write lease is per holder, not per log: every holder gets its own ephemeral lease key, so
+ * any number of handles may append to and trim the same log concurrently. This handle therefore
+ * never caches log state that another holder can change; offset reads go through to the delegate
+ * so a handle that only reads still observes what the other writers have done.
  */
 @Slf4j
 final class LeasedLog implements Log {
@@ -55,9 +58,6 @@ final class LeasedLog implements Log {
     private final ClassLoader contextClassLoader;
     private final Executor delegateCloseExecutor;
     private final Runnable onFullyClosed;
-    private final AtomicReference<LogOffset> cachedFirstOffset = new AtomicReference<>();
-    private final AtomicReference<LogOffset> cachedLastOffset = new AtomicReference<>();
-    private final AtomicLong mutationEpoch = new AtomicLong();
 
     private boolean closing;
     private int activeOperations;
@@ -219,18 +219,7 @@ final class LeasedLog implements Log {
 
     @Override
     public CompletableFuture<LogEntryHeader> append(int numberOfRecords, ByteBuf data) {
-        return trackNonCancellableOperation(() -> delegate.append(numberOfRecords, data)
-            .whenComplete((header, failure) -> {
-                if (failure != null || header == null) {
-                    invalidateOffsetCache();
-                    return;
-                }
-                mutationEpoch.incrementAndGet();
-                LogOffset appended = new LogOffset(header.offset(), header.numberOfRecords(),
-                    header.timestamp(), header.entrySize(), header.cumulativeSize());
-                advanceCachedLastOffset(appended);
-                repairCachedFirstOffset(appended);
-            }));
+        return trackNonCancellableOperation(() -> delegate.append(numberOfRecords, data));
     }
 
     private <T> CompletableFuture<T> trackNonCancellableOperation(
@@ -389,7 +378,7 @@ final class LeasedLog implements Log {
 
     @Override
     public CompletableFuture<LogOffset> getFirstOffset() {
-        return cachedOffset(cachedFirstOffset, delegate::getFirstOffset);
+        return trackOperation(delegate::getFirstOffset, ignored -> { });
     }
 
     @Override
@@ -400,70 +389,12 @@ final class LeasedLog implements Log {
 
     @Override
     public CompletableFuture<LogOffset> getLastOffset() {
-        return cachedOffset(cachedLastOffset, delegate::getLastOffset);
+        return trackOperation(delegate::getLastOffset, ignored -> { });
     }
 
     @Override
     public CompletableFuture<Long> softTrim(long offsetIncluded) {
-        return trackOperation(() -> delegate.softTrim(offsetIncluded)
-            .whenComplete((ignored, failure) -> {
-                mutationEpoch.incrementAndGet();
-                cachedFirstOffset.set(null);
-            }), ignored -> { });
-    }
-
-    private CompletableFuture<LogOffset> cachedOffset(
-            AtomicReference<LogOffset> cache, Supplier<CompletableFuture<LogOffset>> read) {
-        LogOffset cached = cache.get();
-        if (cached != null) {
-            return trackOperation(() -> CompletableFuture.completedFuture(cached), ignored -> { });
-        }
-        long epoch = mutationEpoch.get();
-        return trackOperation(() -> read.get().whenComplete((value, failure) -> {
-            if (failure != null || value == null) {
-                cache.set(null);
-            } else if (mutationEpoch.get() == epoch) {
-                cache.compareAndSet(null, value);
-            }
-        }), ignored -> { });
-    }
-
-    /**
-     * Advances the cached tail from an append, keeping the highest candidate.
-     *
-     * <p>Appends may complete out of order, so the last one to arrive is not necessarily the one
-     * that ends the log. Keeping the maximum means a completion that started earlier can never
-     * rewind the tail to an offset the log has already passed. An empty cache is still filled, so
-     * a first append after an invalidation seeds it as before.
-     */
-    private void advanceCachedLastOffset(LogOffset appended) {
-        cachedLastOffset.accumulateAndGet(appended, (cached, candidate) ->
-            cached == null || candidate.offset() > cached.offset() ? candidate : cached);
-    }
-
-    /**
-     * Fills a cached "no first entry" from an append, keeping the lowest candidate.
-     *
-     * <p>Appends may complete out of order, so the last one to arrive is not necessarily the one
-     * that starts the log. Keeping the minimum means a lower offset always wins the repair, and a
-     * cache invalidated in the meantime is left invalid rather than filled from a stale append.
-     */
-    private void repairCachedFirstOffset(LogOffset appended) {
-        cachedFirstOffset.accumulateAndGet(appended, (cached, candidate) -> {
-            if (cached == null) {
-                return null;
-            }
-            if (cached.offset() < 0) {
-                return candidate;
-            }
-            return candidate.offset() < cached.offset() ? candidate : cached;
-        });
-    }
-
-    private void invalidateOffsetCache() {
-        mutationEpoch.incrementAndGet();
-        cachedFirstOffset.set(null);
-        cachedLastOffset.set(null);
+        return trackOperation(() -> delegate.softTrim(offsetIncluded), ignored -> { });
     }
 
     @Override
@@ -478,7 +409,6 @@ final class LeasedLog implements Log {
 
     @Override
     public void invalidateCache() {
-        invalidateOffsetCache();
         runSynchronousOperation(delegate::invalidateCache);
     }
 
@@ -495,7 +425,6 @@ final class LeasedLog implements Log {
 
     @Override
     public void fence() {
-        invalidateOffsetCache();
         runSynchronousOperation(delegate::fence);
     }
 

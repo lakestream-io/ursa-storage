@@ -600,177 +600,39 @@ class LeasedLogTest {
     }
 
     @Test
-    void lastOffsetIsServedFromCacheAfterAppend() throws Exception {
-        LeasedLogFixture fixture = newLog(51L);
-        Log delegate = fixture.delegate();
-        StreamWriteLease lease = fixture.lease();
-        LogEntryHeader header = mock(LogEntryHeader.class);
-        when(header.offset()).thenReturn(10L);
-        when(header.numberOfRecords()).thenReturn(3);
-        when(header.timestamp()).thenReturn(1234L);
-        when(header.entrySize()).thenReturn(100);
-        when(header.cumulativeSize()).thenReturn(1000L);
-        when(delegate.append(3, Unpooled.EMPTY_BUFFER))
-            .thenReturn(CompletableFuture.completedFuture(header));
-        LeasedLog log = fixture.log();
-
-        log.append(3, Unpooled.EMPTY_BUFFER).get(10, TimeUnit.SECONDS);
-        LogOffset last = log.getLastOffset().get(10, TimeUnit.SECONDS);
-
-        assertEquals(new LogOffset(10L, 3, 1234L, 100, 1000L), last);
-        verify(delegate, never()).getLastOffset();
-    }
-
-    @Test
-    void firstOffsetIsCachedUntilSoftTrim() throws Exception {
-        LeasedLogFixture fixture = newLog(52L);
-        Log delegate = fixture.delegate();
-        StreamWriteLease lease = fixture.lease();
-        LogOffset first = new LogOffset(4L, 2, 1L);
-        LogOffset afterTrim = new LogOffset(9L, 1, 2L);
+    void offsetsFollowAnotherHandleThatWritesAndTrimsTheSameLog() throws Exception {
+        // acquireStreamWriteLease creates a per-holder ephemeral key, so a log has as many
+        // concurrent writers as it has open handles: in a zone-aware deployment one broker per
+        // zone appends to and runs retention over the same partition. A handle that only reads
+        // is never told about the other holders' work, so it must read offsets through.
+        Log delegate = delegate(61L);
+        LeasedLog reader = new LeasedLog(delegate, lease(61L), Runnable::run, () -> { });
+        LeasedLog otherZoneWriter = new LeasedLog(delegate, lease(61L), Runnable::run, () -> { });
+        LogOffset firstBeforeTrim = new LogOffset(0L, 1, 100L, 50, 50L);
+        LogOffset firstAfterTrim = new LogOffset(1L, 1, 200L, 60, 110L);
+        LogOffset lastBeforeAppend = new LogOffset(0L, 1, 100L, 50, 50L);
+        LogOffset lastAfterAppend = new LogOffset(1L, 1, 200L, 60, 110L);
+        LogEntryHeader appended = header(1L, 1, 200L, 60, 110L);
         when(delegate.getFirstOffset())
-            .thenReturn(CompletableFuture.completedFuture(first))
-            .thenReturn(CompletableFuture.completedFuture(afterTrim));
-        when(delegate.softTrim(8L)).thenReturn(CompletableFuture.completedFuture(9L));
-        LeasedLog log = fixture.log();
-
-        assertEquals(first, log.getFirstOffset().get());
-        assertEquals(first, log.getFirstOffset().get());
-        verify(delegate, times(1)).getFirstOffset();
-
-        log.softTrim(8L).get();
-        assertEquals(afterTrim, log.getFirstOffset().get());
-        verify(delegate, times(2)).getFirstOffset();
-    }
-
-    @Test
-    void failedOffsetReadInvalidatesCache() throws Exception {
-        LeasedLogFixture fixture = newLog(53L);
-        Log delegate = fixture.delegate();
-        StreamWriteLease lease = fixture.lease();
-        LogOffset last = new LogOffset(7L, 1, 1L);
+            .thenReturn(CompletableFuture.completedFuture(firstBeforeTrim))
+            .thenReturn(CompletableFuture.completedFuture(firstAfterTrim));
         when(delegate.getLastOffset())
-            .thenReturn(CompletableFuture.completedFuture(last))
-            .thenReturn(CompletableFuture.failedFuture(new IOException("boom")))
-            .thenReturn(CompletableFuture.completedFuture(last));
-        LeasedLog log = fixture.log();
-
-        assertEquals(last, log.getLastOffset().get());
-        log.invalidateCache();
-        assertThrows(ExecutionException.class, () -> log.getLastOffset().get());
-        assertEquals(last, log.getLastOffset().get());
-        verify(delegate, times(3)).getLastOffset();
-    }
-
-    @Test
-    void appendRepairsCachedEmptyFirstOffset() throws Exception {
-        LeasedLogFixture fixture = newLog(54L);
-        Log delegate = fixture.delegate();
-        StreamWriteLease lease = fixture.lease();
-        when(delegate.getFirstOffset())
-            .thenReturn(CompletableFuture.completedFuture(LogOffset.NOT_FOUND));
-        LogEntryHeader header = mock(LogEntryHeader.class);
-        when(header.offset()).thenReturn(0L);
-        when(header.numberOfRecords()).thenReturn(1);
-        when(header.timestamp()).thenReturn(100L);
-        when(header.entrySize()).thenReturn(50);
-        when(header.cumulativeSize()).thenReturn(50L);
+            .thenReturn(CompletableFuture.completedFuture(lastBeforeAppend))
+            .thenReturn(CompletableFuture.completedFuture(lastAfterAppend));
         when(delegate.append(1, Unpooled.EMPTY_BUFFER))
-            .thenReturn(CompletableFuture.completedFuture(header));
-        LeasedLog log = fixture.log();
+            .thenReturn(CompletableFuture.completedFuture(appended));
+        when(delegate.softTrim(0L)).thenReturn(CompletableFuture.completedFuture(1L));
 
-        assertEquals(LogOffset.NOT_FOUND, log.getFirstOffset().get(10, TimeUnit.SECONDS));
-        log.append(1, Unpooled.EMPTY_BUFFER).get(10, TimeUnit.SECONDS);
+        assertEquals(lastBeforeAppend, reader.getLastOffset().get(10, TimeUnit.SECONDS));
+        assertEquals(firstBeforeTrim, reader.getFirstOffset().get(10, TimeUnit.SECONDS));
 
-        assertEquals(new LogOffset(0L, 1, 100L, 50, 50L),
-            log.getFirstOffset().get(10, TimeUnit.SECONDS));
-        verify(delegate, times(1)).getFirstOffset();
-    }
+        otherZoneWriter.append(1, Unpooled.EMPTY_BUFFER).get(10, TimeUnit.SECONDS);
+        otherZoneWriter.softTrim(0L).get(10, TimeUnit.SECONDS);
 
-    @Test
-    void staleFirstOffsetReadDoesNotOverrideAppend() throws Exception {
-        LeasedLogFixture fixture = newLog(55L);
-        Log delegate = fixture.delegate();
-        StreamWriteLease lease = fixture.lease();
-        CompletableFuture<LogOffset> pending = new CompletableFuture<>();
-        LogOffset fresh = new LogOffset(0L, 1, 200L, 60, 60L);
-        when(delegate.getFirstOffset())
-            .thenReturn(pending)
-            .thenReturn(CompletableFuture.completedFuture(fresh));
-        LogEntryHeader header = mock(LogEntryHeader.class);
-        when(header.offset()).thenReturn(0L);
-        when(header.numberOfRecords()).thenReturn(1);
-        when(header.timestamp()).thenReturn(200L);
-        when(header.entrySize()).thenReturn(60);
-        when(header.cumulativeSize()).thenReturn(60L);
-        when(delegate.append(1, Unpooled.EMPTY_BUFFER))
-            .thenReturn(CompletableFuture.completedFuture(header));
-        LeasedLog log = fixture.log();
-
-        CompletableFuture<LogOffset> staleRead = log.getFirstOffset();
-        assertFalse(staleRead.isDone());
-
-        log.append(1, Unpooled.EMPTY_BUFFER).get(10, TimeUnit.SECONDS);
-        pending.complete(LogOffset.NOT_FOUND);
-
-        assertEquals(LogOffset.NOT_FOUND, staleRead.get(10, TimeUnit.SECONDS));
-        assertEquals(fresh, log.getFirstOffset().get(10, TimeUnit.SECONDS));
+        assertEquals(lastAfterAppend, reader.getLastOffset().get(10, TimeUnit.SECONDS));
+        assertEquals(firstAfterTrim, reader.getFirstOffset().get(10, TimeUnit.SECONDS));
+        verify(delegate, times(2)).getLastOffset();
         verify(delegate, times(2)).getFirstOffset();
-    }
-
-    @Test
-    void staleFirstOffsetReadDoesNotOverrideSoftTrim() throws Exception {
-        LeasedLogFixture fixture = newLog(56L);
-        Log delegate = fixture.delegate();
-        StreamWriteLease lease = fixture.lease();
-        CompletableFuture<LogOffset> pending = new CompletableFuture<>();
-        LogOffset stale = new LogOffset(3L, 1, 1L);
-        LogOffset fresh = new LogOffset(9L, 1, 2L);
-        when(delegate.getFirstOffset())
-            .thenReturn(pending)
-            .thenReturn(CompletableFuture.completedFuture(fresh));
-        when(delegate.softTrim(8L)).thenReturn(CompletableFuture.completedFuture(9L));
-        LeasedLog log = fixture.log();
-
-        CompletableFuture<LogOffset> staleRead = log.getFirstOffset();
-        assertFalse(staleRead.isDone());
-
-        log.softTrim(8L).get(10, TimeUnit.SECONDS);
-        pending.complete(stale);
-
-        assertEquals(stale, staleRead.get(10, TimeUnit.SECONDS));
-        assertEquals(fresh, log.getFirstOffset().get(10, TimeUnit.SECONDS));
-        verify(delegate, times(2)).getFirstOffset();
-    }
-
-    @Test
-    void outOfOrderAppendsKeepTheLowestFirstOffset() throws Exception {
-        LeasedLogFixture fixture = newLog(57L);
-        Log delegate = fixture.delegate();
-        StreamWriteLease lease = fixture.lease();
-        when(delegate.getFirstOffset())
-            .thenReturn(CompletableFuture.completedFuture(LogOffset.NOT_FOUND));
-        CompletableFuture<LogEntryHeader> firstAppend = new CompletableFuture<>();
-        CompletableFuture<LogEntryHeader> secondAppend = new CompletableFuture<>();
-        when(delegate.append(1, Unpooled.EMPTY_BUFFER))
-            .thenReturn(firstAppend)
-            .thenReturn(secondAppend);
-        LeasedLog log = fixture.log();
-
-        assertEquals(LogOffset.NOT_FOUND, log.getFirstOffset().get(10, TimeUnit.SECONDS));
-        CompletableFuture<LogEntryHeader> earlier = log.append(1, Unpooled.EMPTY_BUFFER);
-        CompletableFuture<LogEntryHeader> later = log.append(1, Unpooled.EMPTY_BUFFER);
-
-        // The append at the higher offset completes first, so a last-write-wins cache would keep
-        // it and hide the entry that actually starts the log.
-        secondAppend.complete(header(1L, 1, 200L, 60, 110L));
-        firstAppend.complete(header(0L, 1, 100L, 50, 50L));
-        later.get(10, TimeUnit.SECONDS);
-        earlier.get(10, TimeUnit.SECONDS);
-
-        assertEquals(new LogOffset(0L, 1, 100L, 50, 50L),
-            log.getFirstOffset().get(10, TimeUnit.SECONDS));
-        verify(delegate, times(1)).getFirstOffset();
     }
 
     @Test
@@ -790,33 +652,6 @@ class LeasedLogTest {
             () -> close.get(5, TimeUnit.SECONDS));
         assertInstanceOf(RejectedExecutionException.class, rejected.getCause());
         verify(lease, never()).closeAsync();
-    }
-
-    @Test
-    void outOfOrderAppendsKeepTheHighestLastOffset() throws Exception {
-        LeasedLogFixture fixture = newLog(59L);
-        Log delegate = fixture.delegate();
-        StreamWriteLease lease = fixture.lease();
-        CompletableFuture<LogEntryHeader> firstAppend = new CompletableFuture<>();
-        CompletableFuture<LogEntryHeader> secondAppend = new CompletableFuture<>();
-        when(delegate.append(1, Unpooled.EMPTY_BUFFER))
-            .thenReturn(firstAppend)
-            .thenReturn(secondAppend);
-        LeasedLog log = fixture.log();
-
-        CompletableFuture<LogEntryHeader> earlier = log.append(1, Unpooled.EMPTY_BUFFER);
-        CompletableFuture<LogEntryHeader> later = log.append(1, Unpooled.EMPTY_BUFFER);
-
-        // The append at the higher offset completes first, so a last-write-wins cache would be
-        // rewound by the append that started earlier and report a tail that is already stale.
-        secondAppend.complete(header(1L, 1, 200L, 60, 110L));
-        firstAppend.complete(header(0L, 1, 100L, 50, 50L));
-        later.get(10, TimeUnit.SECONDS);
-        earlier.get(10, TimeUnit.SECONDS);
-
-        assertEquals(new LogOffset(1L, 1, 200L, 60, 110L),
-            log.getLastOffset().get(10, TimeUnit.SECONDS));
-        verify(delegate, never()).getLastOffset();
     }
 
     @Test
