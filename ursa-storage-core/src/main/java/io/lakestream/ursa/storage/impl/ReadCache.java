@@ -15,6 +15,7 @@ import com.google.common.cache.RemovalNotification;
 import io.lakestream.api.FileInfo;
 import io.lakestream.ursa.storage.FileStorage;
 import io.lakestream.ursa.storage.WalStorageMetrics;
+import io.lakestream.ursa.storage.impl.exception.EntryCacheClosedException;
 import io.lakestream.ursa.storage.impl.exception.OperationRejectException;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
@@ -214,7 +215,12 @@ class ReadCache {
             CompletableFuture<PersistCache> cache = notification.getValue();
             if (cache != null) {
                 cache.thenAccept(c -> {
-                    readCacheSizeInBytes.addAndGet(-c.sizeInBytes());
+                    // Size first, and tolerant of an already-closed segment: sizeInBytes() throws on
+                    // one, and that throw used to skip both the gauge decrement and the close() below,
+                    // permanently drifting the gauge and leaking the segment's retained slice of the
+                    // storage read buffer. A segment that is already closed had its size accounted for
+                    // by the removal that closed it, so there is nothing left to subtract.
+                    readCacheSizeInBytes.addAndGet(-sizeOfClosable(c));
                     if (RemovalCause.SIZE == notification.getCause()) {
                         readCacheEvictionPolicy.onRemoval(notification.getKey().toString(), c);
                     }
@@ -222,6 +228,14 @@ class ReadCache {
                 });
             }
             metrics.getReadCacheEvictionCount().increment();
+        }
+
+        private long sizeOfClosable(PersistCache cache) {
+            try {
+                return cache.sizeInBytes();
+            } catch (EntryCacheClosedException e) {
+                return 0;
+            }
         }
     }
 

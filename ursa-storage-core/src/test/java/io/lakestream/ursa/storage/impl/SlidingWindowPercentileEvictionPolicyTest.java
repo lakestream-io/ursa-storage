@@ -119,6 +119,25 @@ public class SlidingWindowPercentileEvictionPolicyTest {
     }
 
     @Test
+    public void test_evictionSurvivesConcurrentClose() throws Exception {
+        int size = cacheSize * 10;
+        for (int i = 0; i < size; i++) {
+            fill(i);
+        }
+        calculatePercentiles();
+
+        // A concurrent Guava eviction closes an entry while the pass is walking the map. Reading its
+        // read statistics used to throw EntryCacheClosedException out of doEvict, silently aborting
+        // the whole pass -- exactly under the load where eviction is needed.
+        var closedSegment = PersistCacheFactory.create(allocator, cacheSize, PROTOBUF_VERSION);
+        closedSegment.close();
+        cache.asMap().put("closed-key", CompletableFuture.completedFuture(closedSegment));
+
+        int evicted = target.tryEvict(cache, cacheSize).join();
+        assertThat(evicted > 0).isTrue();
+    }
+
+    @Test
     public void test_whenReadAgain() throws Exception {
         int size = cacheSize * 3;
         for (int i = 0; i < size; i++) {

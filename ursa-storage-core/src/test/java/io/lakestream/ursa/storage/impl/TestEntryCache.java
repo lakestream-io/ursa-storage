@@ -307,11 +307,12 @@ public class TestEntryCache extends FileBasedTestClass {
         ex = assertThrows(EntryCacheClosedException.class, () -> persistCache.isEmpty());
         assertEquals("already closed", ex.getMessage());
 
-        ex = assertThrows(EntryCacheClosedException.class, () -> persistCache.getReadCount());
-        assertEquals("already closed", ex.getMessage());
-
-        ex = assertThrows(EntryCacheClosedException.class, () -> persistCache.getLastReadTimestamp());
-        assertEquals("already closed", ex.getMessage());
+        // The read statistics are deliberately unguarded: the eviction pass reads them while walking
+        // a cache other threads are evicting from, and a throw there aborted the whole pass. After a
+        // close they report their last known, harmless values instead.
+        assertEquals(0, persistCache.getReadCount());
+        assertTrue(persistCache.getLastReadTimestamp() > 0);
+        assertEquals(0, persistCache.getReadDurationInMillis());
 
         ex = assertThrows(EntryCacheClosedException.class, () -> persistCache.clear());
         assertEquals("already closed", ex.getMessage());

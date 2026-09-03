@@ -756,18 +756,30 @@ public class EntryCache implements PersistCache {
         return composite;
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Deliberately unguarded and lock-free. These read statistics feed the eviction heuristic,
+     * which walks the whole read cache while other threads are evicting from it, and a metric. A
+     * value read from a segment that is closing is stale but harmless; throwing
+     * {@code EntryCacheClosedException} out of the accessor used to abort the entire eviction pass —
+     * precisely under the load where eviction is needed most.
+     */
     @Override
     public long getReadCount() {
-        validateState();
         if (readCount == null) {
             return 0;
         }
         return readCount.sum();
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Unguarded for the same reason as {@link #getReadCount()}.
+     */
     @Override
     public long getReadDurationInMillis() {
-        validateState();
         return lastReadTimestamp - createdTimestamp;
     }
 
@@ -776,9 +788,13 @@ public class EntryCache implements PersistCache {
         return flushStartTime;
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Unguarded for the same reason as {@link #getReadCount()}.
+     */
     @Override
     public long getLastReadTimestamp() {
-        validateState();
         return lastReadTimestamp;
     }
 

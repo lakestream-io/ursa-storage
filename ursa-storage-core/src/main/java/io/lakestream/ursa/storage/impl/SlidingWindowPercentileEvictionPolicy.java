@@ -170,7 +170,10 @@ public class SlidingWindowPercentileEvictionPolicy {
                     }
                     long cntDiffRate = diffRate(cnt, targetReadCount);
                     int readDuration = toInt(c.getReadDurationInMillis());
-                    int idleDuration = toInt(now - c.getLastReadTimestamp());
+                    // A concurrent clear() or close() resets the segment's timestamps to "now",
+                    // which can land after the timestamp captured before the walk. Clamp instead of
+                    // letting toInt() throw and abort the whole pass.
+                    int idleDuration = toInt(Math.max(0, now - c.getLastReadTimestamp()));
                     int targetIdleDuration = Math.max(readDuration, globalIdleDuration);
 
                     if (idleDuration < targetIdleDuration && !isSmall(cntDiffRate)) {

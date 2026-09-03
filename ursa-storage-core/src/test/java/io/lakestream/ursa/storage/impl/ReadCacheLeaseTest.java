@@ -11,6 +11,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 import io.lakestream.api.FileInfo;
 import io.lakestream.ursa.storage.FileStorage;
@@ -154,6 +157,27 @@ public class ReadCacheLeaseTest {
         readCache.getReadCache().asMap().put(file, CompletableFuture.completedFuture(segment));
 
         assertNull(readCache.acquire(file, 1).get());
+
+        readCache.close();
+    }
+
+    @Test
+    void testRemovalClosesSegmentEvenWhenItsSizeIsUnreadable() {
+        SegmentFileStorage fileStorage = new SegmentFileStorage();
+        ReadCache readCache = newReadCache(fileStorage);
+        FileInfo file = new FileInfo("wal-already-closed", FILE_WEIGHT);
+
+        // Stands in for a segment whose size can no longer be read when the removal listener runs.
+        // The listener used to call sizeInBytes() first and let the throw escape, skipping both the
+        // size-gauge decrement and, worse, the close() -- leaking the segment's retained slice of the
+        // storage read buffer until GC.
+        PersistCache unreadable = mock(PersistCache.class);
+        when(unreadable.sizeInBytes()).thenThrow(new EntryCacheClosedException("already closed"));
+        readCache.getReadCache().asMap().put(file, CompletableFuture.completedFuture(unreadable));
+
+        readCache.getReadCache().invalidate(file);
+
+        verify(unreadable).close();
 
         readCache.close();
     }
