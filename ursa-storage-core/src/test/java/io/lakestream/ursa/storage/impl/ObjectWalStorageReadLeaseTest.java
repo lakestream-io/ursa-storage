@@ -9,6 +9,8 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 
 import io.lakestream.api.EntryHeader;
@@ -23,10 +25,18 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.buffer.Unpooled;
+import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.sdk.OpenTelemetrySdk;
+import io.opentelemetry.sdk.metrics.SdkMeterProvider;
+import io.opentelemetry.sdk.metrics.data.MetricData;
+import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
 import io.oxia.client.api.AsyncOxiaClient;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -48,12 +58,14 @@ public class ObjectWalStorageReadLeaseTest {
     private StorageFormat format;
     private CountingSegmentFileStorage fileStorage;
     private ObjectWalStorageImpl storage;
+    private InMemoryMetricReader metricReader;
 
     /** Serves one deterministic single-entry WAL segment per location and counts the reads. */
     private static final class CountingSegmentFileStorage implements FileStorage {
 
         private final AtomicInteger reads = new AtomicInteger();
         private final StorageFormat format;
+        private volatile boolean failReads;
 
         CountingSegmentFileStorage(StorageFormat format) {
             this.format = format;
@@ -62,6 +74,9 @@ public class ObjectWalStorageReadLeaseTest {
         @Override
         public CompletableFuture<ByteBuf> getAsync(String location) {
             reads.incrementAndGet();
+            if (failReads) {
+                return CompletableFuture.failedFuture(new IllegalStateException("storage unavailable"));
+            }
             byte[] bytes = payloadFor(location);
             PersistCache writer = PersistCacheFactory.create(ALLOCATOR, bytes.length, PROTOBUF_VERSION);
             ByteBuf payload = Unpooled.wrappedBuffer(bytes);
@@ -107,8 +122,12 @@ public class ObjectWalStorageReadLeaseTest {
         config.setWriteBufferSize(64 * 1024);
         format = new StorageFormat(config);
         fileStorage = new CountingSegmentFileStorage(format);
+        metricReader = InMemoryMetricReader.create();
+        OpenTelemetry otel = OpenTelemetrySdk.builder()
+            .setMeterProvider(SdkMeterProvider.builder().registerMetricReader(metricReader).build())
+            .build();
         storage = new ObjectWalStorageImpl(ALLOCATOR, fileStorage,
-            IDGenerator.create("memory", null, null), config, InstrumentProvider.NOOP,
+            IDGenerator.create("memory", null, null), config, new InstrumentProvider(otel),
             mock(AsyncOxiaClient.class), format, new StreamStateManagerImpl());
         storage.initialize();
     }
@@ -119,8 +138,12 @@ public class ObjectWalStorageReadLeaseTest {
     }
 
     private EntryIndex indexFor(String location) {
+        return indexFor(location, 0);
+    }
+
+    private EntryIndex indexFor(String location, long offset) {
         byte[] bytes = payloadFor(location);
-        EntryHeader header = new EntryHeader(0, MESSAGES_PER_STORED_ENTRY, System.currentTimeMillis(),
+        EntryHeader header = new EntryHeader(offset, MESSAGES_PER_STORED_ENTRY, System.currentTimeMillis(),
             bytes.length, bytes.length);
         Position position = new Position(new FileInfo(location, bytes.length), 0, Position.FileType.RAW);
         return new EntryIndex(header, position, 1, EntryIndex.IndexType.COMPACT, Optional.of(new int[]{1}));
@@ -199,6 +222,120 @@ public class ObjectWalStorageReadLeaseTest {
 
         // An unbalanced acquire would either pin the segment forever or drain it early.
         assertEquals(0, ((EntryCache) segment).leaseCount());
+        // ... and the production tripwire for that must agree.
+        assertEquals(0, storage.leasedSegmentsForTest());
+        assertEquals(0, leasedSegmentsGauge());
+    }
+
+    /** Leaves a completed future for an already-retired segment reachable in the read cache. */
+    private void seedRetiredReadCacheSegment(EntryIndex index) {
+        PersistCache retired = PersistCacheFactory.create(ALLOCATOR, 64, PROTOBUF_VERSION);
+        retired.close();
+        storage.getReadCacheForTest().getReadCache().asMap()
+            .put(index.position().file(), CompletableFuture.completedFuture(retired));
+    }
+
+    @Test
+    void testRetiredReadCacheSegmentIsReadFromStorage() throws Exception {
+        // Reproduces the production log line "Cache segment retired while reading location ...":
+        // the location resolves to a retired segment, so no lease can be granted for it. That is an
+        // ordinary cache miss and the batch must still complete, from storage.
+        EntryIndex index = indexFor(LOCATION);
+        seedRetiredReadCacheSegment(index);
+
+        EntryList entryList = new EntryList(STREAM_ID, 0, Long.MAX_VALUE, 10, 10_000, null, null);
+        storage.get(List.of(index), entryList).get();
+
+        assertEquals(1, entryList.size());
+        assertArrayEquals(payloadFor(LOCATION), toBytes(entryList.get(0).payload()));
+        assertEquals(1, fileStorage.reads.get());
+        assertEquals(1, staleSegmentMissCount());
+        assertEquals(0, storage.leasedSegmentsForTest());
+        entryList.clear();
+    }
+
+    @Test
+    void testRetiredReadCacheSegmentAcrossMultipleLocationsIsReadFromStorage() throws Exception {
+        // One live location and one retired location in the same batch: the live one is served from
+        // cache, the retired one from storage, and the batch completes with both payloads in order.
+        EntryIndex live = indexFor("wal-segment-live", 0);
+        EntryIndex retired = indexFor("wal-segment-retired", MESSAGES_PER_STORED_ENTRY);
+        seedRetiredReadCacheSegment(retired);
+
+        EntryList entryList = new EntryList(STREAM_ID, 0, Long.MAX_VALUE, 100, 100_000, null, null);
+        storage.get(List.of(live, retired), entryList).get();
+
+        assertEquals(2, entryList.size());
+        assertArrayEquals(payloadFor("wal-segment-live"), toBytes(entryList.get(0).payload()));
+        assertArrayEquals(payloadFor("wal-segment-retired"), toBytes(entryList.get(1).payload()));
+        assertEquals(0, storage.leasedSegmentsForTest());
+        entryList.clear();
+    }
+
+    @Test
+    void testRetiredSegmentReadFailsWithCacheLifecycleCauseWhenStorageFails() {
+        EntryIndex index = indexFor(LOCATION);
+        seedRetiredReadCacheSegment(index);
+        fileStorage.failReads = true;
+
+        EntryList entryList = new EntryList(STREAM_ID, 0, Long.MAX_VALUE, 10, 10_000, null, null);
+        ExecutionException failure = assertThrows(ExecutionException.class,
+            () -> storage.get(List.of(index), entryList).get());
+
+        // The recovery read is what failed, so the storage error is what surfaces -- the read is not
+        // silently swallowed -- and no lease is left behind.
+        assertTrue(hasCause(failure, IllegalStateException.class), "unexpected failure: " + failure);
+        assertEquals(0, storage.leasedSegmentsForTest());
+        entryList.clear();
+    }
+
+    @Test
+    void testStaleSegmentReadIsCountedAsACacheMiss() throws Exception {
+        // A recycled segment: cleared after its flush, so the entry-id guard refuses the read.
+        PersistCache segment = seedWriteCacheSegment(LOCATION, "recycled".getBytes(UTF_8), 1);
+        segment.clear();
+
+        var entry = storage.get(STREAM_ID, indexFor(LOCATION)).get();
+
+        assertNotNull(entry);
+        assertArrayEquals(payloadFor(LOCATION), toBytes(entry.payload()));
+        entry.payload().release();
+        assertEquals(1, staleSegmentMissCount());
+        assertEquals(0, storage.leasedSegmentsForTest());
+    }
+
+    private static boolean hasCause(Throwable failure, Class<? extends Throwable> type) {
+        for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+            if (type.isInstance(cause)) {
+                return true;
+            }
+            if (cause.getCause() == cause) {
+                break;
+            }
+        }
+        return false;
+    }
+
+    private long staleSegmentMissCount() {
+        Collection<MetricData> metrics = metricReader.collectAllMetrics();
+        return metrics.stream()
+            .filter(metric -> "ursa.storage.wal.read.cache.missed".equals(metric.getName()))
+            .flatMap(metric -> metric.getLongSumData().getPoints().stream())
+            .filter(point -> "stale_segment".equals(
+                point.getAttributes().get(io.opentelemetry.api.common.AttributeKey.stringKey("type"))))
+            .mapToLong(point -> point.getValue())
+            .sum();
+    }
+
+    private long leasedSegmentsGauge() {
+        Collection<MetricData> metrics = metricReader.collectAllMetrics();
+        return metrics.stream()
+            .filter(metric -> "ursa.storage.wal.cache.leasedSegments".equals(metric.getName()))
+            .flatMap(metric -> metric.getLongGaugeData().getPoints().stream())
+            .filter(point -> point.getAttributes().equals(Attributes.empty()))
+            .mapToLong(point -> point.getValue())
+            .findFirst()
+            .orElseThrow(() -> new AssertionError("leased segments gauge not reported"));
     }
 
     @Test

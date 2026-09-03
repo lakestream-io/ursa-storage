@@ -11,17 +11,26 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import io.lakestream.api.FileInfo;
+import io.lakestream.ursa.metrics.InstrumentProvider;
 import io.lakestream.ursa.storage.FileStorage;
 import io.lakestream.ursa.storage.WalStorageMetrics;
 import io.lakestream.ursa.storage.impl.exception.EntryCacheClosedException;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.Unpooled;
+import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.sdk.OpenTelemetrySdk;
+import io.opentelemetry.sdk.metrics.SdkMeterProvider;
+import io.opentelemetry.sdk.metrics.data.MetricData;
+import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
+import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -84,10 +93,18 @@ public class ReadCacheLeaseTest {
     }
 
     private static ReadCache newReadCache(FileStorage fileStorage) {
+        return newReadCache(fileStorage, WalStorageMetrics.NULL);
+    }
+
+    private static ReadCache newReadCache(FileStorage fileStorage, WalStorageMetrics metrics) {
+        return new ReadCache(readCacheConfig(), ALLOCATOR, fileStorage, metrics);
+    }
+
+    private static StorageConfig readCacheConfig() {
         StorageConfig config = new StorageConfig();
         config.setIndexSerializeFormatVersion(PROTOBUF_VERSION);
         config.setReadCacheMemorySize(1024);
-        return new ReadCache(config, ALLOCATOR, fileStorage, WalStorageMetrics.NULL);
+        return config;
     }
 
     private static byte[] toBytes(ByteBuf buf) {
@@ -180,6 +197,49 @@ public class ReadCacheLeaseTest {
         verify(unreadable).close();
 
         readCache.close();
+    }
+
+    @Test
+    void testSizeGaugeDecrementsOnDoubleRemoval() throws Exception {
+        InMemoryMetricReader metricReader = InMemoryMetricReader.create();
+        SdkMeterProvider meterProvider = SdkMeterProvider.builder().registerMetricReader(metricReader).build();
+        OpenTelemetry otel = OpenTelemetrySdk.builder().setMeterProvider(meterProvider).build();
+        WalStorageMetrics metrics = new WalStorageMetrics("test", new InstrumentProvider(otel), readCacheConfig());
+
+        SegmentFileStorage fileStorage = new SegmentFileStorage();
+        ReadCache readCache = newReadCache(fileStorage, metrics);
+        FileInfo file = new FileInfo("wal-gauge", FILE_WEIGHT);
+
+        PersistCache segment = readCache.acquire(file, 1).get();
+        assertNotNull(segment);
+        segment.release();
+        long loadedSize = segment.sizeInBytes();
+        assertTrue(loadedSize > 0);
+        assertEquals(loadedSize, readCacheSize(metricReader));
+
+        readCache.getReadCache().invalidate(file);
+        assertEquals(0, readCacheSize(metricReader));
+
+        // Double removal: the stale future is reachable again and removed a second time. The first
+        // removal already accounted for the segment's size, so the gauge must stay at 0 rather than
+        // going negative or being skipped by a throw out of sizeInBytes() on the closed segment.
+        readCache.getReadCache().asMap().put(file, CompletableFuture.completedFuture(segment));
+        readCache.getReadCache().invalidate(file);
+        assertEquals(0, readCacheSize(metricReader));
+
+        readCache.close();
+        assertEquals(0, readCacheSize(metricReader));
+    }
+
+    private static long readCacheSize(InMemoryMetricReader metricReader) {
+        Collection<MetricData> metrics = metricReader.collectAllMetrics();
+        return metrics.stream()
+            .filter(metric -> "ursa.storage.wal.readCache.size".equals(metric.getName()))
+            .flatMap(metric -> metric.getLongGaugeData().getPoints().stream())
+            .filter(point -> point.getAttributes().equals(Attributes.empty()))
+            .mapToLong(point -> point.getValue())
+            .findFirst()
+            .orElseThrow(() -> new AssertionError("read cache size gauge not reported"));
     }
 
     @Test

@@ -186,6 +186,15 @@ public class EntryCache implements PersistCache {
         return leases.get();
     }
 
+    /**
+     * Reproduces the doClear() write interleaving in which a walker observes the new createdTimestamp
+     * paired with a stale lastReadTimestamp, which is what makes getReadDurationInMillis() negative.
+     */
+    @VisibleForTesting
+    void setCreatedTimestampForTest(long timestamp) {
+        this.createdTimestamp = timestamp;
+    }
+
     @Override
     public void close() {
         // Retire first so no new lease can be granted, then let whoever drops the last lease do the
@@ -374,7 +383,10 @@ public class EntryCache implements PersistCache {
             // that has been refilled with different data for the same stream returns a well-formed
             // but wrong payload, with no error and no metric. Reporting a miss instead sends the
             // caller down the storage read path, which is always correct.
-            log.warn("[{}] Entry cache is not available for read by entry id: "
+            // Debug, not warn: a recycled segment can be hit once per entry in a batch read, and the
+            // outcome is a miss the caller recovers from. The rate is visible through the
+            // "stale_segment" read-cache miss counter the read sites bump on this path.
+            log.debug("[{}] Entry cache is not available for read by entry id: "
                     + "flushed first offset is not set", streamId);
             return null;
         }
@@ -780,7 +792,11 @@ public class EntryCache implements PersistCache {
      */
     @Override
     public long getReadDurationInMillis() {
-        return lastReadTimestamp - createdTimestamp;
+        // Clamped, not merely unguarded. doClear() writes createdTimestamp (a plain field) before
+        // lastReadTimestamp (volatile), so a concurrent walker can pair the new createdTimestamp with
+        // the stale, smaller lastReadTimestamp and see a negative duration. The eviction pass feeds
+        // this straight into toInt(), which rejects negatives and would abort the whole pass.
+        return Math.max(0, lastReadTimestamp - createdTimestamp);
     }
 
     @Override

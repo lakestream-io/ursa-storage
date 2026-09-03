@@ -43,9 +43,12 @@ import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.tuple.Pair;
@@ -73,6 +76,10 @@ public class ObjectWalStorageImpl implements WalStorage {
     private final WriteCache writeCache;
     private final BlockingQueue<Pair<PersistCache, CompletableFuture<String>>> flushResultQueue;
     private final ReadCache readCache;
+    // Cache segments currently held under a read lease by this storage instance. Every lease is
+    // acquired and released inside one synchronous block, so this sits at or near zero in steady
+    // state; a sustained non-zero value means a lease leaked and is pinning a segment's buffer.
+    private final AtomicInteger leasedSegments = new AtomicInteger(0);
     private final LogStateManager streamStateManager;
 
     private final Thread requestProcessThread;
@@ -116,6 +123,7 @@ public class ObjectWalStorageImpl implements WalStorage {
 
         // read cache related initialize
         this.readCache = new ReadCache(config, allocator, fileStorage, metrics);
+        metrics.buildLeasedSegmentsGauge((avoid) -> (long) leasedSegments.get());
         this.streamStateManager = streamStateManager;
     }
 
@@ -439,6 +447,16 @@ public class ObjectWalStorageImpl implements WalStorage {
     }
 
     @VisibleForTesting
+    ReadCache getReadCacheForTest() {
+        return readCache;
+    }
+
+    @VisibleForTesting
+    int leasedSegmentsForTest() {
+        return leasedSegments.get();
+    }
+
+    @VisibleForTesting
     AtomicLong getPendingAddRequestsDataSizeForTest() {
         return pendingAddRequestsDataSize;
     }
@@ -460,7 +478,25 @@ public class ObjectWalStorageImpl implements WalStorage {
      */
     private PersistCache acquireFromWriteCache(String location) {
         PersistCache write = writeCache.get(location);
-        return write != null && write.tryRetain() ? write : null;
+        return write != null && write.tryRetain() ? countLease(write) : null;
+    }
+
+    /** Records a granted lease for the {@code leasedSegments} gauge. Returns its argument. */
+    private PersistCache countLease(PersistCache leased) {
+        if (leased != null) {
+            leasedSegments.incrementAndGet();
+        }
+        return leased;
+    }
+
+    /**
+     * Releases one lease and keeps the gauge in step. Every release in this class goes through here,
+     * so an unbalanced acquire shows up as a drifting {@code leasedSegments} gauge rather than as a
+     * silent pin. Never called while holding a cache lock, as {@link PersistCache#release()} requires.
+     */
+    private void releaseLease(PersistCache leased) {
+        leasedSegments.decrementAndGet();
+        leased.release();
     }
 
     /**
@@ -484,7 +520,7 @@ public class ObjectWalStorageImpl implements WalStorage {
             if (write == null) {
                 metrics.getGetEntriesCacheMiss()
                     .increment(Attributes.of(AttributeKey.stringKey("type"), "write_cache"));
-                return readCache.acquire(position.file(), 1);
+                return readCache.acquire(position.file(), 1).thenApply(this::countLease);
             } else {
                 return CompletableFuture.completedFuture(write);
             }
@@ -513,7 +549,14 @@ public class ObjectWalStorageImpl implements WalStorage {
                     log.debug("Cache segment closed while reading id:{} location:{}, reading from storage",
                             id, position.location(), e);
                 } finally {
-                    c.release();
+                    releaseLease(c);
+                }
+                if (payload == null) {
+                    // The segment could not serve this entry: it never held it, or its recycle guard
+                    // refused the read. Either way the read falls through to storage, and this is
+                    // where a recycled write-cache segment becomes visible to an operator.
+                    metrics.getGetEntriesCacheMiss()
+                        .increment(Attributes.of(AttributeKey.stringKey("type"), "stale_segment"));
                 }
             }
             if (payload != null) {
@@ -557,7 +600,7 @@ public class ObjectWalStorageImpl implements WalStorage {
                         return CompletableFuture.failedFuture(new WalStorageException(e.getMessage(), e));
                     }
                 } finally {
-                    c.release();
+                    releaseLease(c);
                 }
             }
             return readEntryFromStorage(id, offset, compactedIndex);
@@ -612,7 +655,8 @@ public class ObjectWalStorageImpl implements WalStorage {
                 if (write == null) {
                     metrics.getGetEntriesCacheMiss()
                             .add(posCount, Attributes.of(AttributeKey.stringKey("type"), "write_cache"));
-                    caches.put(location.location(), readCache.acquire(location, posCount));
+                    caches.put(location.location(),
+                            readCache.acquire(location, posCount).thenApply(this::countLease));
                 } else {
                     caches.put(location.location(), CompletableFuture.completedFuture(write));
                 }
@@ -627,15 +671,85 @@ public class ObjectWalStorageImpl implements WalStorage {
                 }
             });
             return cachesFuture.thenCompose(__ -> {
-                try {
-                    return readEntriesFromCaches(indices, entryList, hasRetried, caches, start);
-                } finally {
-                    // Every use of a leased segment above is synchronous, so the leases are dropped
-                    // here — before any storage fallback future is awaited and before a retry runs.
-                    releaseAcquiredCaches(caches);
-                }
+                // A location whose segment retired before it could be leased is an ordinary cache
+                // miss: read it straight from storage rather than failing the batch.
+                CompletableFuture<Map<String, PersistCache>> recoveryFuture =
+                        readRetiredLocationsFromStorage(caches);
+                recoveryFuture.whenComplete((recovered, e) -> {
+                    if (e != null) {
+                        metrics.getGetEntriesDuration().recordFailure(System.nanoTime() - start);
+                        releaseAcquiredCaches(caches);
+                    }
+                });
+                return recoveryFuture.thenCompose(recovered -> {
+                    try {
+                        return readEntriesFromCaches(indices, entryList, hasRetried, caches, recovered, start);
+                    } finally {
+                        // Every use of a cached or recovered segment above is synchronous, so both are
+                        // dropped here — before any storage fallback future is awaited and before a
+                        // retry runs. Payloads are copies, so closing a recovered segment is safe.
+                        releaseAcquiredCaches(caches);
+                        closeRecoveredSegments(recovered);
+                    }
+                });
             });
         });
+    }
+
+    /**
+     * Reads, straight from object storage, every location whose cached segment retired before it
+     * could be leased.
+     *
+     * <p>Returns an empty map on the common path, where every location resolved to a live segment.
+     * The returned segments are local to this read: the caller closes them once the synchronous read
+     * loop is done with them.
+     */
+    private CompletableFuture<Map<String, PersistCache>> readRetiredLocationsFromStorage(
+            Map<String, CompletableFuture<PersistCache>> caches) {
+        List<String> retired = null;
+        for (var e : caches.entrySet()) {
+            CompletableFuture<PersistCache> cacheFuture = e.getValue();
+            if (cacheFuture.isDone() && !cacheFuture.isCompletedExceptionally()
+                    && !cacheFuture.isCancelled() && cacheFuture.join() == null) {
+                if (retired == null) {
+                    retired = new ArrayList<>();
+                }
+                retired.add(e.getKey());
+            }
+        }
+        if (retired == null) {
+            return CompletableFuture.completedFuture(Map.of());
+        }
+
+        Map<String, PersistCache> recovered = new ConcurrentHashMap<>();
+        List<CompletableFuture<Void>> loads = new ArrayList<>(retired.size());
+        for (String location : retired) {
+            metrics.getGetEntriesCacheMiss()
+                    .increment(Attributes.of(AttributeKey.stringKey("type"), "stale_segment"));
+            loads.add(fileStorage.getAsync(location).thenAccept(byteBuf ->
+                    recovered.put(location, PersistCacheFactory.deserialize(allocator, byteBuf,
+                            config.getIndexSerializeFormatVersion()))));
+        }
+        return FutureUtils.waitForAll(loads)
+                .handle((ignored, failure) -> {
+                    if (failure != null) {
+                        // Close whatever did load before propagating, so a partial recovery cannot leak.
+                        closeRecoveredSegments(recovered);
+                        throw failure instanceof CompletionException completion
+                                ? completion : new CompletionException(failure);
+                    }
+                    return recovered;
+                });
+    }
+
+    private static void closeRecoveredSegments(Map<String, PersistCache> recovered) {
+        for (PersistCache segment : recovered.values()) {
+            try {
+                segment.close();
+            } catch (RuntimeException closeFailure) {
+                log.warn("Failed to close a segment recovered from storage", closeFailure);
+            }
+        }
     }
 
     /**
@@ -646,7 +760,8 @@ public class ObjectWalStorageImpl implements WalStorage {
      * scheduled.
      */
     private CompletableFuture<Void> readEntriesFromCaches(List<EntryIndex> indices, EntryList entryList,
-            boolean hasRetried, Map<String, CompletableFuture<PersistCache>> caches, long start) {
+            boolean hasRetried, Map<String, CompletableFuture<PersistCache>> caches,
+            Map<String, PersistCache> recovered, long start) {
         boolean hasNullValue = false;
         List<CompletableFuture<ByteBuf>> getFromStorageList = new ArrayList<>();
         for (int i = 0; i < indices.size(); i++) {
@@ -654,17 +769,21 @@ public class ObjectWalStorageImpl implements WalStorage {
             var header = index.header();
             var pos = index.position();
             PersistCache c = caches.get(pos.location()).join();
+            if (c == null) {
+                // Retired before it could be leased: served from the copy just read from storage.
+                c = recovered.get(pos.location());
+            }
             boolean success = true;
             if (storageFormat.isProtobufFormat()) {
                 if (c == null) {
-                    // The segment retired between the lookup and the lease. Retry once: the read cache
-                    // entry is already invalidated, so the retry reloads the location from storage.
-                    if (!hasRetried) {
-                        entryList.clear();
-                        return get(indices, entryList, true);
-                    }
+                    // Defensive: recovery covers every retired location, so this is unreachable unless
+                    // that invariant breaks. Carry an EntryCacheClosedException cause so LogCursorImpl
+                    // recognises a cache-lifecycle failure and does not invalidate the index cache
+                    // shared by every cursor on the log.
                     return CompletableFuture.failedFuture(new WalStorageException(
-                            "Cache segment retired while reading location " + pos.location()));
+                            "Cache segment retired while reading location " + pos.location(),
+                            new EntryCacheClosedException(
+                                    "Cache segment retired while reading location " + pos.location())));
                 }
                 try {
                     success = convertPersistCacheToEntryList(c, index, entryList);
@@ -691,6 +810,12 @@ public class ObjectWalStorageImpl implements WalStorage {
                 if (entryList.isNotFull(header)) {
                     ByteBuf payload = c == null ? null : c.get(id, pos.indexId());
                     if (payload == null) {
+                        if (c != null) {
+                            // See the matching note on the single-entry read: a segment that cannot
+                            // serve the entry, including one refused by the recycle guard.
+                            metrics.getGetEntriesCacheMiss()
+                                .increment(Attributes.of(AttributeKey.stringKey("type"), "stale_segment"));
+                        }
                         hasNullValue = true;
                         CompletableFuture<ByteBuf> entryFromStorage = fileStorage
                                 .getAsync(pos.location()).thenApply(byteBuf -> {
@@ -778,14 +903,14 @@ public class ObjectWalStorageImpl implements WalStorage {
      * value means the segment retired before it could be leased, so there is nothing to release.
      * Called outside any cache lock, as {@link PersistCache#release()} requires.
      */
-    private static void releaseAcquiredCaches(Map<String, CompletableFuture<PersistCache>> caches) {
+    private void releaseAcquiredCaches(Map<String, CompletableFuture<PersistCache>> caches) {
         for (CompletableFuture<PersistCache> cacheFuture : caches.values()) {
             if (!cacheFuture.isDone() || cacheFuture.isCompletedExceptionally() || cacheFuture.isCancelled()) {
                 continue;
             }
             PersistCache cache = cacheFuture.join();
             if (cache != null) {
-                cache.release();
+                releaseLease(cache);
             }
         }
     }

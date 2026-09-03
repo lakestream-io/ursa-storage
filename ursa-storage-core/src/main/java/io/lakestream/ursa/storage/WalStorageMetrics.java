@@ -44,6 +44,7 @@ public class WalStorageMetrics {
     private final LatencyHistogram readCacheLoadingDuration;
     private final Counter getEntriesCacheMiss;
     private ObservableLongGauge readCacheSizeInBytes;
+    private ObservableLongGauge leasedSegments;
 
     public WalStorageMetrics(String storageType, InstrumentProvider provider, StorageConfig config) {
         this.provider = provider;
@@ -111,6 +112,24 @@ public class WalStorageMetrics {
             .ofLongs()
             .buildWithCallback((gauge) -> {
                 gauge.record(queue.size(), Attributes.builder().put("type", storageType).build());
+            });
+    }
+
+    /**
+     * Publishes the number of cache segments currently held under a read lease.
+     *
+     * <p>A read lease lives for one synchronous copy()/get() call, so in steady state this hovers at
+     * or near zero and a sustained non-zero value means a lease was acquired and never released --
+     * which pins a segment's buffer. This gauge is the production tripwire for that.
+     */
+    public void buildLeasedSegmentsGauge(Function<Void, Long> leaseCompute) {
+        this.leasedSegments = provider.getMeter()
+            .gaugeBuilder("ursa.storage.wal.cache.leasedSegments")
+            .setUnit(Unit.Request.toString())
+            .setDescription("The number of cache segments currently held under a read lease")
+            .ofLongs()
+            .buildWithCallback((gauge) -> {
+                gauge.record(leaseCompute.apply(null));
             });
     }
 

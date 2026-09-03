@@ -33,6 +33,7 @@ import io.lakestream.api.Position;
 import io.lakestream.ursa.lakestream.reader.CompactedObjectReader;
 import io.lakestream.ursa.storage.Entry;
 import io.lakestream.ursa.storage.impl.exception.EntryCacheClosedException;
+import io.lakestream.ursa.storage.impl.exception.WalStorageException;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import java.util.Collections;
@@ -296,6 +297,26 @@ class LogCursorImplTest {
         assertEquals(0, cursor.getPrefetchedMessageCount());
         // ... but the index cache is shared by every cursor on the log and must survive a transient
         // WAL cache segment close.
+        verify(log, never()).invalidateCache();
+    }
+
+    @Test
+    void testRetiredSegmentFailureDoesNotInvalidateSharedIndexCache() {
+        cursor.getPrefetchedIndexes().add(makeRawEntryIndex(0, 1));
+        cursor.setPrefetchedMessageCount(1);
+
+        // Exactly the shape ObjectWalStorageImpl produces when a cache segment retires under a batch
+        // read and the single retry cannot recover: a WalStorageException wrapping the cache
+        // lifecycle cause. The cursor has to see through the wrapper.
+        when(logStorage.readEntriesByIndex(eq(logId), any(), anyLong(), anyLong(),
+            anyInt(), anyLong(), any(), any()))
+            .thenReturn(CompletableFuture.failedFuture(new CompletionException(
+                new WalStorageException("Cache segment retired while reading location wal-file",
+                    new EntryCacheClosedException("Cache segment retired while reading location wal-file")))));
+
+        assertThrows(ExecutionException.class, () -> cursor.readEntries(10, Long.MAX_VALUE).get());
+
+        assertTrue(cursor.getPrefetchedIndexes().isEmpty());
         verify(log, never()).invalidateCache();
     }
 
