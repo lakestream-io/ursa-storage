@@ -61,6 +61,13 @@ import lombok.extern.slf4j.Slf4j;
 public class CompactionWorker implements Runnable {
 
     private static final Pattern PARTITION_SUFFIX = Pattern.compile("-partition-(\\d+)$");
+    /**
+     * Prefix of the log names the catalog allocates for Lakestream-native streams. Kept in step with
+     * {@code IndexedStreamCatalog#nativePartitionAllocationKey}, which builds
+     * {@code lakestream-native/<StreamIdentifier#fullName>/partition-N}.
+     */
+    private static final String NATIVE_NAME_PREFIX = "lakestream-native/";
+    private static final Pattern PARTITION_SEGMENT = Pattern.compile("^partition-(\\d+)$");
 
     private final CompactTaskManager compactTaskManager;
     private final CompactionService compactionService;
@@ -490,7 +497,11 @@ public class CompactionWorker implements Runnable {
             if (value == null || value.isBlank() || value.contains("://")) {
                 throw new IllegalArgumentException("Invalid stream name: " + value);
             }
-            String[] parts = value.strip().split("/", -1);
+            String stripped = value.strip();
+            if (stripped.startsWith(NATIVE_NAME_PREFIX)) {
+                return parseNative(stripped);
+            }
+            String[] parts = stripped.split("/", -1);
             String namespace;
             String localName;
             if (parts.length == 1) {
@@ -511,6 +522,35 @@ public class CompactionWorker implements Runnable {
             }
             return new CanonicalName(namespace, localName, localName.substring(0, matcher.start()),
                     Integer.parseInt(matcher.group(1)));
+        }
+
+        /**
+         * Resolves {@code lakestream-native/<namespace>/<name>/partition-N}. The partition is its own trailing
+         * segment rather than a suffix on the name, and the namespace may itself contain slashes, so the stream
+         * name is the last segment of what remains once the prefix and the partition segment are removed.
+         */
+        private static CanonicalName parseNative(String value) {
+            String remainder = value.substring(NATIVE_NAME_PREFIX.length());
+            int partitionStart = remainder.lastIndexOf('/');
+            if (partitionStart < 0) {
+                throw new IllegalArgumentException("Invalid stream name: " + value);
+            }
+            Matcher partitionMatcher = PARTITION_SEGMENT.matcher(remainder.substring(partitionStart + 1));
+            if (!partitionMatcher.matches()) {
+                throw new IllegalArgumentException("Invalid stream name: " + value);
+            }
+            String fullName = remainder.substring(0, partitionStart);
+            int nameStart = fullName.lastIndexOf('/');
+            if (nameStart < 0) {
+                throw new IllegalArgumentException("Invalid stream name: " + value);
+            }
+            String namespace = fullName.substring(0, nameStart);
+            String localName = fullName.substring(nameStart + 1);
+            if (namespace.isBlank() || localName.isBlank()) {
+                throw new IllegalArgumentException("Invalid stream name: " + value);
+            }
+            return new CanonicalName(namespace, localName, localName,
+                    Integer.parseInt(partitionMatcher.group(1)));
         }
     }
 }
