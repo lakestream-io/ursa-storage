@@ -65,8 +65,8 @@ class CompactionTaskCompleterTest {
     /**
      * Regression test for issue #11: the compacted-object readers can only locate a Parquet file
      * through the {@code ManagedTableFileIndex}, which the commit runner builds from the task's
-     * {@link ManagedWriteResult}s. They must therefore be recorded unconditionally (no
-     * {@code managedTableSchemaEvolutionEnabled} gate), otherwise every compacted range is unreadable.
+     * {@link ManagedWriteResult}s. They must therefore be recorded unconditionally, otherwise every
+     * compacted range is unreadable.
      */
     @Test
     void managedParquetResultsAlwaysRecordManagedWriteResults() throws Exception {

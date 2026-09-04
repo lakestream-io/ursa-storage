@@ -106,8 +106,6 @@ public class LakehouseMaterializationService implements MaterializationService {
         ensureOpen();
         this.runtime = Objects.requireNonNull(runtime, "runtime");
         this.config = Objects.requireNonNull(config, "config");
-        CompactionTaskCompleter.warnIfDeprecatedFlagConfigured(
-                config.additionalProperties().get(CompactionTaskCompleter.MANAGED_TABLE_SCHEMA_EVOLUTION_ENABLED));
 
         // Discover factories via ServiceLoader. Each TableCatalogType has at most one factory;
         // duplicate registrations log a warning and the first-loaded factory wins.

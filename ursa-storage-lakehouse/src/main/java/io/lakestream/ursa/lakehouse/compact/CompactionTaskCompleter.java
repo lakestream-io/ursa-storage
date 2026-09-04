@@ -26,7 +26,6 @@ import java.util.Optional;
 import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
-import lombok.extern.slf4j.Slf4j;
 import org.apache.iceberg.io.WriteResult;
 
 /**
@@ -45,41 +44,12 @@ import org.apache.iceberg.io.WriteResult;
  * {@code KafkaLakehouseReader}) require that index to locate the Parquet file for an offset; a compacted
  * range without it is unreadable.
  */
-@Slf4j
 public class CompactionTaskCompleter {
-
-    /**
-     * Historical property that used to gate {@code ManagedTableFileIndex} emission. It is now a no-op:
-     * the index is always written because no reader can consume a compacted range without it.
-     */
-    public static final String MANAGED_TABLE_SCHEMA_EVOLUTION_ENABLED = "managedTableSchemaEvolutionEnabled";
 
     private final CompactTaskManager compactTaskManager;
 
     public CompactionTaskCompleter(CompactTaskManager compactTaskManager) {
         this.compactTaskManager = compactTaskManager;
-    }
-
-    /**
-     * @deprecated the {@code managedTableSchemaEvolutionEnabled} flag no longer has any effect; use
-     *     {@link #CompactionTaskCompleter(CompactTaskManager)}.
-     */
-    @Deprecated
-    public CompactionTaskCompleter(CompactTaskManager compactTaskManager,
-                                   boolean managedTableSchemaEvolutionEnabled) {
-        this(compactTaskManager);
-    }
-
-    /**
-     * Logs a warning when the deprecated {@code managedTableSchemaEvolutionEnabled} property is present
-     * so operators know it can be removed from their configuration.
-     */
-    public static void warnIfDeprecatedFlagConfigured(Object configuredValue) {
-        if (configuredValue != null) {
-            log.warn("Property '{}' (={}) is deprecated and ignored: the ManagedTableFileIndex is now always "
-                     + "written for compacted stream-backed tables. Remove it from the configuration.",
-                MANAGED_TABLE_SCHEMA_EVOLUTION_ENABLED, configuredValue);
-        }
     }
 
     /**

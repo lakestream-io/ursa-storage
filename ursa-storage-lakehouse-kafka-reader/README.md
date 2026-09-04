@@ -13,8 +13,7 @@ the legacy WASB connector, which Hadoop 3.5 no longer provides. Azure deployment
 HNS-enabled storage account and configure `AZUREDFS`.
 
 Kafka compaction always writes this format with a `ManagedTableFileIndex` in the Lakestream
-`EntryIndex`; no compactor property gates it (the historical `managedTableSchemaEvolutionEnabled`
-flag is deprecated and ignored). The reader uses that index to select a Parquet file, seeks its companion
+`EntryIndex`; no compactor property gates it. The reader uses that index to select a Parquet file, seeks its companion
 `.index` file by Kafka offset, and returns owned `LogEntry` buffers. Callers must close every
 returned entry exactly once.
 

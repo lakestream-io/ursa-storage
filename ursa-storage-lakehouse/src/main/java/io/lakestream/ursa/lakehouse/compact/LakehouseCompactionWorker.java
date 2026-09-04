@@ -65,8 +65,6 @@ public class LakehouseCompactionWorker implements CompactionTaskProcessor {
         this.entryReaderFactory = entryReaderFactory;
         this.compactTaskManager = compactTaskManager;
         this.compactionMetrics = metrics;
-        CompactionTaskCompleter.warnIfDeprecatedFlagConfigured(storageConfig.getProperties()
-            .get(CompactionTaskCompleter.MANAGED_TABLE_SCHEMA_EVOLUTION_ENABLED));
         this.skipMarkerMessages = Boolean.parseBoolean(storageConfig.getProperties()
             .getOrDefault("skipMarkerMessages", "false").toString());
         this.readTimeoutSeconds = Long.parseLong(storageConfig.getProperties()
