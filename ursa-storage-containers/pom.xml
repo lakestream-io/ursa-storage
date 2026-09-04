@@ -69,15 +69,11 @@
             <artifactId>kafka-avro-serializer</artifactId>
         </dependency>
 
+        <!-- Provides the Apache-2.0 JSON Schema / Protobuf schema providers for the registry client. -->
         <dependency>
-            <groupId>io.confluent</groupId>
-            <artifactId>kafka-json-schema-provider</artifactId>
-            <version>${schema.registry.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>io.confluent</groupId>
-            <artifactId>kafka-protobuf-provider</artifactId>
-            <version>${schema.registry.version}</version>
+            <groupId>io.lakestream</groupId>
+            <artifactId>ursa-storage-materialization</artifactId>
+            <version>${project.version}</version>
         </dependency>
 
     </dependencies>

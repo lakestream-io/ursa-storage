@@ -28,12 +28,12 @@ import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.collections.CollectionUtils;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.io.WriteResult;
 
@@ -420,22 +420,26 @@ public class UpsertCommitFileRunner extends AbstractCommitRunner implements Comm
 
     private boolean hasFiles(CompactStreamTask task) {
         if (task instanceof IcebergCompactStreamTask icebergCompactStreamTask) {
-            return CollectionUtils.isNotEmpty(icebergCompactStreamTask.getWriteResults());
+            return isNotEmpty(icebergCompactStreamTask.getWriteResults());
         }
         if (task instanceof DeltaCompactStreamTask deltaCompactStreamTask) {
-            return CollectionUtils.isNotEmpty(deltaCompactStreamTask.getDeltaFiles());
+            return isNotEmpty(deltaCompactStreamTask.getDeltaFiles());
         }
         return false;
     }
 
     private boolean hasDltFiles(CompactStreamTask task) {
         if (task instanceof IcebergCompactStreamTask icebergCompactStreamTask) {
-            return CollectionUtils.isNotEmpty(icebergCompactStreamTask.getDltWriteResults());
+            return isNotEmpty(icebergCompactStreamTask.getDltWriteResults());
         }
         if (task instanceof DeltaCompactStreamTask deltaCompactStreamTask) {
-            return CollectionUtils.isNotEmpty(deltaCompactStreamTask.getDltDeltaFiles());
+            return isNotEmpty(deltaCompactStreamTask.getDltDeltaFiles());
         }
         return false;
+    }
+
+    private static boolean isNotEmpty(Collection<?> collection) {
+        return collection != null && !collection.isEmpty();
     }
 
     @Override

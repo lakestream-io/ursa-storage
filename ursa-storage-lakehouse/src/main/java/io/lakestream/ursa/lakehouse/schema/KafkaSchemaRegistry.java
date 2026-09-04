@@ -5,18 +5,16 @@
 package io.lakestream.ursa.lakehouse.schema;
 
 import io.confluent.kafka.schemaregistry.SchemaProvider;
-import io.confluent.kafka.schemaregistry.avro.AvroSchemaProvider;
 import io.confluent.kafka.schemaregistry.client.CachedSchemaRegistryClient;
 import io.confluent.kafka.schemaregistry.client.MockSchemaRegistryClient;
 import io.confluent.kafka.schemaregistry.client.SchemaMetadata;
 import io.confluent.kafka.schemaregistry.client.SchemaRegistryClient;
 import io.confluent.kafka.schemaregistry.client.rest.RestService;
 import io.confluent.kafka.schemaregistry.client.rest.exceptions.RestClientException;
-import io.confluent.kafka.schemaregistry.json.JsonSchemaProvider;
-import io.confluent.kafka.schemaregistry.protobuf.ProtobufSchemaProvider;
 import io.lakestream.ursa.lakehouse.exception.FetchSchemaFailedException;
 import io.lakestream.ursa.lakehouse.exception.SchemaNotFoundException;
 import io.lakestream.ursa.lakehouse.utils.TopicName;
+import io.lakestream.ursa.materialization.serde.kafka.schema.RawSchemaProvider;
 import io.lakestream.ursa.storage.impl.StorageConfig;
 import java.io.IOException;
 import java.util.HashMap;
@@ -45,10 +43,12 @@ public class KafkaSchemaRegistry implements SchemaRegistry {
      * Creates a registry client for Kafka schema-aware records. When no registry URL is configured,
      * an in-memory client is used so raw and primitive Kafka records remain materializable without
      * accidentally constructing an HTTP client for the literal URL {@code "null"}.
+     *
+     * <p>JSON Schema and Protobuf schemas are kept as opaque text ({@link RawSchemaProvider}); only the
+     * Apache-2.0 Avro provider parses schemas on the client.
      */
     public static SchemaRegistryClient createClient(Properties properties) {
-        List<SchemaProvider> providers = List.of(
-                new JsonSchemaProvider(), new AvroSchemaProvider(), new ProtobufSchemaProvider());
+        List<SchemaProvider> providers = RawSchemaProvider.defaultProviders();
         String url = properties.getProperty(URL);
         if (url == null || url.isBlank()) {
             return new MockSchemaRegistryClient(providers);

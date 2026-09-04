@@ -11,8 +11,9 @@ import io.confluent.kafka.schemaregistry.client.rest.exceptions.RestClientExcept
 import io.confluent.kafka.serializers.KafkaAvroDeserializer;
 import io.confluent.kafka.serializers.KafkaAvroSerializer;
 import io.lakestream.ursa.materialization.serde.SchemaService;
-import io.lakestream.ursa.materialization.util.kafka.json.KafkaJsonSchemaDeserializer;
-import io.lakestream.ursa.materialization.util.kafka.protobuf.KafkaProtobufDeserializer;
+import io.lakestream.ursa.materialization.serde.kafka.schema.RawSchemaProvider;
+import io.lakestream.ursa.materialization.serde.kafka.schema.SchemaRegistryJsonDeserializer;
+import io.lakestream.ursa.materialization.serde.kafka.schema.SchemaRegistryProtobufDeserializer;
 import java.io.IOException;
 import java.util.Collections;
 import java.util.HashMap;
@@ -51,8 +52,9 @@ public class KafkaSchemaService implements SchemaService<SchemaMetadata> {
         this.serializerMap = new HashMap<>();
 
         deserializerMap.put("AVRO", new KafkaAvroDeserializer(schemaRegistryClient));
-        deserializerMap.put("JSON", new KafkaJsonSchemaDeserializer<>(schemaRegistryClient));
-        deserializerMap.put("PROTOBUF", new KafkaProtobufDeserializer<>(schemaRegistryClient));
+        deserializerMap.put(RawSchemaProvider.JSON_TYPE, new SchemaRegistryJsonDeserializer());
+        deserializerMap.put(RawSchemaProvider.PROTOBUF_TYPE,
+                new SchemaRegistryProtobufDeserializer(schemaRegistryClient, this::getSubject));
         serializerMap.put("AVRO", new KafkaAvroSerializer(schemaRegistryClient));
     }
 
