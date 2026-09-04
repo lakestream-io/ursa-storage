@@ -147,8 +147,9 @@ public final class TableCatalogBootstrap {
     /**
      * When {@code materializationEnabled=true} and a {@code materializationDefaultNamespace} is set,
      * synthesizes a default {@link TableCatalog} from the flat legacy lakehouse config and attaches a
-     * default {@link TableMaterializationPolicy} (EXTERNAL, referencing that catalog, table name =
-     * {@code ${stream.name}}) to that namespace. This makes catalog-side materialization resolution
+     * default {@link TableMaterializationPolicy} (EXTERNAL, referencing that catalog) to that
+     * namespace. Unless an explicit naming template is configured, delivered tables use the source
+     * logical name recorded on each stream. This makes catalog-side materialization resolution
      * succeed so the new {@code maybeMaterialize} pipeline materializes every stream in the namespace
      * — the same coverage the legacy global-config pipeline had — without per-stream policy authoring.
      *
@@ -237,9 +238,10 @@ public final class TableCatalogBootstrap {
      * lakehouse config, or {@link Optional#empty()} when {@code lakehouseType} is unset/unsupported.
      * Shared by the startup default-policy bridge (which registers the catalog and scopes the policy to
      * a namespace / cluster) and the per-task compatibility resolution
-     * ({@link #resolveFromProperties}). The policy is EXTERNAL/MANAGED per {@code streamTableMode},
-     * enabled, with table naming {@code ${stream.name}} (namespace prefix = the ClickHouse database for
-     * CLICKHOUSE, else derived from the stream).
+     * ({@link #resolveFromProperties}). The policy is EXTERNAL/MANAGED per {@code streamTableMode}
+     * and enabled. Explicit {@code tableNameTemplate} configuration is preserved; otherwise policy
+     * resolution selects the mode-specific default. ClickHouse retains an implicit template because
+     * its fixed database and flat table-name space must encode the stream namespace.
      */
     static Optional<CatalogAndPolicy> buildCatalogAndPolicy(Properties properties) {
         String lakehouseType = properties.getProperty("lakehouseType", "NONE").toUpperCase(Locale.ROOT);
@@ -294,12 +296,21 @@ public final class TableCatalogBootstrap {
                 : Optional.empty();
         // ClickHouse is a 2-level store (database.table) with no separate namespace tier, so the
         // stream namespace would otherwise be dropped and two streams with the same local name in
-        // different namespaces would collide on one table. Encode the full identity into the table
-        // name: database = clickhouseDatabase (fixed), table = ${stream.namespace}.${stream.name}
-        // (the ClickHouse sink turns the namespace path separator '/' into '.'). Iceberg/Delta keep
-        // ${stream.name} — they carry the namespace as a real multi-level table namespace instead.
-        String tableNameTemplate = properties.getProperty(StreamTableNaming.TABLE_NAME_TEMPLATE_PROPERTY,
-                clickhouse ? "${stream.namespace}.${stream.name}" : "${stream.name}");
+        // different namespaces would collide on one table. It therefore keeps an implicit template.
+        // Iceberg and Delta need no template: policy resolution selects the storage name for MANAGED
+        // tables and the source logical name for EXTERNAL/CUSTOM tables.
+        String configuredTemplate = properties.getProperty(StreamTableNaming.TABLE_NAME_TEMPLATE_PROPERTY);
+        Optional<TableNaming> tableNaming;
+        if (configuredTemplate != null) {
+            tableNaming = Optional.of(new TableNaming(tableNamespacePrefix, configuredTemplate));
+        } else if (clickhouse) {
+            String defaultTemplate = mode == TableMode.MANAGED
+                    ? "${stream.namespace}.${stream.name}"
+                    : "${stream.namespace}.${stream.logicalName}";
+            tableNaming = Optional.of(new TableNaming(tableNamespacePrefix, defaultTemplate));
+        } else {
+            tableNaming = Optional.empty();
+        }
 
         // Carry the legacy DynamicConfigs / flat properties into the STRUCTURED policy fields so sinks
         // that read the policy (ClickHouse reads primaryKey / framework.writeMode / commit.batchSize;
@@ -321,7 +332,7 @@ public final class TableCatalogBootstrap {
 
         TableMaterializationPolicy policy = new TableMaterializationPolicy(
                 Optional.of(catalogName),
-                Optional.of(new TableNaming(tableNamespacePrefix, tableNameTemplate)),
+                tableNaming,
                 Optional.empty(),
                 Optional.of(Boolean.TRUE),
                 framework,
@@ -332,6 +343,14 @@ public final class TableCatalogBootstrap {
                         Optional.empty(), Optional.empty(), Optional.empty())),
                 Map.of());
         return Optional.of(new CatalogAndPolicy(catalog, policy));
+    }
+
+    private static Map<String, String> propertiesToMap(Properties properties) {
+        Map<String, String> values = new LinkedHashMap<>();
+        for (String name : properties.stringPropertyNames()) {
+            values.put(name, properties.getProperty(name));
+        }
+        return Map.copyOf(values);
     }
 
     /**
@@ -390,21 +409,22 @@ public final class TableCatalogBootstrap {
         final CatalogAndPolicy resolved = cp;
         return TableMaterializationPolicy.resolve(Optional.of(resolved.policy()), Optional.empty(), streamId,
                 name -> name.equals(resolved.catalog().name())
-                        ? Optional.of(resolved.catalog()) : Optional.empty());
+                        ? Optional.of(resolved.catalog()) : Optional.empty(),
+                propertiesToMap(properties));
     }
 
     /**
      * Builds the synthetic ({@link TableCatalog}, {@link TableMaterializationPolicy}) for the SBT-only
-     * case: a {@link TableCatalogType#NONE} catalog with a {@code MANAGED}, enabled policy naming the
-     * table {@code ${stream.name}}. There is no external factory for a NONE catalog; the dispatch path
-     * builds only the managed Compacted-Object writer.
+     * case: a {@link TableCatalogType#NONE} catalog with a {@code MANAGED}, enabled policy. The
+     * mode-specific default keeps its synthetic table identity on {@code stream.name}. There is no
+     * factory for a NONE catalog; the dispatch path builds only the managed Compacted-Object writer.
      */
     private static CatalogAndPolicy managedOnlyCatalogAndPolicy() {
         String catalogName = "managed-none";
         TableCatalog catalog = new TableCatalog(catalogName, TableCatalogType.NONE, Map.of(), Map.of());
         TableMaterializationPolicy policy = new TableMaterializationPolicy(
                 Optional.of(catalogName),
-                Optional.of(new TableNaming(Optional.empty(), "${stream.name}")),
+                Optional.empty(),
                 Optional.empty(),
                 Optional.of(Boolean.TRUE),
                 Optional.empty(),

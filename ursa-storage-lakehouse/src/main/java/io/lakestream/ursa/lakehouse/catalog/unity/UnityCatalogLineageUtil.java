@@ -5,15 +5,19 @@
 package io.lakestream.ursa.lakehouse.catalog.unity;
 
 import com.databricks.sdk.service.catalog.SystemType;
+import io.lakestream.api.SourceMetadataProperties;
+import io.lakestream.api.materialization.TableIdentifier;
 import io.lakestream.ursa.lakehouse.LakehouseConfiguration;
 import io.lakestream.ursa.lakehouse.LakehouseConfiguration.LakehouseType;
 import io.lakestream.ursa.lakehouse.iceberg.IcebergTable;
+import io.lakestream.ursa.lakehouse.utils.StreamTableNaming;
 import io.lakestream.ursa.lakehouse.utils.TableNameFormatUtils;
 import io.lakestream.ursa.lakehouse.utils.TopicName;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.stream.Stream;
 import org.apache.commons.lang3.StringUtils;
 
 public final class UnityCatalogLineageUtil {
@@ -37,16 +41,20 @@ public final class UnityCatalogLineageUtil {
 
     public static Optional<UnityCatalogExternalLineageRequest> buildDeltaRequest(LakehouseConfiguration config,
                                                                                  String topicName) {
-        UnityTableIdentifier identifier = UnityTableIdentifier.parse(topicName);
+        String sourceTopic = sourceTopic(config, topicName);
+        UnityTableIdentifier sourceIdentifier = UnityTableIdentifier.parse(sourceTopic);
+        TableIdentifier resolvedTable = StreamTableNaming.resolve(topicName, config.getProperties());
+        UnityTableIdentifier tableIdentifier = UnityTableIdentifier.parse(
+                StreamTableNaming.qualifiedName(resolvedTable));
         String unityCatalogName = config.getUnityCatalogName();
         if (StringUtils.isBlank(unityCatalogName)) {
             return Optional.empty();
         }
 
         return Optional.of(new UnityCatalogExternalLineageRequest(
-                topicName,
-                identifier.getTableFullName(unityCatalogName),
-                "lakestream_ursa_" + identifier.getSchema() + "_" + identifier.getTable(),
+                sourceTopic,
+                tableIdentifier.getTableFullName(unityCatalogName),
+                "lakestream_ursa_" + sourceIdentifier.getSchema() + "_" + sourceIdentifier.getTable(),
                 clusterName(config),
                 resolveSystemType(config.getUnityCatalogByolSystemType())));
     }
@@ -65,22 +73,37 @@ public final class UnityCatalogLineageUtil {
             return Optional.empty();
         }
 
-        TopicName parsedTopic = TopicName.getPartitionedTopicName(topicName);
-        String[] namespaceLevels = new String[]{parsedTopic.getNamespace()};
+        String sourceTopic = sourceTopic(config, topicName);
+        TopicName parsedSource = TopicName.getPartitionedTopicName(sourceTopic);
+        TableIdentifier resolvedTable = StreamTableNaming.resolve(topicName, config.getProperties());
         String cluster = clusterName(config);
-        String ns = java.util.stream.Stream
-                .concat(java.util.stream.Stream.of(cluster), java.util.Arrays.stream(namespaceLevels))
+        String tableNamespace = unityIcebergNamespace(cluster, resolvedTable.namespace());
+        String tableName = TableNameFormatUtils.formatUnityCatalogIcebergTableName(resolvedTable.name());
+        String icebergCatalogName = getIcebergUnityCatalogName(config, icebergProps);
+        String tableFullName = icebergCatalogName + "." + tableNamespace + "." + tableName;
+        String sourceNamespace = unityIcebergNamespace(cluster, parsedSource.getNamespace());
+        String sourceName = TableNameFormatUtils.formatUnityCatalogIcebergTableName(parsedSource.getLocalName());
+        String topicMetadataName = "lakestream_ursa_" + sourceNamespace + "_" + sourceName;
+
+        return Optional.of(new UnityCatalogExternalLineageRequest(
+                sourceTopic, tableFullName, topicMetadataName, cluster,
+                resolveSystemType(config.getUnityCatalogByolSystemType())));
+    }
+
+    private static String sourceTopic(LakehouseConfiguration config, String fallback) {
+        String logicalName = config.getProperties().getProperty(SourceMetadataProperties.LOGICAL_NAME_PROPERTY);
+        if (StringUtils.isNotBlank(logicalName)) {
+            return logicalName;
+        }
+        String legacyKafkaTopic = config.getProperties().getProperty("lakestream.kafka.topic.name");
+        return StringUtils.defaultIfBlank(legacyKafkaTopic, fallback);
+    }
+
+    private static String unityIcebergNamespace(String cluster, String namespace) {
+        return Stream.of(cluster, namespace)
                 .map(TableNameFormatUtils::formatUnityCatalogIcebergNamespaceName)
                 .reduce((left, right) -> left + "_" + right)
                 .orElseThrow();
-        String tableName = TableNameFormatUtils.formatUnityCatalogIcebergTableName(parsedTopic.getLocalName());
-        String icebergCatalogName = getIcebergUnityCatalogName(config, icebergProps);
-        String tableFullName = icebergCatalogName + "." + ns + "." + tableName;
-        String topicMetadataName = "lakestream_ursa_" + ns + "_" + tableName;
-
-        return Optional.of(new UnityCatalogExternalLineageRequest(
-                topicName, tableFullName, topicMetadataName, cluster,
-                resolveSystemType(config.getUnityCatalogByolSystemType())));
     }
 
     private static String clusterName(LakehouseConfiguration config) {

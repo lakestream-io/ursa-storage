@@ -7,6 +7,7 @@ package io.lakestream.ursa.compact;
 import io.lakestream.api.StreamCatalog;
 import io.lakestream.api.StreamIdentifier;
 import io.lakestream.api.StreamMetadata;
+import io.lakestream.api.materialization.ResolvedMaterialization;
 import io.lakestream.ursa.compact.elect.CompactLeader;
 import io.lakestream.ursa.compact.elect.LeaderElectionService;
 import io.lakestream.ursa.compaction.CompactTaskManager;
@@ -247,6 +248,15 @@ public class CompactionScheduler {
         return metadata == null ? Map.of() : metadata.properties();
     }
 
+    /** Resolves the current catalog destination for cleanup of a stream's managed table. */
+    private Optional<ResolvedMaterialization> lookupMaterialization(String logName) {
+        StreamCatalog catalog = this.streamCatalog;
+        if (catalog == null) {
+            return Optional.empty();
+        }
+        return catalog.resolveMaterialization(CompactionWorker.toStreamIdentifier(logName)).join();
+    }
+
     /**
      * Reflectively loads the {@link CompactionStorageBindings} implementation and constructs it
      * with a single {@code Dependencies} bag. The lakehouse implementation provides a static
@@ -274,7 +284,8 @@ public class CompactionScheduler {
                     publishTaskExecutor,
                     compactedTaskExecutor,
                     commitParquetFileExecutor,
-                    (Function<String, Map<String, String>>) this::lookupStreamProperties);
+                    (Function<String, Map<String, String>>) this::lookupStreamProperties,
+                    (Function<String, Optional<ResolvedMaterialization>>) this::lookupMaterialization);
             Constructor<?> ctor = clazz.getConstructor(depsClass);
             return (CompactionStorageBindings) ctor.newInstance(depsInstance);
         } catch (ReflectiveOperationException e) {

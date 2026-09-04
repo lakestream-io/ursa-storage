@@ -20,6 +20,16 @@ class KafkaSourceMetadataTest {
     }
 
     @Test
+    void sourceLogicalNameTakesPrecedenceOverLegacyKafkaProperty() {
+        assertThat(KafkaSourceMetadata.topicName(
+                        "default/orders-topic-id-RQttf5YgR5-xrS63xWM3FA-partition-3",
+                        Map.of(
+                                KafkaSourceMetadata.LOGICAL_NAME_PROPERTY, "orders",
+                                KafkaSourceMetadata.TOPIC_NAME_PROPERTY, "legacy-orders")))
+                .isEqualTo("orders");
+    }
+
+    @Test
     void directStreamFallbackRemovesNamespaceAndPartitionSuffix() {
         assertThat(KafkaSourceMetadata.topicName("default/orders-partition-3", Map.of()))
                 .isEqualTo("orders");

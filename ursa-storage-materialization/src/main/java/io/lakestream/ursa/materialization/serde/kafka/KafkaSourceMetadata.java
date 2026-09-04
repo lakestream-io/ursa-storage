@@ -4,12 +4,16 @@
  */
 package io.lakestream.ursa.materialization.serde.kafka;
 
+import io.lakestream.api.SourceMetadataProperties;
 import java.util.Map;
 
 /** Metadata that connects a UUID-qualified storage stream to its logical Kafka topic. */
 public final class KafkaSourceMetadata {
 
-    /** Stream property supplied by the Kafka integration for logical topic resolution. */
+    /** Source-neutral stream property supplied by source integrations for logical-name resolution. */
+    public static final String LOGICAL_NAME_PROPERTY = SourceMetadataProperties.LOGICAL_NAME_PROPERTY;
+
+    /** Legacy Kafka-specific stream property retained for existing streams. */
     public static final String TOPIC_NAME_PROPERTY = "lakestream.kafka.topic.name";
 
     private KafkaSourceMetadata() {
@@ -24,6 +28,10 @@ public final class KafkaSourceMetadata {
      */
     public static String topicName(String fallbackStreamName, Map<String, String> streamProperties) {
         if (streamProperties != null) {
+            String logicalName = streamProperties.get(LOGICAL_NAME_PROPERTY);
+            if (logicalName != null && !logicalName.isBlank()) {
+                return logicalName;
+            }
             String topicName = streamProperties.get(TOPIC_NAME_PROPERTY);
             if (topicName != null && !topicName.isBlank()) {
                 return topicName;

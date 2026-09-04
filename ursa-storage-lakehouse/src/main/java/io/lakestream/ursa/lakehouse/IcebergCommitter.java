@@ -12,6 +12,7 @@ import io.lakestream.ursa.lakehouse.iceberg.IcebergCompactStreamTask;
 import io.lakestream.ursa.lakehouse.iceberg.IcebergTable;
 import io.lakestream.ursa.lakehouse.iceberg.TableOptions;
 import io.lakestream.ursa.lakehouse.utils.AvroSchemaUtilExtended;
+import io.lakestream.ursa.lakehouse.utils.StreamTableNaming;
 import io.lakestream.ursa.lakehouse.v2.MessageId;
 import io.lakestream.ursa.lakehouse.writer.ParquetFileStat;
 import java.io.IOException;
@@ -23,6 +24,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Snapshot;
+import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 
 @Slf4j
@@ -46,9 +48,17 @@ public class IcebergCommitter implements LakehouseCommitter {
 
 
     public IcebergCommitter(LakehouseConfiguration config, String parentTopic) {
+        this(config, parentTopic, StreamTableNaming.resolve(parentTopic, config.getProperties()));
+    }
+
+    public IcebergCommitter(
+            LakehouseConfiguration config,
+            String parentTopic,
+            io.lakestream.api.materialization.TableIdentifier resolvedIdentifier) {
         this.config = config;
         this.parentTopic = parentTopic;
-        this.identifier = IcebergTable.getTableIdentifierByTopic(parentTopic, config);
+        this.identifier = TableIdentifier.of(
+                Namespace.of(resolvedIdentifier.namespace()), resolvedIdentifier.name());
         this.icebergTable = new IcebergTable(config, identifier);
         this.lakehouseWriterType = getIcebergCommitType(config);
     }

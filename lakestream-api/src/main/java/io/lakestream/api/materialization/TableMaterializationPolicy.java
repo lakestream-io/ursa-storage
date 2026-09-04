@@ -4,6 +4,7 @@
  */
 package io.lakestream.api.materialization;
 
+import io.lakestream.api.SourceMetadataProperties;
 import io.lakestream.api.StreamIdentifier;
 import java.util.List;
 import java.util.Map;
@@ -95,9 +96,8 @@ public record TableMaterializationPolicy(
     /**
      * Resolves the effective materialization for {@code streamId} by deep-merging
      * the namespace and stream policies, looking up the referenced catalog via
-     * {@code catalogLookup}, and deriving the table identifier from the
-     * stream's explicit override (preferred) or from the namespace's
-     * {@link TableNaming} template.
+     * {@code catalogLookup}, and deriving the table identifier from the stream's explicit override,
+     * the namespace's {@link TableNaming} template, or the mode-specific default.
      *
      * <p>Merge rules (stream wins, namespace as baseline):
      * <ul>
@@ -105,8 +105,10 @@ public record TableMaterializationPolicy(
      *       the stream short-circuits with {@link Optional#empty()}.
      *       Namespace {@code enabled} is intentionally ignored.</li>
      *   <li>{@code catalogRef}: stream-over-namespace; required for resolution.</li>
-     *   <li>{@code tableIdentifier}: stream's explicit value wins; otherwise the
-     *       namespace's {@link TableNaming} is applied to {@code streamId}.</li>
+     *   <li>{@code tableIdentifier}: stream's explicit value wins; otherwise the namespace's
+     *       {@link TableNaming} is applied. With neither configured, managed tables use
+     *       {@code stream.name}; external/custom tables use the source logical name and then fall
+     *       back to {@code stream.name}.</li>
      *   <li>Sub-records ({@code framework}, {@code evolution}, {@code table}):
      *       merged field-by-field with stream-over-namespace semantics.</li>
      *   <li>{@code primaryKey} / {@code partitionBy} / {@code sortBy}: stream's
@@ -127,9 +129,8 @@ public record TableMaterializationPolicy(
      * @param streamPolicy    the stream override (may be empty)
      * @param streamId        the stream being resolved (used for template interpolation)
      * @param catalogLookup   callback returning the named {@link TableCatalog}, or empty
-     * @return the resolved materialization, or {@link Optional#empty()} if the
-     *     stream is not materialized (disabled, no catalog ref, missing catalog,
-     *     or no derivable table identifier)
+     * @return the resolved materialization, or {@link Optional#empty()} if the stream is not
+     *     materialized (disabled, no catalog ref, or missing catalog)
      */
     public static Optional<ResolvedMaterialization> resolve(
             Optional<TableMaterializationPolicy> namespacePolicy,
@@ -142,9 +143,9 @@ public record TableMaterializationPolicy(
     /**
      * Resolves the effective materialization for {@code streamId} by deep-merging
      * the namespace and stream policies, looking up the referenced catalog via
-     * {@code catalogLookup}, and deriving the table identifier from the
-     * stream's explicit override (preferred) or from the namespace's
-     * {@link TableNaming} template applied together with {@code properties}.
+     * {@code catalogLookup}, and deriving the table identifier from the stream's explicit override,
+     * the namespace's {@link TableNaming} template, or the mode-specific default applied together
+     * with {@code properties}.
      *
      * <p>Merge rules (stream wins, namespace as baseline):
      * <ul>
@@ -152,9 +153,11 @@ public record TableMaterializationPolicy(
      *       the stream short-circuits with {@link Optional#empty()}.
      *       Namespace {@code enabled} is intentionally ignored.</li>
      *   <li>{@code catalogRef}: stream-over-namespace; required for resolution.</li>
-     *   <li>{@code tableIdentifier}: stream's explicit value wins; otherwise the
-     *       namespace's {@link TableNaming} is applied to {@code streamId} and
-     *       {@code properties}.</li>
+     *   <li>{@code tableIdentifier}: stream's explicit value wins; otherwise the namespace's
+     *       {@link TableNaming} is applied to {@code streamId} and {@code properties}. With neither
+     *       configured, managed tables use {@code stream.name}; external/custom tables use
+     *       {@link SourceMetadataProperties#LOGICAL_NAME_PROPERTY}, the legacy Kafka topic-name
+     *       property, and finally {@code stream.name}.</li>
      *   <li>Sub-records ({@code framework}, {@code evolution}, {@code table}):
      *       merged field-by-field with stream-over-namespace semantics.</li>
      *   <li>{@code primaryKey} / {@code partitionBy} / {@code sortBy}: stream's
@@ -171,12 +174,10 @@ public record TableMaterializationPolicy(
      * @param streamPolicy    the stream override (may be empty)
      * @param streamId        the stream being resolved (used for template interpolation)
      * @param catalogLookup   callback returning the named {@link TableCatalog}, or empty
-     * @param properties      the stream's properties, consulted by the namespace's
-     *                        {@link TableNaming} template for {@code ${stream.property.<key>}}
-     *                        variables
-     * @return the resolved materialization, or {@link Optional#empty()} if the
-     *     stream is not materialized (disabled, no catalog ref, missing catalog,
-     *     or no derivable table identifier)
+     * @param properties      the stream's properties, consulted by naming templates and the
+     *                        external/custom table-name default
+     * @return the resolved materialization, or {@link Optional#empty()} if the stream is not
+     *     materialized (disabled, no catalog ref, or missing catalog)
      */
     public static Optional<ResolvedMaterialization> resolve(
             Optional<TableMaterializationPolicy> namespacePolicy,
@@ -209,16 +210,22 @@ public record TableMaterializationPolicy(
             return Optional.empty();
         }
 
-        // Effective table identifier: stream's explicit value wins, otherwise
-        // derive from namespace.tableNaming(); if neither path produces one,
-        // the stream cannot be materialized.
+        Optional<TableConf> effectiveTable = mergeTable(stream.table(), namespace.table());
+
+        // Effective table identifier: an explicit stream value wins, then namespace naming. With
+        // neither configured, keep Ursa-managed tables tied to the storage stream identity while
+        // delivered tables use the source's stable logical name (Kafka topic, Pulsar topic, etc.).
         Optional<TableIdentifier> effectiveTableIdentifier = stream.tableIdentifier();
         if (effectiveTableIdentifier.isEmpty()) {
             effectiveTableIdentifier = namespace.tableNaming()
                     .map(naming -> naming.toTableIdentifier(streamId, properties));
         }
         if (effectiveTableIdentifier.isEmpty()) {
-            return Optional.empty();
+            TableMode mode = effectiveTable.flatMap(TableConf::mode).orElse(TableMode.MANAGED);
+            String tableName = mode == TableMode.MANAGED
+                    ? streamId.name()
+                    : SourceMetadataProperties.logicalName(streamId, properties);
+            effectiveTableIdentifier = Optional.of(new TableIdentifier(streamId.namespace(), tableName));
         }
 
         // Build the merged effective policy. tableNaming is namespace-only;
@@ -232,7 +239,7 @@ public record TableMaterializationPolicy(
                 mergeEvolution(stream.evolution(), namespace.evolution()),
                 pick(stream.primaryKey(), namespace.primaryKey()),
                 pick(stream.baseSchemaVersion(), namespace.baseSchemaVersion()),
-                mergeTable(stream.table(), namespace.table()),
+                effectiveTable,
                 stream.connectionOverrides());
 
         return Optional.of(new ResolvedMaterialization(

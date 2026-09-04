@@ -14,7 +14,7 @@ import io.lakestream.ursa.lakehouse.delta.ExternalDeltaTable;
 import io.lakestream.ursa.lakehouse.delta.ExternalDeltaTableFactory;
 import io.lakestream.ursa.lakehouse.delta.GenericRow;
 import io.lakestream.ursa.lakehouse.delta.ParquetRowWriter;
-import io.lakestream.ursa.lakehouse.utils.TopicName;
+import io.lakestream.ursa.lakehouse.utils.StreamTableNaming;
 import io.lakestream.ursa.lakehouse.v2.AbstractLakehouseWriter;
 import io.lakestream.ursa.lakehouse.v2.IWriteResult;
 import io.lakestream.ursa.materialization.serde.EntrySerdeFactory;
@@ -75,7 +75,8 @@ public class DeltaExternalTableWriter extends AbstractLakehouseWriter {
             partitionKeys = Arrays.asList(Arrays.stream(partitionKey.split(","))
                 .map(String::strip).toArray(String[]::new));
         }
-        this.parentTopic = TopicName.get(topic).getPartitionedTopicName();
+        this.parentTopic = StreamTableNaming.qualifiedName(
+                StreamTableNaming.resolveForWriter(topic, config.getProperties()));
         this.deltaTable = ExternalDeltaTableFactory.getDeltaTable(config, parentTopic);
         this.isSchemaEvolutionEnabled = config.isSchemaEvolutionEnabled();
         if (isSchemaEvolutionEnabled) {

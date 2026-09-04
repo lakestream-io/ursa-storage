@@ -7,12 +7,14 @@ package io.lakestream.ursa.lakehouse.compact;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.AtomicDouble;
+import io.lakestream.api.materialization.TableMode;
 import io.lakestream.ursa.compaction.CompactTaskManager;
 import io.lakestream.ursa.compaction.metrics.CompactionMetrics;
 import io.lakestream.ursa.compaction.task.CompactStreamTask;
 import io.lakestream.ursa.exception.ExceptionCode;
 import io.lakestream.ursa.exception.ExceptionWithCode;
 import io.lakestream.ursa.exception.RuntimeExceptionWithCode;
+import io.lakestream.ursa.lakehouse.utils.StreamTableNaming;
 import io.lakestream.ursa.lakehouse.v2.IWriteResult;
 import io.lakestream.ursa.lakehouse.v2.LakehouseFactory;
 import io.lakestream.ursa.lakehouse.v2.LakehouseRecordWriter;
@@ -24,7 +26,9 @@ import io.opentelemetry.api.common.AttributesBuilder;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
@@ -101,6 +105,19 @@ public class LakehouseCompactionWorker implements CompactionTaskProcessor {
                      entryReaderOptions)) {
             managedWriter = lakehouseFactory.getManagedWriter(topic, propertiesForWriter);
             externalWriter = lakehouseFactory.getExternalWriter(topic, propertiesForWriter);
+            if (externalWriter.isPresent()) {
+                // Legacy workers create writers before policy resolution. Resolve the SDT destination
+                // now and persist it on the task so the asynchronous committer uses the same identity.
+                // Do this only after constructing the SBT writer so SDT naming cannot affect its path.
+                Properties namingProperties = new Properties();
+                namingProperties.putAll(propertiesForWriter);
+                Map<String, String> resolvedProperties = StreamTableNaming.withResolvedTableIdentifier(
+                        propertiesForWriter,
+                        StreamTableNaming.resolveForWriter(topic, namingProperties, TableMode.EXTERNAL));
+                propertiesForWriter.clear();
+                propertiesForWriter.putAll(resolvedProperties);
+                task.setProperties(resolvedProperties);
+            }
             dltWriter = externalWriter.flatMap(writer -> {
                 Optional<LakehouseRecordWriter<FailureMessage>> candidate =
                         lakehouseFactory.getExternalDLTWriter(topic, propertiesForWriter);

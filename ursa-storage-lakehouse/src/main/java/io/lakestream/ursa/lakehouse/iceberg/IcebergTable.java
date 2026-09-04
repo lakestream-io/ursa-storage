@@ -1386,13 +1386,13 @@ public class IcebergTable {
     /**
      * Resolves the table for {@code topic}, the one way table identity is derived.
      *
-     * <p>Both sides of materialization ask here - the writer that creates the table and the commit
-     * runner that adds snapshots to it - so a deployment that renames its tables moves them together.
-     * A second derivation that skipped the configuration would put the two back out of step, and the
-     * symptom is silent: data files land in the warehouse and no snapshot ever references them.
+     * <p>Writers resolve through {@link StreamTableNaming#resolveForWriter}; new tasks persist that
+     * result for committers. A second derivation that skipped the configuration would put them out of
+     * step, and the symptom is silent: data files land in the warehouse and no snapshot ever
+     * references them.
      */
     public static TableIdentifier getTableIdentifierByTopic(String topic, LakehouseConfiguration config) {
-        return toIceberg(StreamTableNaming.resolve(topic, config.getProperties()));
+        return toIceberg(StreamTableNaming.resolveForWriter(topic, config.getProperties()));
     }
 
     private static TableIdentifier toIceberg(io.lakestream.api.materialization.TableIdentifier identifier) {

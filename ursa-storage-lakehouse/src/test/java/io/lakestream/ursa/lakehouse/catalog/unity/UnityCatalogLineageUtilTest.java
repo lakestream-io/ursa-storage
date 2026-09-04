@@ -7,7 +7,10 @@ package io.lakestream.ursa.lakehouse.catalog.unity;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.lakestream.api.SourceMetadataProperties;
+import io.lakestream.api.materialization.TableIdentifier;
 import io.lakestream.ursa.lakehouse.LakehouseConfiguration;
+import io.lakestream.ursa.lakehouse.utils.StreamTableNaming;
 import java.util.List;
 import java.util.Optional;
 import java.util.Properties;
@@ -61,6 +64,36 @@ public class UnityCatalogLineageUtilTest {
         assertEquals("catalog-a.cluster_ns.table", request.getTableFullName());
         assertEquals("lakestream_ursa_cluster_ns_table", request.getTopicMetadataName());
         assertEquals("cluster", request.getClusterName());
+    }
+
+    @Test
+    void testResolvedTableAndLogicalSourceDriveLineageIndependently() {
+        Properties properties = new Properties();
+        properties.put("unityCatalogName", "uc-main");
+        properties.put("clusterName", "cluster");
+        properties.put("unityCatalogByolSystemType", "KAFKA");
+        properties.put("lakehouseType", "DELTA_AND_ICEBERG");
+        properties.put("iceberg.catalog.alpha.catalog-backend", "UNITYCATALOG");
+        properties.put("iceberg.catalog.alpha.uri", "https://workspace/api/2.1/unity-catalog/iceberg-rest");
+        properties.put("iceberg.catalog.alpha.warehouse", "catalog-a");
+        properties.put(SourceMetadataProperties.LOGICAL_NAME_PROPERTY, "orders");
+        StreamTableNaming.applyResolvedTableIdentifier(
+                properties, new TableIdentifier("analytics", "orders_archive"));
+        LakehouseConfiguration config = new LakehouseConfiguration(properties);
+
+        List<UnityCatalogExternalLineageRequest> requests = UnityCatalogLineageUtil.buildRequests(
+                config, "default/orders-topic-id-abc-partition-0", Optional.of("alpha"));
+
+        assertEquals(2, requests.size());
+        assertTrue(requests.stream().allMatch(r -> "orders".equals(r.getTopicName())));
+        assertTrue(requests.stream().anyMatch(r ->
+                "uc-main.analytics.orders_archive".equals(r.getTableFullName())));
+        assertTrue(requests.stream().anyMatch(r ->
+                "catalog-a.cluster_analytics.orders_archive".equals(r.getTableFullName())));
+        assertTrue(requests.stream().anyMatch(r ->
+                "lakestream_ursa_default_orders".equals(r.getTopicMetadataName())));
+        assertTrue(requests.stream().anyMatch(r ->
+                "lakestream_ursa_cluster_default_orders".equals(r.getTopicMetadataName())));
     }
 
     @Test

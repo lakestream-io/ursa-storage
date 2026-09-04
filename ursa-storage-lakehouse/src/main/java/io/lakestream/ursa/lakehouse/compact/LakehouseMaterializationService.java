@@ -11,12 +11,14 @@ import io.lakestream.api.materialization.ResolvedMaterialization;
 import io.lakestream.api.materialization.TableCatalog;
 import io.lakestream.api.materialization.TableCatalogType;
 import io.lakestream.api.materialization.TableMaterializationPolicy;
+import io.lakestream.api.materialization.TableMode;
 import io.lakestream.ursa.compaction.CompactTaskManager;
 import io.lakestream.ursa.compaction.metrics.CompactionMetrics;
 import io.lakestream.ursa.compaction.task.CompactStreamTask;
 import io.lakestream.ursa.exception.ExceptionCode;
 import io.lakestream.ursa.exception.ExceptionWithCode;
 import io.lakestream.ursa.lakehouse.LakehouseConfiguration;
+import io.lakestream.ursa.lakehouse.utils.StreamTableNaming;
 import io.lakestream.ursa.lakehouse.v2.AbstractLakehouseWriter;
 import io.lakestream.ursa.lakehouse.v2.IWriteResult;
 import io.lakestream.ursa.lakehouse.v2.LakehouseFactory;
@@ -160,12 +162,13 @@ public class LakehouseMaterializationService implements MaterializationService {
         TableCatalog catalog = resolved.catalog();
         TableCatalogType catalogType = catalog.type();
         // A NONE catalog marks a managed-only (SBT / Ursa-protocol) materialization: SDT is disabled and
-        // no external table is configured, so only the internal managed Compacted-Object writer runs.
-        // There is no external factory for it. Any other type must have a registered factory for the
-        // external (SDT) sink.
-        boolean externalSink = catalogType != TableCatalogType.NONE;
-        TableMaterializerFactory factory = externalSink ? factories.get(catalogType) : null;
-        if (externalSink && factory == null) {
+        // no catalog-visible table is configured, so only the internal managed Compacted-Object writer
+        // runs. Any other type must have a registered factory for its catalog sink.
+        boolean catalogSink = catalogType != TableCatalogType.NONE;
+        boolean factoryOwnsManagedTable = catalogSink
+                && effectiveTableMode(resolved.effectivePolicy()) == TableMode.MANAGED;
+        TableMaterializerFactory factory = catalogSink ? factories.get(catalogType) : null;
+        if (catalogSink && factory == null) {
             String reason = "No TableMaterializerFactory registered for catalog type " + catalogType;
             runtime.metrics().recordSchemaEvolutionRejected(
                     catalog.name(), catalogType, streamId, reason);
@@ -196,9 +199,10 @@ public class LakehouseMaterializationService implements MaterializationService {
         try {
             Map<String, String> effectiveWriterProperties =
                     writerProperties(sourceTaskProperties, streamMetadata);
-            if (externalSink) {
-                MaterializationRuntime writerRuntime = runtime.withTaskProperties(
-                        effectiveWriterProperties);
+            if (catalogSink) {
+                Map<String, String> factoryProperties = new HashMap<>(effectiveWriterProperties);
+                factoryProperties.put(MaterializationRuntime.SOURCE_TOPIC_PROPERTY, task.sourceTopic());
+                MaterializationRuntime writerRuntime = runtime.withTaskProperties(factoryProperties);
                 TableMaterializer<?> materializer = factory.create(
                         resolved.effectivePolicy(), catalog, streamMetadata, writerRuntime);
                 materializers.add(materializer);
@@ -207,8 +211,12 @@ public class LakehouseMaterializationService implements MaterializationService {
                 // opening a reader or writing data.
                 ensureOpen();
             }
-            buildManagedMaterializer(task, task.sourceTopic(), effectiveWriterProperties)
-                    .ifPresent(materializers::add);
+            // A MANAGED catalog materializer is the SBT writer. Adding the standalone managed
+            // writer as well would create a second SBT output and write every record twice.
+            if (!factoryOwnsManagedTable) {
+                buildManagedMaterializer(task, task.sourceTopic(), effectiveWriterProperties)
+                        .ifPresent(materializers::add);
+            }
             ensureOpen();
             if (materializers.isEmpty()) {
                 throw new MaterializationException(ExceptionCode.INTERNAL_ERROR,
@@ -220,6 +228,13 @@ public class LakehouseMaterializationService implements MaterializationService {
             runtime.metrics().recordWritten(catalog.name(), catalogType, streamId);
             log.info("Committed task {} in MaterializationService for stream {}: {}",
                 task.sourceTopic(), streamId.fullName(), result);
+            // A group committer runs asynchronously and no longer has ResolvedMaterialization. Carry
+            // the exact destination on the task so it commits the files to the table the writer used.
+            if (catalogSink && task.sourceTask() != null) {
+                CompactStreamTask sourceTask = task.sourceTask();
+                sourceTask.setProperties(withResolvedMaterialization(
+                        sourceTask.getProperties(), resolved));
+            }
             // Persist (group-commit) or retire the compaction task from the committed materializers' write results.
             completeTask(materializers, task);
         } catch (MaterializationException e) {
@@ -394,6 +409,27 @@ public class LakehouseMaterializationService implements MaterializationService {
         }
     }
 
+    private static TableMode effectiveTableMode(TableMaterializationPolicy policy) {
+        return policy.table().flatMap(table -> table.mode()).orElse(TableMode.MANAGED);
+    }
+
+    /** Persists the dispatch and table identity needed by the asynchronous group committer. */
+    private static Map<String, String> withResolvedMaterialization(
+            Map<String, String> properties, ResolvedMaterialization resolved) {
+        Map<String, String> result = new HashMap<>(StreamTableNaming.withResolvedTableIdentifier(
+                properties, resolved.tableIdentifier()));
+        result.put(LakehouseConfiguration.STREAM_TABLE_MODE,
+                effectiveTableMode(resolved.effectivePolicy()).name());
+        result.put(LakehouseConfiguration.CATALOG_NAME, resolved.catalog().name());
+        String lakehouseType = switch (resolved.catalog().type()) {
+            case ICEBERG -> LakehouseConfiguration.LakehouseType.ICEBERG.name();
+            case DELTA, DELTA_UC -> LakehouseConfiguration.LakehouseType.DELTA.name();
+            case CLICKHOUSE, NONE -> LakehouseConfiguration.LakehouseType.NONE.name();
+        };
+        result.put("lakehouseType", lakehouseType);
+        return Map.copyOf(result);
+    }
+
     private static EvolutionPolicy evolutionPolicyFor(TableCatalogType catalogType) {
         return switch (catalogType) {
             case DELTA, DELTA_UC -> EvolutionPolicy.forDelta();
@@ -546,6 +582,10 @@ public class LakehouseMaterializationService implements MaterializationService {
         }
         Map<String, String> merged = new HashMap<>(streamProperties);
         merged.putAll(taskProperties);
+        String logicalSourceName = streamProperties.get(KafkaSourceMetadata.LOGICAL_NAME_PROPERTY);
+        if (logicalSourceName != null) {
+            merged.put(KafkaSourceMetadata.LOGICAL_NAME_PROPERTY, logicalSourceName);
+        }
         String logicalKafkaTopic = streamProperties.get(KafkaSourceMetadata.TOPIC_NAME_PROPERTY);
         if (logicalKafkaTopic != null) {
             merged.put(KafkaSourceMetadata.TOPIC_NAME_PROPERTY, logicalKafkaTopic);

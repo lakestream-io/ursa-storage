@@ -11,6 +11,7 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.lakestream.api.SourceMetadataProperties;
 import io.lakestream.api.StreamIdentifier;
 import java.util.Map;
 import java.util.Optional;
@@ -18,8 +19,8 @@ import org.junit.jupiter.api.Test;
 
 /**
  * Construction, equality and interpolation rules for {@link TableNaming}: the
- * {@code ${stream.namespace}} / {@code ${stream.name}} / {@code ${stream.property.<key>}}
- * variables, and the prefix vs. derived-namespace fallback.
+ * {@code ${stream.namespace}} / {@code ${stream.name}} / {@code ${stream.logicalName}} /
+ * {@code ${stream.property.<key>}} variables, and the prefix vs. derived-namespace fallback.
  */
 class TableNamingTest {
 
@@ -69,6 +70,36 @@ class TableNamingTest {
             Map.of("lakestream.kafka.topic.name", "orders"));
         assertEquals("orders_v1", table.name());
         assertEquals("default", table.namespace());
+    }
+
+    @Test
+    void interpolatesSourceLogicalName() {
+        TableNaming naming = new TableNaming(Optional.empty(), "${stream.logicalName}");
+        StreamIdentifier stream = StreamIdentifier.of("default", "orders-incarnation-abc");
+
+        TableIdentifier table = naming.toTableIdentifier(stream,
+                Map.of(SourceMetadataProperties.LOGICAL_NAME_PROPERTY, "orders"));
+
+        assertThat(table).isEqualTo(new TableIdentifier("default", "orders"));
+    }
+
+    @Test
+    void logicalNameSupportsExistingKafkaMetadata() {
+        TableNaming naming = new TableNaming(Optional.empty(), "${stream.logicalName}");
+        StreamIdentifier stream = StreamIdentifier.of("default", "orders-topic-id-abc");
+
+        TableIdentifier table = naming.toTableIdentifier(
+                stream, Map.of("lakestream.kafka.topic.name", "orders"));
+
+        assertThat(table.name()).isEqualTo("orders");
+    }
+
+    @Test
+    void logicalNameFallsBackToStorageStreamName() {
+        TableNaming naming = new TableNaming(Optional.empty(), "${stream.logicalName}");
+        StreamIdentifier stream = StreamIdentifier.of("default", "native-stream");
+
+        assertThat(naming.toTableIdentifier(stream, Map.of()).name()).isEqualTo("native-stream");
     }
 
     @Test

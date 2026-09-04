@@ -4,13 +4,13 @@
  */
 package io.lakestream.ursa.lakehouse.v2;
 
-import io.lakestream.api.StreamIdentifier;
 import io.lakestream.api.StreamMetadata;
 import io.lakestream.api.materialization.TableCatalog;
 import io.lakestream.api.materialization.TableCatalogType;
 import io.lakestream.api.materialization.TableMaterializationPolicy;
 import io.lakestream.api.materialization.TableMode;
 import io.lakestream.ursa.compaction.DynamicConfigs;
+import io.lakestream.ursa.exception.ExceptionCode;
 import io.lakestream.ursa.lakehouse.LakehouseConfiguration;
 import io.lakestream.ursa.lakehouse.compact.FailureMessage;
 import io.lakestream.ursa.lakehouse.utils.StreamTableNaming;
@@ -31,7 +31,7 @@ import java.util.Optional;
 import java.util.Properties;
 
 /**
- * Package-private helper that wires a {@link TableCatalog} + {@link TableMaterializationPolicy}
+ * Shared adapter that wires a {@link TableCatalog} + {@link TableMaterializationPolicy}
  * into the underlying {@link AbstractLakehouseWriter} appropriate for the requested
  * {@link TableCatalogType}.
  *
@@ -46,7 +46,7 @@ import java.util.Properties;
  * <p>This is an explicit T8 trade-off: T8 lands the adapter; refactoring
  * {@code LakehouseConfiguration} to consume {@code TableCatalog} natively belongs to T9.
  */
-final class LakehouseWriterFactory {
+public final class LakehouseWriterFactory {
 
     /** Namespace of the properties a stream source records about itself, such as its Kafka topic name. */
     private static final String STREAM_PROPERTY_PREFIX = "lakestream.";
@@ -56,8 +56,11 @@ final class LakehouseWriterFactory {
 
     /**
      * Builds an Iceberg writer. {@link TableMode#MANAGED} maps to
-     * {@link IcebergManagedTableWriter}; {@link TableMode#EXTERNAL} (and {@link TableMode#CUSTOM}
-     * for now) maps to {@link IcebergExternalTableWriter}.
+     * {@link IcebergManagedTableWriter}; its writer topic remains the incarnation-scoped partition
+     * log so SBT paths and partition metadata never depend on the catalog table identifier, while
+     * the resolved identifier is carried separately in {@link LakehouseConfiguration}.
+     * {@link TableMode#EXTERNAL} (and {@link TableMode#CUSTOM} for now) maps to
+     * {@link IcebergExternalTableWriter} using the resolved SDT identifier directly.
      */
     static AbstractLakehouseWriter iceberg(TableMaterializationPolicy policy,
                                            TableCatalog catalog,
@@ -66,22 +69,23 @@ final class LakehouseWriterFactory {
         requireNonNullArgs(policy, catalog, streamMetadata, runtime);
         if (catalog.type() != TableCatalogType.ICEBERG) {
             throw new MaterializationException(
-                    io.lakestream.ursa.exception.ExceptionCode.LAKEHOUSE_CREATE_TABLE_WRITER_ERROR,
+                    ExceptionCode.LAKEHOUSE_CREATE_TABLE_WRITER_ERROR,
                     "Expected ICEBERG catalog type but got " + catalog.type());
         }
         LakehouseConfiguration config =
                 buildConfiguration(catalog, policy, "iceberg", runtime.taskProperties());
         EntrySerdeFactory serdeFactory = new EntrySerdeFactory((SchemaService) runtime.schemaService());
         InstrumentProvider provider = InstrumentProvider.NOOP;
-        String topic = destinationTopic(streamMetadata);
+        String destinationTopic = destinationTopic(policy, streamMetadata);
         String schemaTopic = schemaTopic(streamMetadata, runtime.taskProperties());
 
         TableMode mode = effectiveMode(policy);
         return switch (mode) {
             case MANAGED -> new IcebergManagedTableWriter(
-                    topic, schemaTopic, serdeFactory, config, provider);
-            case EXTERNAL, CUSTOM ->
-                    new IcebergExternalTableWriter(topic, schemaTopic, serdeFactory, config, provider);
+                    sourceTopic(streamMetadata, runtime.taskProperties()), schemaTopic,
+                    serdeFactory, config, provider);
+            case EXTERNAL, CUSTOM -> new IcebergExternalTableWriter(
+                    destinationTopic, schemaTopic, serdeFactory, config, provider);
         };
     }
 
@@ -97,13 +101,13 @@ final class LakehouseWriterFactory {
         requireNonNullArgs(policy, catalog, streamMetadata, runtime);
         if (catalog.type() != TableCatalogType.DELTA) {
             throw new MaterializationException(
-                    io.lakestream.ursa.exception.ExceptionCode.LAKEHOUSE_CREATE_TABLE_WRITER_ERROR,
+                    ExceptionCode.LAKEHOUSE_CREATE_TABLE_WRITER_ERROR,
                     "Expected DELTA catalog type but got " + catalog.type());
         }
         LakehouseConfiguration config =
                 buildConfiguration(catalog, policy, "delta", runtime.taskProperties());
         EntrySerdeFactory serdeFactory = new EntrySerdeFactory((SchemaService) runtime.schemaService());
-        String destinationTopic = destinationTopic(streamMetadata);
+        String destinationTopic = destinationTopic(policy, streamMetadata);
         return new DeltaExternalTableWriter(
                 destinationTopic,
                 schemaTopic(streamMetadata, runtime.taskProperties()),
@@ -118,13 +122,13 @@ final class LakehouseWriterFactory {
         requireNonNullArgs(policy, catalog, streamMetadata, runtime);
         if (catalog.type() != TableCatalogType.DELTA_UC) {
             throw new MaterializationException(
-                    io.lakestream.ursa.exception.ExceptionCode.LAKEHOUSE_CREATE_TABLE_WRITER_ERROR,
+                    ExceptionCode.LAKEHOUSE_CREATE_TABLE_WRITER_ERROR,
                     "Expected DELTA_UC catalog type but got " + catalog.type());
         }
         LakehouseConfiguration config =
                 buildConfiguration(catalog, policy, "delta", runtime.taskProperties());
         EntrySerdeFactory serdeFactory = new EntrySerdeFactory((SchemaService) runtime.schemaService());
-        String destinationTopic = destinationTopic(streamMetadata);
+        String destinationTopic = destinationTopic(policy, streamMetadata);
         return new DeltaExternalTableWriter(
                 destinationTopic,
                 schemaTopic(streamMetadata, runtime.taskProperties()),
@@ -147,7 +151,7 @@ final class LakehouseWriterFactory {
             return Optional.empty();
         }
         LakehouseConfiguration config = buildConfiguration(catalog, policy, prefix, taskProperties);
-        String topic = destinationTopic(streamMetadata);
+        String topic = destinationTopic(policy, streamMetadata);
         InstrumentProvider provider = InstrumentProvider.NOOP;
         return switch (config.getLakehouseType()) {
             case ICEBERG -> Optional.of(new IcebergExternalDLTTableWriter(topic, config, provider));
@@ -171,10 +175,10 @@ final class LakehouseWriterFactory {
      * The catalog name is recorded under {@code catalog.name} so
      * {@link LakehouseConfiguration#getCatalogName()} resolves correctly.
      */
-    static LakehouseConfiguration buildConfiguration(TableCatalog catalog,
-                                                     TableMaterializationPolicy policy,
-                                                     String prefix,
-                                                     Map<String, String> taskProperties) {
+    public static LakehouseConfiguration buildConfiguration(TableCatalog catalog,
+                                                             TableMaterializationPolicy policy,
+                                                             String prefix,
+                                                             Map<String, String> taskProperties) {
         Objects.requireNonNull(catalog, "catalog");
         Objects.requireNonNull(policy, "policy");
         Objects.requireNonNull(prefix, "prefix");
@@ -215,19 +219,11 @@ final class LakehouseWriterFactory {
     }
 
     /**
-     * Projects the task's legacy {@link DynamicConfigs} (carried in the per-task compaction properties)
-     * onto the flat {@link LakehouseConfiguration} keys the writers read: {@code catalog.name}
-     * ({@code sdtCatalogName}), {@code identifierFields}, {@code partitionKey}, {@code upsertMode}
-     * ({@code upsertModeEnabled}), and {@code base.schema.version} ({@code baseSchemaVersion}). Applied
-     * last so per-task values win over the catalog/policy-derived configuration.
-     */
-    /**
-     * Carries the policy's table naming down to the writer.
+     * Carries the policy's final table identity down to the writer.
      *
-     * <p>The policy decides what a stream's table is called, but the writer resolves that name through
-     * {@code StreamTableNaming}, the same resolver the commit runner uses - one rule, so the table the
-     * writer creates is the table the commit runner adds snapshots to. Project the template and the
-     * stream properties a template may interpolate onto the flat keys that resolver reads.
+     * <p>The resolved identifier is authoritative. The template and source properties are retained
+     * only for compatibility with writer code and tasks created before resolved identifiers were
+     * persisted.
      *
      * <p>Only {@code lakestream.}-prefixed stream properties are projected: they are the ones a stream
      * source records about itself, and copying the whole task bag would leak storage configuration into
@@ -240,16 +236,25 @@ final class LakehouseWriterFactory {
         policy.tableNaming().ifPresent(naming ->
                 properties.setProperty(StreamTableNaming.TABLE_NAME_TEMPLATE_PROPERTY,
                         naming.tableNameTemplate()));
-        if (taskProperties == null) {
-            return;
-        }
-        for (Map.Entry<String, String> entry : taskProperties.entrySet()) {
-            if (entry.getKey().startsWith(STREAM_PROPERTY_PREFIX)) {
-                properties.setProperty(entry.getKey(), entry.getValue());
+        if (taskProperties != null) {
+            for (Map.Entry<String, String> entry : taskProperties.entrySet()) {
+                if (entry.getKey().startsWith(STREAM_PROPERTY_PREFIX)) {
+                    properties.setProperty(entry.getKey(), entry.getValue());
+                }
             }
         }
+        policy.tableIdentifier().ifPresent(identifier ->
+                StreamTableNaming.applyResolvedTableIdentifier(properties, identifier));
     }
 
+    /**
+     * Projects the task's legacy {@link DynamicConfigs} (carried in the per-task compaction properties)
+     * onto the flat {@link LakehouseConfiguration} keys the writers read: {@code catalog.name}
+     * ({@code sdtCatalogName}), {@code identifierFields}, {@code partitionKey}, {@code upsertMode}
+     * ({@code upsertModeEnabled}), and {@code base.schema.version} ({@code baseSchemaVersion}). These
+     * values override their catalog/policy-derived equivalents; final table identity is projected
+     * separately afterward.
+     */
     private static void applyTaskPropertyOverrides(Properties properties, Map<String, String> taskProperties) {
         if (taskProperties == null || taskProperties.isEmpty()) {
             return;
@@ -285,13 +290,25 @@ final class LakehouseWriterFactory {
                 .orElse(TableMode.MANAGED);
     }
 
-    static String destinationTopic(StreamMetadata streamMetadata) {
-        StreamIdentifier id = streamMetadata.identifier();
-        return id.fullName();
+    static String destinationTopic(
+            TableMaterializationPolicy policy, StreamMetadata streamMetadata) {
+        return policy.tableIdentifier()
+                .map(StreamTableNaming::qualifiedName)
+                .orElseThrow(() -> new MaterializationException(
+                        ExceptionCode.INTERNAL_ERROR,
+                        "Resolved policy for stream " + streamMetadata.identifier().fullName()
+                                + " has no table identifier"));
     }
 
     static String schemaTopic(StreamMetadata streamMetadata, Map<String, String> streamProperties) {
-        return KafkaSourceMetadata.topicName(destinationTopic(streamMetadata), streamProperties);
+        return KafkaSourceMetadata.topicName(streamMetadata.identifier().fullName(), streamProperties);
+    }
+
+    static String sourceTopic(StreamMetadata streamMetadata, Map<String, String> taskProperties) {
+        String sourceTopic = taskProperties.get(MaterializationRuntime.SOURCE_TOPIC_PROPERTY);
+        return sourceTopic == null || sourceTopic.isBlank()
+                ? streamMetadata.identifier().fullName()
+                : sourceTopic;
     }
 
     private static void requireNonNullArgs(TableMaterializationPolicy policy,

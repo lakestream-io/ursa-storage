@@ -16,6 +16,7 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import io.lakestream.api.materialization.TableIdentifier;
 import io.lakestream.ursa.exception.ExceptionCode;
 import io.lakestream.ursa.exception.LakehouseOptException;
 import io.lakestream.ursa.lakehouse.LakehouseConfiguration;
@@ -24,6 +25,7 @@ import io.lakestream.ursa.lakehouse.delta.DirectExternalTable;
 import io.lakestream.ursa.lakehouse.delta.ExternalDeltaTable;
 import io.lakestream.ursa.lakehouse.delta.GenericRow;
 import io.lakestream.ursa.lakehouse.delta.ParquetRowWriter;
+import io.lakestream.ursa.lakehouse.utils.StreamTableNaming;
 import io.lakestream.ursa.lakehouse.v2.IWriteResult;
 import io.lakestream.ursa.lakehouse.writer.ParquetFileStat;
 import io.lakestream.ursa.metrics.InstrumentProvider;
@@ -67,6 +69,18 @@ public class DeltaExternalDLTTableWriterTest {
         lenient().when(config.getProperties()).thenReturn(new Properties());
         lenient().when(config.getStreamTableMode()).thenReturn(LakehouseConfiguration.StreamTableMode.EXTERNAL);
         writer = new DeltaExternalDLTTableWriter(topic, config, instrumentProvider);
+    }
+
+    @Test
+    void resolvedTableIdentityIsUsedForTheDltWithoutParsingItsNameAsALog() {
+        Properties properties = new Properties();
+        StreamTableNaming.applyResolvedTableIdentifier(
+                properties, new TableIdentifier("analytics", "orders-partition-0"));
+        when(config.getProperties()).thenReturn(properties);
+
+        writer = new DeltaExternalDLTTableWriter(topic, config, instrumentProvider);
+
+        assertEquals("analytics/orders-partition-0_dlt", writer.getDeltaTable().getParentTopic());
     }
 
     @Test

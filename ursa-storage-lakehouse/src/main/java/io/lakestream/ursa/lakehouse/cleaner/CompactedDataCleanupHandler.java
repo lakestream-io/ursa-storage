@@ -7,9 +7,13 @@ package io.lakestream.ursa.lakehouse.cleaner;
 import com.google.common.annotations.VisibleForTesting;
 import io.lakestream.api.EntryIndex;
 import io.lakestream.api.Position;
+import io.lakestream.api.materialization.ResolvedMaterialization;
+import io.lakestream.api.materialization.TableCatalogType;
+import io.lakestream.api.materialization.TableMode;
 import io.lakestream.ursa.lakehouse.LakehouseCommitter;
 import io.lakestream.ursa.lakehouse.LakehouseConfiguration;
 import io.lakestream.ursa.lakehouse.exception.LakehouseException;
+import io.lakestream.ursa.lakehouse.v2.LakehouseWriterFactory;
 import io.lakestream.ursa.lakehouse.writer.ParquetFileStat;
 import io.lakestream.ursa.storage.FileStorage;
 import io.lakestream.ursa.storage.StorageApi;
@@ -21,6 +25,7 @@ import java.util.Collections;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -30,6 +35,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
 
@@ -61,6 +67,7 @@ public class CompactedDataCleanupHandler implements StartStopRunner {
     private final StorageApi storage;
     private final FileStorage fileStorage;
     private final ExecutorService executor;
+    private final Function<String, Optional<ResolvedMaterialization>> materializationLookup;
     private static final int MAX_FILES_PER_TASK = 1000;
     private static final long INFLIGHT_DRAIN_TIMEOUT_SECS = 60L;
 
@@ -81,9 +88,27 @@ public class CompactedDataCleanupHandler implements StartStopRunner {
      * @param fileStorage The file storage API for deleting files from cloud storage.
      */
     public CompactedDataCleanupHandler(StorageConfig config, StorageApi storage, FileStorage fileStorage) {
+        this(config, storage, fileStorage, null);
+    }
+
+    /**
+     * Constructs a cleanup handler that can resolve per-stream catalog policies.
+     *
+     * @param config                storage and legacy lakehouse configuration
+     * @param storage               storage API used to read and delete indexes
+     * @param fileStorage           compacted-object storage
+     * @param materializationLookup current resolved materialization by canonical stream/log name,
+     *                              or {@code null} for legacy config-only deployments
+     */
+    public CompactedDataCleanupHandler(
+            StorageConfig config,
+            StorageApi storage,
+            FileStorage fileStorage,
+            Function<String, Optional<ResolvedMaterialization>> materializationLookup) {
         this.config = config;
         this.storage = storage;
         this.fileStorage = fileStorage;
+        this.materializationLookup = materializationLookup;
         this.executor = Executors.newFixedThreadPool(config.getCompactedDataCleanupThreadNum(),
                 new DefaultThreadFactory("ursa-compacted-data-cleanup"));
     }
@@ -100,12 +125,52 @@ public class CompactedDataCleanupHandler implements StartStopRunner {
      */
     @VisibleForTesting
     List<LakehouseCommitter> getLakeHouseCommitters(TopicCleanupTask task) {
-        var lakehouseConfig = new LakehouseConfiguration(config.getProperties());
-        if (lakehouseConfig.getStreamTableMode() == LakehouseConfiguration.StreamTableMode.EXTERNAL) {
-            // For external tables, we don't need to commit deletions to the Lakehouse.
-            return Collections.emptyList();
+        return getLakehouseConfiguration(task)
+                .map(lakehouseConfig -> LakehouseCommitter.get(
+                        lakehouseConfig, task.getCompactionTopic()))
+                .orElseGet(Collections::emptyList);
+    }
+
+    /**
+     * Resolves the same managed-table configuration used by the writer and committer. A catalog
+     * policy wins over deployment-wide legacy settings, so an explicit managed table identifier
+     * cannot make cleanup target the incarnation-scoped storage name by mistake.
+     */
+    @VisibleForTesting
+    Optional<LakehouseConfiguration> getLakehouseConfiguration(TopicCleanupTask task) {
+        if (materializationLookup != null) {
+            Optional<ResolvedMaterialization> resolved = materializationLookup.apply(task.getCompactionTopic());
+            if (resolved.isPresent()) {
+                ResolvedMaterialization materialization = resolved.get();
+                TableMode mode = materialization.effectivePolicy().table()
+                        .flatMap(table -> table.mode())
+                        .orElse(TableMode.MANAGED);
+                if (mode != TableMode.MANAGED) {
+                    // External/custom tables do not contain the managed Compacted Objects.
+                    return Optional.empty();
+                }
+                TableCatalogType catalogType = materialization.catalog().type();
+                String prefix;
+                switch (catalogType) {
+                    case ICEBERG -> prefix = "iceberg";
+                    case DELTA, DELTA_UC -> prefix = "delta";
+                    case CLICKHOUSE, NONE -> {
+                        return Optional.empty();
+                    }
+                    default -> throw new IllegalArgumentException(
+                            "Unsupported managed table catalog type: " + catalogType);
+                }
+                return Optional.of(LakehouseWriterFactory.buildConfiguration(
+                        materialization.catalog(), materialization.effectivePolicy(), prefix, Map.of()));
+            }
         }
-        return LakehouseCommitter.get(lakehouseConfig, task.getCompactionTopic());
+
+        LakehouseConfiguration legacyConfig = new LakehouseConfiguration(config.getProperties());
+        if (legacyConfig.getStreamTableMode() == LakehouseConfiguration.StreamTableMode.EXTERNAL) {
+            // For external tables, we don't need to commit deletions to the Lakehouse.
+            return Optional.empty();
+        }
+        return Optional.of(legacyConfig);
     }
 
     /**

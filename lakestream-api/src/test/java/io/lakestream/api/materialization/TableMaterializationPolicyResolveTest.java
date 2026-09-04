@@ -6,6 +6,7 @@ package io.lakestream.api.materialization;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.lakestream.api.SourceMetadataProperties;
 import io.lakestream.api.StreamIdentifier;
 import java.util.List;
 import java.util.Map;
@@ -115,6 +116,35 @@ class TableMaterializationPolicyResolveTest {
                 .isEqualTo(new TableIdentifier("custom_ns", "custom_table"));
         assertThat(result.get().effectivePolicy().tableIdentifier())
                 .contains(new TableIdentifier("custom_ns", "custom_table"));
+    }
+
+    @Test
+    void explicitTemplateOverridesSourceLogicalName() {
+        TableMaterializationPolicy ns = new TableMaterializationPolicy(
+                Optional.of("iceberg-glue"),
+                Optional.of(new TableNaming(Optional.of("analytics"), "${stream.name}_archive")),
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                Optional.of(new TableConf(
+                        Optional.of(TableMode.EXTERNAL),
+                        Optional.empty(),
+                        Optional.empty(),
+                        Optional.empty(),
+                        Optional.empty(),
+                        Optional.empty())),
+                Map.of());
+        StreamIdentifier storageStream = StreamIdentifier.of("default", "orders-topic-id-abc");
+
+        Optional<ResolvedMaterialization> result = TableMaterializationPolicy.resolve(
+                Optional.of(ns), Optional.empty(), storageStream, lookup(ICEBERG_CATALOG),
+                Map.of(SourceMetadataProperties.LOGICAL_NAME_PROPERTY, "orders"));
+
+        assertThat(result.orElseThrow().tableIdentifier())
+                .isEqualTo(new TableIdentifier("analytics", "orders-topic-id-abc_archive"));
     }
 
     @Test
@@ -304,24 +334,67 @@ class TableMaterializationPolicyResolveTest {
     }
 
     @Test
-    void missingTableIdentifierReturnsEmpty() {
-        // catalogRef is set, but no tableNaming on namespace and no override on stream.
-        TableMaterializationPolicy ns = new TableMaterializationPolicy(
-                Optional.of("iceberg-glue"),
-                Optional.empty(),
-                Optional.empty(),
-                Optional.empty(),
-                Optional.empty(),
-                Optional.empty(),
-                Optional.empty(),
-                Optional.empty(),
-                Optional.empty(),
-                Map.of());
+    void externalTableDefaultsToKafkaTopicName() {
+        TableMaterializationPolicy ns = policyWithoutNaming(TableMode.EXTERNAL);
+        StreamIdentifier storageStream = StreamIdentifier.of(
+                "public/default", "orders-topic-id-65WMNfybQpCDVulYOxMCTw");
 
         Optional<ResolvedMaterialization> result = TableMaterializationPolicy.resolve(
-                Optional.of(ns), Optional.empty(), STREAM, lookup(ICEBERG_CATALOG));
+                Optional.of(ns), Optional.empty(), storageStream, lookup(ICEBERG_CATALOG),
+                Map.of("lakestream.kafka.topic.name", "orders"));
 
-        assertThat(result).isEmpty();
+        assertThat(result).isPresent();
+        assertThat(result.orElseThrow().tableIdentifier())
+                .isEqualTo(new TableIdentifier("public/default", "orders"));
+    }
+
+    @Test
+    void externalTablePrefersSourceLogicalNameAndFallsBackToStreamName() {
+        TableMaterializationPolicy ns = policyWithoutNaming(TableMode.EXTERNAL);
+        StreamIdentifier storageStream = StreamIdentifier.of("public/default", "physical-stream");
+
+        Optional<ResolvedMaterialization> fromSource = TableMaterializationPolicy.resolve(
+                Optional.of(ns), Optional.empty(), storageStream, lookup(ICEBERG_CATALOG),
+                Map.of(SourceMetadataProperties.LOGICAL_NAME_PROPERTY, "logical-stream",
+                        "lakestream.kafka.topic.name", "legacy-kafka-name"));
+        Optional<ResolvedMaterialization> fromStream = TableMaterializationPolicy.resolve(
+                Optional.of(ns), Optional.empty(), storageStream, lookup(ICEBERG_CATALOG));
+
+        assertThat(fromSource.orElseThrow().tableIdentifier().name()).isEqualTo("logical-stream");
+        assertThat(fromStream.orElseThrow().tableIdentifier().name()).isEqualTo("physical-stream");
+    }
+
+    @Test
+    void recreatedSourceIncarnationsShareDefaultExternalTable() {
+        TableMaterializationPolicy ns = policyWithoutNaming(TableMode.EXTERNAL);
+        Map<String, String> properties = Map.of(
+                SourceMetadataProperties.LOGICAL_NAME_PROPERTY, "orders");
+
+        ResolvedMaterialization first = TableMaterializationPolicy.resolve(
+                Optional.of(ns), Optional.empty(),
+                StreamIdentifier.of("default", "orders-topic-id-first"),
+                lookup(ICEBERG_CATALOG), properties).orElseThrow();
+        ResolvedMaterialization second = TableMaterializationPolicy.resolve(
+                Optional.of(ns), Optional.empty(),
+                StreamIdentifier.of("default", "orders-topic-id-second"),
+                lookup(ICEBERG_CATALOG), properties).orElseThrow();
+
+        assertThat(first.tableIdentifier()).isEqualTo(new TableIdentifier("default", "orders"));
+        assertThat(second.tableIdentifier()).isEqualTo(first.tableIdentifier());
+    }
+
+    @Test
+    void managedTableDefaultsToStorageStreamName() {
+        TableMaterializationPolicy ns = policyWithoutNaming(TableMode.MANAGED);
+        StreamIdentifier storageStream = StreamIdentifier.of(
+                "public/default", "orders-topic-id-65WMNfybQpCDVulYOxMCTw");
+
+        Optional<ResolvedMaterialization> result = TableMaterializationPolicy.resolve(
+                Optional.of(ns), Optional.empty(), storageStream, lookup(ICEBERG_CATALOG),
+                Map.of(SourceMetadataProperties.LOGICAL_NAME_PROPERTY, "orders"));
+
+        assertThat(result.orElseThrow().tableIdentifier().name())
+                .isEqualTo("orders-topic-id-65WMNfybQpCDVulYOxMCTw");
     }
 
     @Test
@@ -381,6 +454,26 @@ class TableMaterializationPolicyResolveTest {
      * template "${stream.name}" with prefix "warehouse", framework with
      * writeMode=APPEND, and {@link EvolutionPolicy#forIceberg()}.
      */
+    private static TableMaterializationPolicy policyWithoutNaming(TableMode mode) {
+        return new TableMaterializationPolicy(
+                Optional.of("iceberg-glue"),
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                Optional.of(new TableConf(
+                        Optional.of(mode),
+                        Optional.empty(),
+                        Optional.empty(),
+                        Optional.empty(),
+                        Optional.empty(),
+                        Optional.empty())),
+                Map.of());
+    }
+
     private static TableMaterializationPolicy namespaceFullyPopulated() {
         return new TableMaterializationPolicy(
                 Optional.of("iceberg-glue"),

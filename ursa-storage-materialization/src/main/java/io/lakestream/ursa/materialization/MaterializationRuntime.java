@@ -37,10 +37,11 @@ import org.slf4j.Logger;
  *                                 WAL. May be {@code null} in stub setups.
  * @param taskProperties           per-task compaction properties carrying the legacy {@code DynamicConfigs}
  *                                 (sdtEnabled, sdtCatalogName, identifierFields, upsertMode,
- *                                 baseSchemaVersion, …). Sinks merge these onto the resolved policy /
- *                                 writer config so deployments that drove materialization through task
- *                                 properties remain compatible with the policy-based pipeline. Never
- *                                 {@code null} (defaults to an empty map).
+ *                                 baseSchemaVersion, …) and internal dispatch metadata such as
+ *                                 {@link #SOURCE_TOPIC_PROPERTY}. Sinks merge legacy values onto the
+ *                                 resolved policy / writer config so deployments that drove materialization
+ *                                 through task properties remain compatible with the policy-based pipeline.
+ *                                 Never {@code null} (defaults to an empty map).
  */
 public record MaterializationRuntime(
         SchemaService<?> schemaService,
@@ -52,6 +53,9 @@ public record MaterializationRuntime(
         @Nullable CompactTaskManager compactTaskManager,
         @Nullable StorageApi storageApi,
         Map<String, String> taskProperties) {
+
+    /** Internal task property carrying the incarnation-scoped partition log used for managed output. */
+    public static final String SOURCE_TOPIC_PROPERTY = "ursa.materialization.source.topic";
 
     /** Canonical constructor: validates required dependencies ({@code compactTaskManager} optional). */
     public MaterializationRuntime {

@@ -34,7 +34,6 @@ import io.lakestream.api.materialization.TableCatalog;
 import io.lakestream.api.materialization.TableCatalogType;
 import io.lakestream.api.materialization.TableConf;
 import io.lakestream.api.materialization.TableMaterializationPolicy;
-import io.lakestream.api.materialization.TableNaming;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -51,8 +50,7 @@ streamCatalog.registerTableCatalog(ch).join();
 //    Optional, so set only what the namespace actually owns.
 TableMaterializationPolicy namespacePolicy = new TableMaterializationPolicy(
         Optional.of("clickhouse-prod"),                        // catalogRef
-        Optional.of(new TableNaming(Optional.empty(),
-                "${stream.name}")),                            // tableNaming
+        Optional.empty(),                                      // tableNaming: use mode default
         Optional.empty(),                                      // tableIdentifier
         Optional.empty(),                                      // enabled
         Optional.empty(),                                      // framework
@@ -111,15 +109,33 @@ streamCatalog.setStreamMaterialization(
 > overrides only need the fields that differ from the namespace policy;
 > every other field uses `Optional.empty()` to inherit.
 
-## Table Naming Templates
+## Table Naming
 
-`TableNaming.tableNameTemplate` is interpolated once per stream when the policy
-is resolved. Three variables are supported, all case-sensitive:
+A stream-level explicit `tableIdentifier` has highest priority. Otherwise an explicitly configured
+namespace `TableNaming` template is used. With neither configured, the default depends on table
+mode:
+
+- `MANAGED` uses the storage `stream.name`, keeping an SBT tied to one stream incarnation.
+- `EXTERNAL` and `CUSTOM` use the source-owned `lakestream.source.logical.name`, then the legacy
+  `lakestream.kafka.topic.name`, and finally `stream.name`.
+
+Source integrations own these metadata properties. Applications do not configure them. For example,
+the Kafka integration records the Kafka topic automatically, so a UUID-qualified storage stream can
+materialize to a stable topic-named SDT without a `tableNameTemplate`.
+
+A resolved SDT table name never replaces storage identity. SBT Compacted Objects, partition metadata,
+and Oxia indexes continue to use the incarnation-qualified stream/log identity. With both outputs
+enabled, the SDT writer (including its DLT and committer) and the SBT writer therefore remain
+independent.
+
+`TableNaming.tableNameTemplate` is interpolated once per stream when the policy is resolved. Four
+variables are supported, all case-sensitive:
 
 | Variable | Resolves to |
 |----------|-------------|
 | `${stream.namespace}` | The stream's namespace. |
-| `${stream.name}` | The stream's name within its namespace. |
+| `${stream.name}` | The storage stream's name within its namespace. |
+| `${stream.logicalName}` | The source-owned logical name, falling back to `stream.name`. |
 | `${stream.property.<key>}` | The value of the stream property `<key>`, taken from `StreamMetadata.properties()`. |
 
 `${stream.property.<key>}` lets one namespace policy route streams to tables
@@ -142,17 +158,10 @@ resolves property variables. The single-argument
 any template that uses one. `tableNamespacePrefix` is used literally and is
 never interpolated.
 
-`${stream.property.<key>}` therefore only works where the stream's own
-properties are at hand, which today means catalog-side resolution:
-`StreamCatalog.resolveMaterialization` loads the stream and passes
-`StreamMetadata.properties()` into the template. The compaction worker's
-backwards-compatible fallback — `TableCatalogBootstrap.resolveFromProperties`,
-reached only when catalog-side resolution returns empty and the deployment
-drives materialization from compaction task properties instead — has no stream
-properties to pass, so it resolves the policy without them and a template using
-`${stream.property.<key>}` fails there with `IllegalArgumentException`. A
-deployment that names tables after stream properties must drive materialization
-from a catalog policy.
+Both catalog-side resolution and the compaction worker's backwards-compatible task-property
+fallback pass the available stream properties into the resolver. A property template therefore has
+the same semantics on both paths. Resolution still fails when the referenced property is absent or
+blank.
 
 ## Configuration Keys
 
@@ -193,8 +202,7 @@ See `ursa-storage-clickhouse` for a worked example.
   failure. Check the underlying catalog (Iceberg/Delta/Unity) status.
 - **No materialization happening** — verify
   `streamCatalog.resolveMaterialization(streamId).join().isPresent()`. Common causes:
-  `catalogRef` doesn't resolve to a registered `TableCatalog`; namespace
-  policy missing `tableNaming` template; stream policy set
+  `catalogRef` doesn't resolve to a registered `TableCatalog`; stream policy set
   `enabled = false`.
 
 Useful metrics for active debugging (all under the `ursa.materialization.*`

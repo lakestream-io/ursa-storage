@@ -14,9 +14,12 @@ import io.lakestream.api.StreamMetadata;
 import io.lakestream.api.materialization.TableCatalog;
 import io.lakestream.api.materialization.TableCatalogType;
 import io.lakestream.api.materialization.TableConf;
+import io.lakestream.api.materialization.TableIdentifier;
 import io.lakestream.api.materialization.TableMaterializationPolicy;
 import io.lakestream.api.materialization.TableMode;
 import io.lakestream.ursa.lakehouse.LakehouseConfiguration;
+import io.lakestream.ursa.lakehouse.utils.StreamTableNaming;
+import io.lakestream.ursa.materialization.MaterializationRuntime;
 import io.lakestream.ursa.materialization.serde.kafka.KafkaSchemaService;
 import io.lakestream.ursa.materialization.serde.kafka.KafkaSourceMetadata;
 import java.util.Map;
@@ -52,6 +55,20 @@ class LakehouseWriterFactoryTest {
     }
 
     @Test
+    void managedWriterUsesIncarnationScopedPartitionLogAsItsSourceTopic() {
+        StreamMetadata stream = mock(StreamMetadata.class);
+        when(stream.identifier()).thenReturn(StreamIdentifier.of(
+                "default", "orders-topic-id-65WMNfybQpCDVulYOxMCTw"));
+        String partitionLog = "default/orders-topic-id-65WMNfybQpCDVulYOxMCTw-partition-3";
+
+        String sourceTopic = LakehouseWriterFactory.sourceTopic(stream, Map.of(
+                MaterializationRuntime.SOURCE_TOPIC_PROPERTY, partitionLog,
+                KafkaSourceMetadata.LOGICAL_NAME_PROPERTY, "orders"));
+
+        assertThat(sourceTopic).isEqualTo(partitionLog);
+    }
+
+    @Test
     void externalDeltaDltCanBeDisabledByTaskPolicy() {
         TableCatalog catalog = new TableCatalog(
                 "delta-catalog",
@@ -71,7 +88,32 @@ class LakehouseWriterFactoryTest {
         assertThat(dltWriter).isEmpty();
     }
 
+    @Test
+    void resolvedTableIdentifierIsTheWriterDestination() {
+        TableCatalog catalog = new TableCatalog(
+                "iceberg-catalog", TableCatalogType.ICEBERG, Map.of(), Map.of());
+        TableIdentifier identifier = new TableIdentifier("analytics", "orders_archive");
+        TableMaterializationPolicy policy = withModeAndIdentifier(TableMode.EXTERNAL, identifier);
+        StreamMetadata stream = mock(StreamMetadata.class);
+        when(stream.identifier()).thenReturn(StreamIdentifier.of(
+                "default", "orders-topic-id-65WMNfybQpCDVulYOxMCTw"));
+
+        LakehouseConfiguration configuration = LakehouseWriterFactory.buildConfiguration(
+                catalog, policy, "iceberg",
+                Map.of(KafkaSourceMetadata.TOPIC_NAME_PROPERTY, "orders"));
+
+        assertThat(LakehouseWriterFactory.destinationTopic(policy, stream))
+                .isEqualTo("analytics/orders_archive");
+        assertThat(StreamTableNaming.resolve(stream.identifier().fullName(), configuration.getProperties()))
+                .isEqualTo(identifier);
+    }
+
     private static TableMaterializationPolicy withMode(TableMode mode) {
+        return withModeAndIdentifier(mode, new TableIdentifier("default", "delta-topic"));
+    }
+
+    private static TableMaterializationPolicy withModeAndIdentifier(
+            TableMode mode, TableIdentifier identifier) {
         TableConf tableConf = new TableConf(
                 Optional.of(mode),
                 Optional.empty(),
@@ -82,7 +124,7 @@ class LakehouseWriterFactoryTest {
         return new TableMaterializationPolicy(
                 Optional.empty(),
                 Optional.empty(),
-                Optional.empty(),
+                Optional.of(identifier),
                 Optional.empty(),
                 Optional.empty(),
                 Optional.empty(),
