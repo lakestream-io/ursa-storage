@@ -328,8 +328,8 @@ class IndexedStreamCatalogTest {
             failure.getCause());
         assertEquals(2, allocationCalls.get());
         assertEquals(List.of(
-            "lakestream-native/" + streamId.fullName() + "/partition-0",
-            "lakestream-native/" + streamId.fullName() + "/partition-0"),
+            streamId.fullName() + "-partition-0",
+            streamId.fullName() + "-partition-0"),
             allocationKeys);
         verify(oxiaClient, times(1)).put(eq(partitionPath), any(byte[].class),
             eq(Set.of(PutOption.IfRecordDoesNotExist)));
@@ -360,7 +360,7 @@ class IndexedStreamCatalogTest {
 
         CompletionException failure = assertThrows(CompletionException.class, create::join);
         assertInstanceOf(KeyedAllocationInvalidatedException.class, failure.getCause());
-        String mappingKey = "lakestream-native/" + streamId.fullName() + "/partition-0";
+        String mappingKey = streamId.fullName() + "-partition-0";
         assertEquals(Optional.empty(), mappings.activeStreamId(mappingKey));
         assertEquals(701L, mappings.fence(mappingKey).orElseThrow().streamId());
         assertNull(config.get());
@@ -406,7 +406,7 @@ class IndexedStreamCatalogTest {
         assertTrue(LOG_METADATA_SERDE.deserialize(
             partitionPath, partition.get().value()).deleted());
         verify(logStorage).deleteLog(LogId.of(allocatedStreamId));
-        String mappingKey = "lakestream-native/" + streamId.fullName() + "/partition-0";
+        String mappingKey = streamId.fullName() + "-partition-0";
         assertEquals(allocatedStreamId,
             mappings.fence(mappingKey).orElseThrow().streamId());
     }
@@ -513,7 +513,7 @@ class IndexedStreamCatalogTest {
         CompletionException failure = assertThrows(
             CompletionException.class, staleOwner::join);
         assertInstanceOf(KeyedAllocationInvalidatedException.class, failure.getCause());
-        String mappingKey = "lakestream-native/" + streamId.fullName() + "/partition-0";
+        String mappingKey = streamId.fullName() + "-partition-0";
         assertEquals(Optional.empty(), mappings.activeStreamId(mappingKey));
         assertEquals(reusedStreamId,
             mappings.fence(mappingKey).orElseThrow().streamId());
@@ -612,10 +612,10 @@ class IndexedStreamCatalogTest {
         assertEquals(Map.of("generation", "new"), recovered.properties());
         assertEquals(materialization, recovered.materialization());
 
-        String expectedKey = "lakestream-native/" + streamId.fullName()
-            + "/partition-0";
+        String expectedKey = streamId.fullName()
+            + "-partition-0";
         assertEquals(List.of(expectedKey, expectedKey,
-            "lakestream-native/" + streamId.fullName() + "/partition-1"), allocationKeys);
+            streamId.fullName() + "-partition-1"), allocationKeys);
         assertNotNull(partitionState.get());
         verify(oxiaClient).put(eq(partitionPath), any(byte[].class),
             eq(Set.of(PutOption.IfRecordDoesNotExist)));
@@ -725,8 +725,8 @@ class IndexedStreamCatalogTest {
         assertEquals(3, completed.path("partitions").asInt());
         assertFalse(completed.has("_pendingExpansion"));
         assertEquals(List.of(
-            "lakestream-native/" + streamId.fullName() + "/partition-1",
-            "lakestream-native/" + streamId.fullName() + "/partition-2"),
+            streamId.fullName() + "-partition-1",
+            streamId.fullName() + "-partition-2"),
             physicalAllocations);
     }
 
@@ -1119,8 +1119,8 @@ class IndexedStreamCatalogTest {
         long physicalStreamId = 300L;
         String configPath = catalogPaths.streamConfigPath(streamId);
         String partitionPath = catalogPaths.partitionMetadataPath(streamId, 0);
-        String mappingKey = "lakestream-native/" + streamId.fullName()
-            + "/partition-0";
+        String mappingKey = streamId.fullName()
+            + "-partition-0";
         String incarnation = "metadata-only-then-purge";
         String ownerToken = "registration-owner";
         AtomicReference<VersionedValue> config = mockVersionedConfig(
@@ -1172,8 +1172,8 @@ class IndexedStreamCatalogTest {
         long physicalStreamId = 310L;
         String configPath = catalogPaths.streamConfigPath(streamId);
         String partitionPath = catalogPaths.partitionMetadataPath(streamId, 0);
-        String mappingKey = "lakestream-native/" + streamId.fullName()
-            + "/partition-0";
+        String mappingKey = streamId.fullName()
+            + "-partition-0";
         String incarnation = "recoverable-purge-upgrade";
         String ownerToken = "registration-owner";
         AtomicReference<VersionedValue> config = mockVersionedConfig(
@@ -1226,8 +1226,8 @@ class IndexedStreamCatalogTest {
         long physicalStreamId = 320L;
         String configPath = catalogPaths.streamConfigPath(streamId);
         String partitionPath = catalogPaths.partitionMetadataPath(streamId, 0);
-        String mappingKey = "lakestream-native/" + streamId.fullName()
-            + "/partition-0";
+        String mappingKey = streamId.fullName()
+            + "-partition-0";
         String incarnation = "write-fenced-drop";
         String ownerToken = "registration-owner";
         AtomicReference<VersionedValue> config = mockVersionedConfig(
@@ -1290,8 +1290,8 @@ class IndexedStreamCatalogTest {
         long lateStreamId = 301L;
         String configPath = catalogPaths.streamConfigPath(streamId);
         String partitionPath = catalogPaths.partitionMetadataPath(streamId, 0);
-        String mappingKey = "lakestream-native/" + streamId.fullName()
-            + "/partition-0";
+        String mappingKey = streamId.fullName()
+            + "-partition-0";
         String incarnation = "native-purge-recovery";
         AtomicReference<VersionedValue> config = mockVersionedConfig(
             configPath, ownedStreamConfigBytes(
@@ -1510,8 +1510,8 @@ class IndexedStreamCatalogTest {
         String configPath = catalogPaths.streamConfigPath(streamId);
         String partitionPath = catalogPaths.partitionMetadataPath(streamId, 0);
         String incarnation = "native-incarnation";
-        String mappingKey = "lakestream-native/" + streamId.fullName()
-            + "/partition-0";
+        String mappingKey = streamId.fullName()
+            + "-partition-0";
         AtomicReference<VersionedValue> config = mockVersionedConfig(
             configPath,
             ownedStreamConfigBytes(
@@ -1574,7 +1574,7 @@ class IndexedStreamCatalogTest {
         AtomicReference<VersionedValue> partition =
             mockVersionedConfig(partitionPath, oldTombstone);
         defaultStorage.setFence(
-            "lakestream-native/" + streamId.fullName() + "/partition-0",
+            streamId.fullName() + "-partition-0",
             new StreamIdMappingFence(
                 300L, new StreamIdMappingOwner(
                     "old-incarnation", "old-drop-owner", 2L)));
@@ -2319,7 +2319,7 @@ class IndexedStreamCatalogTest {
         for (int index = 0; index < partitions.size(); index++) {
             String path = catalogPaths.partitionMetadataPath(id, index);
             mappedStreamIds.put(index, storage.activeStreamId(
-                "lakestream-native/" + id.fullName() + "/partition-" + index).orElseThrow());
+                id.fullName() + "-partition-" + index).orElseThrow());
             persistedStreamIds.put(index, LOG_METADATA_SERDE.deserialize(
                 path, partitions.get(index).get().value()).streamId());
         }
@@ -2331,7 +2331,7 @@ class IndexedStreamCatalogTest {
     }
 
     private static CompletableFuture<Long> allocateByPartitionIndex(String allocationKey) {
-        String marker = "/partition-";
+        String marker = "-partition-";
         int index = Integer.parseInt(
             allocationKey.substring(allocationKey.lastIndexOf(marker) + marker.length()));
         return CompletableFuture.completedFuture(100L + index);

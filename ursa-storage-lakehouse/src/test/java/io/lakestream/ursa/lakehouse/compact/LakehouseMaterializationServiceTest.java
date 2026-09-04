@@ -23,10 +23,14 @@ import io.lakestream.api.materialization.MaterializationState;
 import io.lakestream.api.materialization.ResolvedMaterialization;
 import io.lakestream.api.materialization.TableCatalog;
 import io.lakestream.api.materialization.TableCatalogType;
+import io.lakestream.api.materialization.TableConf;
 import io.lakestream.api.materialization.TableIdentifier;
 import io.lakestream.api.materialization.TableMaterializationPolicy;
+import io.lakestream.api.materialization.TableMode;
 import io.lakestream.ursa.compaction.task.CompactStreamTask;
 import io.lakestream.ursa.exception.ExceptionCode;
+import io.lakestream.ursa.lakehouse.LakehouseConfiguration;
+import io.lakestream.ursa.lakehouse.utils.StreamTableNaming;
 import io.lakestream.ursa.lakehouse.v2.AbstractLakehouseWriter;
 import io.lakestream.ursa.lakehouse.v2.LakehouseFactory;
 import io.lakestream.ursa.materialization.FailureMessageHandler;
@@ -49,6 +53,7 @@ import io.netty.buffer.Unpooled;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
@@ -185,6 +190,60 @@ class LakehouseMaterializationServiceTest {
     }
 
     @Test
+    void managedCatalogMaterializerDoesNotAlsoBuildStandaloneSbtWriter() {
+        service.initialize(runtime, config);
+        String sourceTopic = "default/orders-topic-id-abc-partition-0";
+        CompactStreamTask sourceTask = sourceTask(sourceTopic, 17L, Map.of("sbtEnabled", "true"));
+        service.setEntryReaderProvider(emptyReader());
+        LakehouseFactory managedFactory = mock(LakehouseFactory.class);
+        service.setLakehouseFactory(managedFactory);
+        TableMaterializer<GenericEntry> catalogMaterializer = mock(TableMaterializer.class);
+        service.registerFactory(TableCatalogType.ICEBERG, new TableMaterializerFactory() {
+            @Override
+            public TableCatalogType catalogType() {
+                return TableCatalogType.ICEBERG;
+            }
+
+            @Override
+            public TableMaterializer<?> create(
+                    TableMaterializationPolicy policy,
+                    TableCatalog resolvedCatalog,
+                    StreamMetadata streamMetadata,
+                    MaterializationRuntime materializationRuntime) {
+                return catalogMaterializer;
+            }
+
+            @Override
+            public TableSchemaService<?, ?> schemaService(
+                    TableMaterializationPolicy policy,
+                    TableCatalog resolvedCatalog,
+                    StreamMetadata streamMetadata) {
+                return null;
+            }
+        });
+        TableIdentifier identifier = new TableIdentifier("default", "orders-topic-id-abc");
+        TableMaterializationPolicy policy = policyWithMode(
+                "managed-iceberg", identifier, TableMode.MANAGED);
+        ResolvedMaterialization resolved = new ResolvedMaterialization(
+                new TableCatalog("managed-iceberg", TableCatalogType.ICEBERG, Map.of(), Map.of()),
+                identifier,
+                policy);
+
+        service.materialize(new MaterializationTask(
+                metadata("default", "orders-topic-id-abc", Map.of()),
+                resolved, sourceTopic, 17L, 0L, 0L, sourceTask));
+
+        verify(catalogMaterializer).commit();
+        verify(managedFactory, never()).getManagedWriter(any(), any());
+        assertThat(sourceTask.getProperties())
+                .containsEntry(StreamTableNaming.RESOLVED_TABLE_NAMESPACE_PROPERTY, "default")
+                .containsEntry(StreamTableNaming.RESOLVED_TABLE_NAME_PROPERTY, "orders-topic-id-abc")
+                .containsEntry(LakehouseConfiguration.STREAM_TABLE_MODE, TableMode.MANAGED.name())
+                .containsEntry(LakehouseConfiguration.CATALOG_NAME, "managed-iceberg")
+                .containsEntry("lakehouseType", LakehouseConfiguration.LakehouseType.ICEBERG.name());
+    }
+
+    @Test
     void materializeBeforeInitFails() {
         assertThatThrownBy(() -> service.materialize(task(
                 metadata("public/default", "t", Map.of()),
@@ -223,8 +282,10 @@ class LakehouseMaterializationServiceTest {
         service.initialize(runtime, config);
         String canonicalTopic = "default/orders-partition-0-topic-id";
         StreamIdentifier canonicalId = StreamIdentifier.of("default", "orders-topic-id");
-        CompactStreamTask sourceTask = sourceTask(
-                canonicalTopic, 17L, Map.of("sdtCatalogName", "orders-catalog"));
+        CompactStreamTask sourceTask = sourceTask(canonicalTopic, 17L, Map.of(
+                "sdtCatalogName", "orders-catalog",
+                KafkaSourceMetadata.LOGICAL_NAME_PROPERTY, "stale-logical-name",
+                KafkaSourceMetadata.TOPIC_NAME_PROPERTY, "stale-topic-name"));
         AtomicReference<String> readerTopic = new AtomicReference<>();
         service.setEntryReaderProvider((topic, streamId, start, end) -> {
             readerTopic.set(topic);
@@ -235,6 +296,7 @@ class LakehouseMaterializationServiceTest {
                 .thenReturn(java.util.Optional.empty());
         service.setLakehouseFactory(managedFactory);
         TableMaterializer<GenericEntry> materializer = mock(TableMaterializer.class);
+        AtomicReference<TableMaterializationPolicy> factoryPolicy = new AtomicReference<>();
         AtomicReference<StreamMetadata> factoryMetadata = new AtomicReference<>();
         AtomicReference<MaterializationRuntime> factoryRuntime = new AtomicReference<>();
         service.registerFactory(TableCatalogType.DELTA, new TableMaterializerFactory() {
@@ -249,6 +311,7 @@ class LakehouseMaterializationServiceTest {
                     TableCatalog resolvedCatalog,
                     StreamMetadata streamMetadata,
                     MaterializationRuntime taskRuntime) {
+                factoryPolicy.set(policy);
                 factoryMetadata.set(streamMetadata);
                 factoryRuntime.set(taskRuntime);
                 return materializer;
@@ -262,21 +325,32 @@ class LakehouseMaterializationServiceTest {
                 return null;
             }
         });
-        StreamMetadata metadata = metadata(
-                canonicalId,
-                Map.of(KafkaSourceMetadata.TOPIC_NAME_PROPERTY, "orders"));
+        StreamMetadata metadata = metadata(canonicalId, Map.of(
+                KafkaSourceMetadata.LOGICAL_NAME_PROPERTY, "orders",
+                KafkaSourceMetadata.TOPIC_NAME_PROPERTY, "orders"));
 
         service.materialize(new MaterializationTask(
                 metadata, deltaResolved(), canonicalTopic, 17L, 0L, 0L, sourceTask));
 
         assertThat(readerTopic).hasValue(canonicalTopic);
+        assertThat(factoryPolicy.get().tableIdentifier())
+                .contains(new TableIdentifier("ns", "tbl"));
         assertThat(factoryMetadata).hasValue(metadata);
         assertThat(factoryRuntime.get().taskProperties()).containsExactlyInAnyOrderEntriesOf(Map.of(
                 "sdtCatalogName", "orders-catalog",
-                KafkaSourceMetadata.TOPIC_NAME_PROPERTY, "orders"));
+                KafkaSourceMetadata.LOGICAL_NAME_PROPERTY, "orders",
+                KafkaSourceMetadata.TOPIC_NAME_PROPERTY, "orders",
+                MaterializationRuntime.SOURCE_TOPIC_PROPERTY, canonicalTopic));
         verify(managedFactory).getManagedWriter(canonicalTopic, Map.of(
                 "sdtCatalogName", "orders-catalog",
+                KafkaSourceMetadata.LOGICAL_NAME_PROPERTY, "orders",
                 KafkaSourceMetadata.TOPIC_NAME_PROPERTY, "orders"));
+        assertThat(sourceTask.getProperties())
+                .containsEntry(StreamTableNaming.RESOLVED_TABLE_NAMESPACE_PROPERTY, "ns")
+                .containsEntry(StreamTableNaming.RESOLVED_TABLE_NAME_PROPERTY, "tbl")
+                .containsEntry(LakehouseConfiguration.STREAM_TABLE_MODE, TableMode.EXTERNAL.name())
+                .containsEntry(LakehouseConfiguration.CATALOG_NAME, "delta-cat")
+                .containsEntry("lakehouseType", LakehouseConfiguration.LakehouseType.DELTA.name());
         verify(materializer).commit();
     }
 
@@ -549,10 +623,32 @@ class LakehouseMaterializationServiceTest {
     }
 
     private static ResolvedMaterialization deltaResolved() {
+        TableIdentifier identifier = new TableIdentifier("ns", "tbl");
         return new ResolvedMaterialization(
                 new TableCatalog("delta-cat", TableCatalogType.DELTA, Map.of(), Map.of()),
-                new TableIdentifier("ns", "tbl"),
-                TableMaterializationPolicy.empty());
+                identifier,
+                policyWithMode("delta-cat", identifier, TableMode.EXTERNAL));
+    }
+
+    private static TableMaterializationPolicy policyWithMode(
+            String catalog, TableIdentifier identifier, TableMode mode) {
+        return new TableMaterializationPolicy(
+                Optional.of(catalog),
+                Optional.empty(),
+                Optional.of(identifier),
+                Optional.of(Boolean.TRUE),
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                Optional.of(new TableConf(
+                        Optional.of(mode),
+                        Optional.empty(),
+                        Optional.empty(),
+                        Optional.empty(),
+                        Optional.empty(),
+                        Optional.empty())),
+                Map.of());
     }
 
     private static final class RecordingMetrics implements MaterializationMetrics {

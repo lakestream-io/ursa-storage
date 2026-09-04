@@ -12,6 +12,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import io.lakestream.api.Namespace;
+import io.lakestream.api.SourceMetadataProperties;
 import io.lakestream.api.StreamCatalog;
 import io.lakestream.api.StreamIdentifier;
 import io.lakestream.api.materialization.CommitConfig;
@@ -19,9 +20,11 @@ import io.lakestream.api.materialization.FrameworkConf;
 import io.lakestream.api.materialization.ResolvedMaterialization;
 import io.lakestream.api.materialization.TableCatalog;
 import io.lakestream.api.materialization.TableCatalogType;
+import io.lakestream.api.materialization.TableIdentifier;
 import io.lakestream.api.materialization.TableMaterializationPolicy;
 import io.lakestream.api.materialization.TableMode;
 import io.lakestream.api.materialization.WriteMode;
+import io.lakestream.ursa.lakehouse.utils.StreamTableNaming;
 import io.lakestream.ursa.lakehouse.v2.TableCatalogBootstrap.BootstrapResult;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -300,14 +303,47 @@ class TableCatalogBootstrapTest {
         assertThat(catalog.properties()).doesNotContainKey("materializationEnabled");
         assertThat(catalog.properties()).doesNotContainKey("materializationDefaultNamespace");
 
-        // The namespace policy references that catalog, is EXTERNAL, names tables by stream name.
+        // The namespace policy references that catalog and is EXTERNAL. With no explicit template,
+        // policy resolution derives each table from the source logical name.
         TableMaterializationPolicy policy = namespacePolicies.get("public/default");
         assertThat(policy).isNotNull();
         assertThat(policy.catalogRef()).contains("default-delta");
         assertThat(policy.enabled()).contains(Boolean.TRUE);
         assertThat(policy.table().flatMap(t -> t.mode())).contains(TableMode.EXTERNAL);
+        assertThat(policy.tableNaming()).isEmpty();
+    }
+
+    @Test
+    void tableNameTemplateOverridesTheSynthesizedDefault() {
+        Properties props = new Properties();
+        props.setProperty("materializationEnabled", "true");
+        props.setProperty("materializationDefaultNamespace", "public/default");
+        props.setProperty("lakehouseType", "DELTA");
+        props.setProperty("streamTableMode", "EXTERNAL");
+        props.setProperty(StreamTableNaming.TABLE_NAME_TEMPLATE_PROPERTY, "${stream.name}_v2");
+
+        TableCatalogBootstrap.bootstrap(streamCatalog, props);
+
+        TableMaterializationPolicy policy = namespacePolicies.get("public/default");
         assertThat(policy.tableNaming()).isPresent();
-        assertThat(policy.tableNaming().get().tableNameTemplate()).isEqualTo("${stream.name}");
+        assertThat(policy.tableNaming().get().tableNameTemplate()).isEqualTo("${stream.name}_v2");
+    }
+
+    @Test
+    void tableNameTemplateMayInterpolateStreamProperties() {
+        Properties props = new Properties();
+        props.setProperty("materializationEnabled", "true");
+        props.setProperty("materializationDefaultNamespace", "public/default");
+        props.setProperty("lakehouseType", "ICEBERG");
+        props.setProperty("streamTableMode", "EXTERNAL");
+        props.setProperty(StreamTableNaming.TABLE_NAME_TEMPLATE_PROPERTY,
+                "${stream.property.lakestream.kafka.topic.name}");
+
+        TableCatalogBootstrap.bootstrap(streamCatalog, props);
+
+        TableMaterializationPolicy policy = namespacePolicies.get("public/default");
+        assertThat(policy.tableNaming().get().tableNameTemplate())
+                .isEqualTo("${stream.property.lakestream.kafka.topic.name}");
     }
 
     @Test
@@ -353,10 +389,10 @@ class TableCatalogBootstrapTest {
         assertThat(policy.table().flatMap(t -> t.mode())).contains(TableMode.EXTERNAL);
         assertThat(policy.tableNaming()).isPresent();
         // ClickHouse uses a fixed database namespace, so the full stream namespace is encoded into
-        // the table name (${stream.namespace}.${stream.name}); the ClickHouse sink folds the '/'
-        // path separator to '.' at write time. Iceberg/Delta keep ${stream.name}.
+        // the table name. Its logical-name variable reads source metadata before falling back to the
+        // storage stream name; the ClickHouse sink folds the '/' path separator to '.'.
         assertThat(policy.tableNaming().get().tableNameTemplate())
-                .isEqualTo("${stream.namespace}.${stream.name}");
+                .isEqualTo("${stream.namespace}.${stream.logicalName}");
         // The ClickHouse database (table namespace) is pinned, not derived from the stream namespace.
         assertThat(policy.tableNaming().get().tableNamespacePrefix()).contains("analytics");
     }
@@ -409,6 +445,22 @@ class TableCatalogBootstrapTest {
         assertThat(rm.catalog().type()).isEqualTo(TableCatalogType.ICEBERG);
         assertThat(rm.tableIdentifier().name()).isEqualTo("topic-a");
         assertThat(rm.effectivePolicy().catalogRef()).contains("default-iceberg");
+    }
+
+    @Test
+    void resolveFromPropertiesDefaultsExternalTableToKafkaTopic() {
+        Properties props = new Properties();
+        props.setProperty("sdt.enabled", "true");
+        props.setProperty("lakehouseType", "ICEBERG");
+        props.setProperty("streamTableMode", "EXTERNAL");
+        props.setProperty(SourceMetadataProperties.LOGICAL_NAME_PROPERTY, "orders");
+
+        var resolved = TableCatalogBootstrap.resolveFromProperties(
+                props, StreamIdentifier.of("default", "orders-topic-id-abc"));
+
+        assertThat(resolved).isPresent();
+        assertThat(resolved.orElseThrow().tableIdentifier())
+                .isEqualTo(new TableIdentifier("default", "orders"));
     }
 
     @Test
@@ -482,6 +534,7 @@ class TableCatalogBootstrapTest {
         ResolvedMaterialization rm = resolved.get();
         assertThat(rm.catalog().type()).isEqualTo(TableCatalogType.NONE);
         assertThat(rm.tableIdentifier().name()).isEqualTo("topic-a");
+        assertThat(rm.effectivePolicy().tableNaming()).isEmpty();
         assertThat(rm.effectivePolicy().table().flatMap(t -> t.mode())).contains(TableMode.MANAGED);
     }
 

@@ -12,7 +12,7 @@ import io.lakestream.ursa.lakehouse.iceberg.IcebergSinkConfig;
 import io.lakestream.ursa.lakehouse.iceberg.IcebergTable;
 import io.lakestream.ursa.lakehouse.iceberg.TableOptions;
 import io.lakestream.ursa.lakehouse.iceberg.Utilities;
-import io.lakestream.ursa.lakehouse.utils.TopicName;
+import io.lakestream.ursa.lakehouse.utils.StreamTableNaming;
 import io.lakestream.ursa.lakehouse.v2.IWriteResult;
 import io.lakestream.ursa.lakehouse.v2.LakehouseRecordWriter;
 import io.lakestream.ursa.lakehouse.v2.LakehouseWriterMetrics;
@@ -116,17 +116,16 @@ public class IcebergExternalDLTTableWriter implements LakehouseRecordWriter<Fail
     }
 
     private static IcebergTable initIcebergTable(Schema schema, String topic, LakehouseConfiguration config) {
-        String parentTopic = TopicName.get(topic).getPartitionedTopicName();
-        TopicName topicName = TopicName.get(parentTopic);
+        var dltIdentifier = StreamTableNaming.deadLetterTable(
+                StreamTableNaming.resolveForWriter(topic, config.getProperties()), config.getDltSuffix());
 
         var builder = TableOptions.builder();
         builder.schema(schema);
         builder.properties(config.getIcebergTableProperties());
         TableOptions tableOptions = builder.build();
 
-        Namespace namespace = Namespace.of(topicName.getNamespace());
-        String tableName = topicName.getLocalName() + config.getDltSuffix();
-        TableIdentifier identifier = TableIdentifier.of(namespace, tableName);
+        Namespace namespace = Namespace.of(dltIdentifier.namespace());
+        TableIdentifier identifier = TableIdentifier.of(namespace, dltIdentifier.name());
         return new IcebergTable(config, tableOptions, identifier);
     }
 }

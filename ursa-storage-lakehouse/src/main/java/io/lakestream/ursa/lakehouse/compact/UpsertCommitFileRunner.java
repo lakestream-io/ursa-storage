@@ -4,6 +4,7 @@
  */
 package io.lakestream.ursa.lakehouse.compact;
 
+import io.lakestream.api.materialization.TableIdentifier;
 import io.lakestream.ursa.compaction.CompactTaskManager;
 import io.lakestream.ursa.compaction.metrics.CompactionMetrics;
 import io.lakestream.ursa.compaction.task.CompactStreamTask;
@@ -19,6 +20,7 @@ import io.lakestream.ursa.lakehouse.catalog.unity.UnityCatalogLineageUtil;
 import io.lakestream.ursa.lakehouse.delta.DeltaCompactStreamTask;
 import io.lakestream.ursa.lakehouse.exception.IcebergTableCorruptedException;
 import io.lakestream.ursa.lakehouse.iceberg.IcebergCompactStreamTask;
+import io.lakestream.ursa.lakehouse.utils.StreamTableNaming;
 import io.lakestream.ursa.lakehouse.writer.ParquetFileStat;
 import io.lakestream.ursa.storage.StorageApi;
 import io.lakestream.ursa.storage.impl.StorageConfig;
@@ -258,18 +260,20 @@ public class UpsertCommitFileRunner extends AbstractCommitRunner implements Comm
 
     private void initDLTLakehouseCommitterIfNeeded() throws LakehouseOptException {
         if (dltLakehouseCommitter == null) {
-            switch (config.getLakehouseType()) {
-                case DELTA:
-                    dltLakehouseCommitter = new DeltaCommitter(config, dltTopic);
-                    return;
-                case ICEBERG:
-                    dltLakehouseCommitter = new IcebergCommitter(config, dltTopic);
-                    return;
-                default:
-                    throw new IllegalArgumentException("Unsupported lakehouse type for DLT: "
-                            + config.getLakehouseType());
-            }
+            dltLakehouseCommitter = newDltLakehouseCommitter();
         }
+    }
+
+    private LakehouseCommitter newDltLakehouseCommitter() {
+        TableIdentifier mainIdentifier = StreamTableNaming.resolve(parentTopic, config.getProperties());
+        TableIdentifier dltIdentifier = StreamTableNaming.deadLetterTable(
+                mainIdentifier, config.getDltSuffix());
+        return switch (config.getLakehouseType()) {
+            case DELTA -> new DeltaCommitter(config, dltTopic, dltIdentifier);
+            case ICEBERG -> new IcebergCommitter(config, dltTopic, dltIdentifier);
+            default -> throw new IllegalArgumentException(
+                    "Unsupported lakehouse type for DLT: " + config.getLakehouseType());
+        };
     }
 
     static ParquetFileStat generateParquetFileStat(CompactStreamTask compactStreamTask) {
@@ -354,7 +358,7 @@ public class UpsertCommitFileRunner extends AbstractCommitRunner implements Comm
                         if (icebergCompactStreamTask.getDltWriteResults() != null
                                 && !icebergCompactStreamTask.getDltWriteResults().isEmpty()) {
                             if (dltLakehouseCommitter == null) {
-                                dltLakehouseCommitter = new IcebergCommitter(config, dltTopic);
+                                dltLakehouseCommitter = newDltLakehouseCommitter();
                             }
                             committedToDLTTable = dltLakehouseCommitter.isTheCompactStreamTaskCommitted(task);
                         }
@@ -364,7 +368,7 @@ public class UpsertCommitFileRunner extends AbstractCommitRunner implements Comm
                         if (deltaCompactStreamTask.getDltDeltaFiles() != null
                                 && !deltaCompactStreamTask.getDltDeltaFiles().isEmpty()) {
                             if (dltLakehouseCommitter == null) {
-                                dltLakehouseCommitter = new DeltaCommitter(config, dltTopic);
+                                dltLakehouseCommitter = newDltLakehouseCommitter();
                             }
                             committedToDLTTable = dltLakehouseCommitter.isTheCompactStreamTaskCommitted(task);
                         }

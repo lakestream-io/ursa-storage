@@ -4,6 +4,10 @@
  */
 package io.lakestream.ursa.compact;
 
+import io.lakestream.api.StreamCatalog;
+import io.lakestream.api.StreamIdentifier;
+import io.lakestream.api.StreamMetadata;
+import io.lakestream.api.materialization.ResolvedMaterialization;
 import io.lakestream.ursa.compact.elect.CompactLeader;
 import io.lakestream.ursa.compact.elect.LeaderElectionService;
 import io.lakestream.ursa.compaction.CompactTaskManager;
@@ -52,6 +56,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
+import java.util.function.Function;
 import javax.annotation.Nullable;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
@@ -227,6 +232,32 @@ public class CompactionScheduler {
     }
 
     /**
+     * Reads a stream's catalog properties by log name, for the compaction tasks published against it.
+     *
+     * <p>Resolved lazily rather than captured: the catalog is opened after the storage bindings are
+     * built, so at binding time there is nothing to hand over yet. Returns an empty map when this
+     * deployment has no catalog.
+     */
+    private Map<String, String> lookupStreamProperties(String logName) {
+        StreamCatalog catalog = this.streamCatalog;
+        if (catalog == null) {
+            return Map.of();
+        }
+        StreamIdentifier id = CompactionWorker.toStreamIdentifier(logName);
+        StreamMetadata metadata = catalog.loadStream(id).join();
+        return metadata == null ? Map.of() : metadata.properties();
+    }
+
+    /** Resolves the current catalog destination for cleanup of a stream's managed table. */
+    private Optional<ResolvedMaterialization> lookupMaterialization(String logName) {
+        StreamCatalog catalog = this.streamCatalog;
+        if (catalog == null) {
+            return Optional.empty();
+        }
+        return catalog.resolveMaterialization(CompactionWorker.toStreamIdentifier(logName)).join();
+    }
+
+    /**
      * Reflectively loads the {@link CompactionStorageBindings} implementation and constructs it
      * with a single {@code Dependencies} bag. The lakehouse implementation provides a static
      * inner class named {@code Dependencies}; integration modules with different shapes should
@@ -252,7 +283,9 @@ public class CompactionScheduler {
                     scanTopicExecutor,
                     publishTaskExecutor,
                     compactedTaskExecutor,
-                    commitParquetFileExecutor);
+                    commitParquetFileExecutor,
+                    (Function<String, Map<String, String>>) this::lookupStreamProperties,
+                    (Function<String, Optional<ResolvedMaterialization>>) this::lookupMaterialization);
             Constructor<?> ctor = clazz.getConstructor(depsClass);
             return (CompactionStorageBindings) ctor.newInstance(depsInstance);
         } catch (ReflectiveOperationException e) {

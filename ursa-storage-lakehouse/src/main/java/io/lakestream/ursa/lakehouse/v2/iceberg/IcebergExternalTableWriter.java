@@ -73,7 +73,7 @@ public class IcebergExternalTableWriter extends AbstractLakehouseWriter {
         this.encoder = entrySerdeFactory.getEncoder(serializeType);
         this.icebergSinkConfig = new IcebergSinkConfig(config.getProperties());
         this.isSchemaEvolutionEnabled = config.isSchemaEvolutionEnabled();
-        this.icebergTable = new IcebergTable(config, IcebergTable.getTableIdentifierByTopic(topic));
+        this.icebergTable = new IcebergTable(config, IcebergTable.getTableIdentifierByTopic(topic, config));
         if (isSchemaEvolutionEnabled) {
             this.icebergTableSchemaService = new IcebergTableSchemaService(icebergTable, config);
         }

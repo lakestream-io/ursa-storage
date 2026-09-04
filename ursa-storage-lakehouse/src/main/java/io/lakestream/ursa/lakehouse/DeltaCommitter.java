@@ -6,6 +6,7 @@ package io.lakestream.ursa.lakehouse;
 
 import io.delta.kernel.types.StructType;
 import io.delta.kernel.utils.CloseableIterator;
+import io.lakestream.api.materialization.TableIdentifier;
 import io.lakestream.ursa.compaction.task.CompactStreamTask;
 import io.lakestream.ursa.lakehouse.delta.AddFileAction;
 import io.lakestream.ursa.lakehouse.delta.DeltaTable;
@@ -13,6 +14,7 @@ import io.lakestream.ursa.lakehouse.delta.ExternalDeltaTableFactory;
 import io.lakestream.ursa.lakehouse.delta.ManagedDeltaTable;
 import io.lakestream.ursa.lakehouse.exception.LakehouseException;
 import io.lakestream.ursa.lakehouse.utils.AvroSchemaUtilExtended;
+import io.lakestream.ursa.lakehouse.utils.StreamTableNaming;
 import io.lakestream.ursa.lakehouse.v2.MessageId;
 import io.lakestream.ursa.lakehouse.writer.ParquetFileStat;
 import java.io.IOException;
@@ -34,13 +36,21 @@ public class DeltaCommitter implements LakehouseCommitter {
     private DeltaTable deltaTable;
 
     public DeltaCommitter(LakehouseConfiguration config, String parentTopic) {
+        this(config, parentTopic, StreamTableNaming.resolve(parentTopic, config.getProperties()));
+    }
+
+    public DeltaCommitter(
+            LakehouseConfiguration config,
+            String parentTopic,
+            TableIdentifier resolvedIdentifier) {
         this.config = config;
         this.parentTopic = parentTopic;
+        String destination = StreamTableNaming.qualifiedName(resolvedIdentifier);
         boolean isManagedMode = config.getStreamTableMode() == LakehouseConfiguration.StreamTableMode.MANAGED;
         if (isManagedMode) {
-            this.deltaTable = new ManagedDeltaTable(config, parentTopic);
+            this.deltaTable = new ManagedDeltaTable(config, destination);
         } else {
-            this.deltaTable = ExternalDeltaTableFactory.getDeltaTable(config, parentTopic);
+            this.deltaTable = ExternalDeltaTableFactory.getDeltaTable(config, destination);
         }
     }
 

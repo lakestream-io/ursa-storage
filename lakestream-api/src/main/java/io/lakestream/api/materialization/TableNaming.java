@@ -4,6 +4,7 @@
  */
 package io.lakestream.api.materialization;
 
+import io.lakestream.api.SourceMetadataProperties;
 import io.lakestream.api.StreamIdentifier;
 import java.util.Map;
 import java.util.Objects;
@@ -22,7 +23,9 @@ import java.util.regex.Pattern;
  * <p>Supported template variables (case-sensitive):
  * <ul>
  *   <li>{@code ${stream.namespace}} — the stream's namespace</li>
- *   <li>{@code ${stream.name}} — the stream's name within the namespace</li>
+ *   <li>{@code ${stream.name}} — the stream's storage name within the namespace</li>
+ *   <li>{@code ${stream.logicalName}} — the source-owned logical name, falling back to
+ *       {@code stream.name}</li>
  *   <li>{@code ${stream.property.<key>}} — the stream property named
  *       {@code <key>}; only resolved by {@link #toTableIdentifier(StreamIdentifier, Map)}.
  *       The single-argument {@link #toTableIdentifier(StreamIdentifier)} has no
@@ -37,6 +40,7 @@ public record TableNaming(Optional<String> tableNamespacePrefix, String tableNam
     private static final Pattern VARIABLE_PATTERN = Pattern.compile("\\$\\{([^}]+)}");
     private static final String STREAM_NAMESPACE_VAR = "stream.namespace";
     private static final String STREAM_NAME_VAR = "stream.name";
+    private static final String STREAM_LOGICAL_NAME_VAR = "stream.logicalName";
     private static final String STREAM_PROPERTY_PREFIX = "stream.property.";
 
     /** Canonical constructor: validates the optional and required template fields. */
@@ -97,6 +101,8 @@ public record TableNaming(Optional<String> tableNamespacePrefix, String tableNam
                 replacement = streamId.namespace();
             } else if (STREAM_NAME_VAR.equals(variable)) {
                 replacement = streamId.name();
+            } else if (STREAM_LOGICAL_NAME_VAR.equals(variable)) {
+                replacement = SourceMetadataProperties.logicalName(streamId, properties);
             } else if (variable.startsWith(STREAM_PROPERTY_PREFIX)) {
                 String key = variable.substring(STREAM_PROPERTY_PREFIX.length());
                 replacement = properties.get(key);

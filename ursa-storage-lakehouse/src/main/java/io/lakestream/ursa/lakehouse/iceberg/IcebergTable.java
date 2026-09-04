@@ -23,8 +23,8 @@ import io.lakestream.ursa.lakehouse.exception.LakehouseException;
 import io.lakestream.ursa.lakehouse.exception.PersistTagFailedException;
 import io.lakestream.ursa.lakehouse.iceberg.exception.SchemaEvolutionException;
 import io.lakestream.ursa.lakehouse.iceberg.exception.SchemaMappingException;
+import io.lakestream.ursa.lakehouse.utils.StreamTableNaming;
 import io.lakestream.ursa.lakehouse.utils.TableNameFormatUtils;
-import io.lakestream.ursa.lakehouse.utils.TopicName;
 import io.lakestream.ursa.lakehouse.v2.MessageId;
 import io.lakestream.ursa.lakehouse.writer.ParquetFileStat;
 import java.time.Duration;
@@ -1383,11 +1383,20 @@ public class IcebergTable {
         updateTableProperties(transaction, Map.of(LAKESTREAM_SCHEMA_MAPPING, schemaInfo));
     }
 
-    public static TableIdentifier getTableIdentifierByTopic(String topic) {
-        var partitionedTopicName = TopicName.getPartitionedTopicName(topic);
-        var icebergNs = Namespace.of(partitionedTopicName.getNamespace());
-        var tableName = partitionedTopicName.getLocalName();
-        return TableIdentifier.of(icebergNs, tableName);
+    /**
+     * Resolves the table for {@code topic}, the one way table identity is derived.
+     *
+     * <p>Writers resolve through {@link StreamTableNaming#resolveForWriter}; new tasks persist that
+     * result for committers. A second derivation that skipped the configuration would put them out of
+     * step, and the symptom is silent: data files land in the warehouse and no snapshot ever
+     * references them.
+     */
+    public static TableIdentifier getTableIdentifierByTopic(String topic, LakehouseConfiguration config) {
+        return toIceberg(StreamTableNaming.resolveForWriter(topic, config.getProperties()));
+    }
+
+    private static TableIdentifier toIceberg(io.lakestream.api.materialization.TableIdentifier identifier) {
+        return TableIdentifier.of(Namespace.of(identifier.namespace()), identifier.name());
     }
 
     public static long getLatestMetadataSize(Table table) {

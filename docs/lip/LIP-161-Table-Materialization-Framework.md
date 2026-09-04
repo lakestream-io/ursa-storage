@@ -168,7 +168,7 @@ TableCatalog                              (registered at cluster, name-addressab
                                   ▲
                                   │ referenced by name
 TableMaterializationPolicy on Namespace   (ACTIVE — drives materialization
-  catalogRef + tableNaming required;       for every stream in the namespace)
+  catalogRef required; tableNaming optional for every stream in the namespace)
   framework / evolution / primaryKey /
   baseSchemaVersion / table defaults
                                   │ deep-merged; stream wins per field
@@ -182,13 +182,24 @@ TableMaterializationPolicy on Stream      (OVERRIDE — partial)
 
 A stream is materialized **iff** the resolved policy has `catalogRef` set
 (from either layer) **and** `enabled` is not explicitly `false` at stream
-level. Source schema declaration stays on `StreamMetadata.schema()`
-(`SchemaConfig`) — the policy does not duplicate it.
+level. An explicit stream `tableIdentifier` wins over namespace `tableNaming`.
+Without either, MANAGED tables use the storage stream name while EXTERNAL/CUSTOM
+tables use source logical-name metadata and fall back to the stream name. Source
+schema declaration stays on `StreamMetadata.schema()` (`SchemaConfig`) — the
+policy does not duplicate it.
+
+The resolved table identifier is the catalog target; it never replaces storage identity. Internal
+Compacted Objects and Oxia indexes remain keyed by the canonical partition log and numeric stream
+ID. An EXTERNAL/CUSTOM SDT writer, its DLT writer, and its committer all use the same resolved table
+identifier. A MANAGED writer still receives the canonical partition log for SBT object layout and
+partition metadata while carrying the catalog identifier separately. When SBT and SDT are both
+enabled, one source read fans out to independent writers rather than sharing an identity or writing
+through two managed writers.
 
 | Concept | Owner | Lifecycle | Carries |
 |---|---|---|---|
 | `TableCatalog` | Cluster ops | Hybrid: config bootstrap + runtime `registerTableCatalog` API | Name, `TableCatalogType`, connection settings (incl. `catalog-impl` for Iceberg sub-flavours), type-level tuning |
-| `TableMaterializationPolicy` (namespace) | Platform / namespace owner | Set via `setNamespaceMaterialization` | Active policy with `catalogRef` + `tableNaming` template + framework/evolution/table defaults |
+| `TableMaterializationPolicy` (namespace) | Platform / namespace owner | Set via `setNamespaceMaterialization` | Active policy with `catalogRef`, optional `tableNaming`, and framework/evolution/table defaults |
 | `TableMaterializationPolicy` (stream) | Stream owner | Set via `setStreamMaterialization` or `createStream(..., materialization)` | Per-stream overrides; optional `enabled = false` opt-out; optional explicit `tableIdentifier`; `connectionOverrides` |
 | *(Cluster Conf — NOT in any of these)* | Operator | Deployment config | Storage credentials, perf limits, executor sizing |
 

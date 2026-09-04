@@ -75,7 +75,7 @@ public class IcebergManagedTableWriter extends LakehouseWriter {
 
     private IcebergTable getIcebergTable(Schema schema) throws LakehouseOptException {
         try {
-            var tableIdentifier = IcebergTable.getTableIdentifierByTopic(topic);
+            var tableIdentifier = IcebergTable.getTableIdentifierByTopic(topic, configuration);
 
             // Check if Unity Catalog is being used
             boolean isUnityCatalog = IcebergTable.ICEBERG_CATALOG_TYPE_UNITYCATALOG.equalsIgnoreCase(

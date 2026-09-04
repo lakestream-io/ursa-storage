@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.lakestream.ursa.lakehouse.LakehouseConfiguration;
 import io.lakestream.ursa.lakehouse.iceberg.IcebergTable;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -71,7 +72,8 @@ public class DedupFilesTest {
 
     /** Create a table and append the given file paths, one append (= one snapshot) per path. */
     private Table createTableAppending(String stream, String... dataFilePaths) throws Exception {
-        TableIdentifier tableId = IcebergTable.getTableIdentifierByTopic(stream);
+        TableIdentifier tableId = IcebergTable.getTableIdentifierByTopic(
+                stream, new LakehouseConfiguration(new Properties()));
         Schema schema = new Schema(Types.NestedField.required(1, "id", Types.IntegerType.get()));
         Table table = catalog.createTable(tableId, schema, PartitionSpec.unpartitioned());
         for (String relativePath : dataFilePaths) {

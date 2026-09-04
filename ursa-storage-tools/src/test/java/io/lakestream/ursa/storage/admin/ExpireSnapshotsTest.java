@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.lakestream.ursa.lakehouse.LakehouseConfiguration;
 import io.lakestream.ursa.lakehouse.iceberg.IcebergTable;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -203,7 +204,8 @@ public class ExpireSnapshotsTest {
 
     private void createTableWithSnapshots(String stream, int snapshotCount) throws Exception {
         // Derive table identifier the same way the command does
-        TableIdentifier tableId = IcebergTable.getTableIdentifierByTopic(stream);
+        TableIdentifier tableId = IcebergTable.getTableIdentifierByTopic(
+                stream, new LakehouseConfiguration(new Properties()));
 
         Schema schema = new Schema(Types.NestedField.required(1, "id", Types.IntegerType.get()));
         Table table = catalog.createTable(tableId, schema, PartitionSpec.unpartitioned());

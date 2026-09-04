@@ -37,6 +37,16 @@ public final class TopicName {
         return get(get(value).getPartitionedTopicName());
     }
 
+    /**
+     * Resolves the stream identified by a canonical {@code namespace/name-partition-N} log name.
+     *
+     * <p>The returned local name never carries a partition, because a table is keyed by the stream rather
+     * than by one of its partitions.
+     */
+    public static TopicName getStreamIdentity(String value) {
+        return getPartitionedTopicName(value);
+    }
+
     public String getPartitionedTopicName() {
         Matcher matcher = PARTITION_SUFFIX.matcher(localName);
         String baseName = matcher.find() ? localName.substring(0, matcher.start()) : localName;

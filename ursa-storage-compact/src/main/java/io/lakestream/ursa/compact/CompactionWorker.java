@@ -490,19 +490,12 @@ public class CompactionWorker implements Runnable {
             if (value == null || value.isBlank() || value.contains("://")) {
                 throw new IllegalArgumentException("Invalid stream name: " + value);
             }
-            String[] parts = value.strip().split("/", -1);
-            String namespace;
-            String localName;
-            if (parts.length == 1) {
-                namespace = "default";
-                localName = parts[0];
-            } else if (parts.length == 2) {
-                namespace = parts[0];
-                localName = parts[1];
-            } else {
-                throw new IllegalArgumentException("Invalid stream name: " + value);
-            }
-            if (namespace.isBlank() || localName.isBlank()) {
+            String stripped = value.strip();
+            int separator = stripped.lastIndexOf('/');
+            String namespace = separator < 0 ? "default" : stripped.substring(0, separator);
+            String localName = separator < 0 ? stripped : stripped.substring(separator + 1);
+            if (namespace.isBlank() || namespace.startsWith("/") || namespace.endsWith("/")
+                    || namespace.contains("//") || localName.isBlank()) {
                 throw new IllegalArgumentException("Invalid stream name: " + value);
             }
             Matcher matcher = PARTITION_SUFFIX.matcher(localName);

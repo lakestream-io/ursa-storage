@@ -177,7 +177,7 @@ public class DedupFiles implements Callable<Integer> {
             System.out.println("Using catalog: " + catalogName);
 
             LakehouseConfiguration configuration = new LakehouseConfiguration(properties);
-            TableIdentifier identifier = IcebergTable.getTableIdentifierByTopic(topic);
+            TableIdentifier identifier = IcebergTable.getTableIdentifierByTopic(topic, configuration);
             System.out.println("Table identifier: " + identifier);
 
             icebergTable = new IcebergTable(configuration, identifier);

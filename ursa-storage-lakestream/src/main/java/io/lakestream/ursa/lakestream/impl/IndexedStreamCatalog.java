@@ -592,7 +592,7 @@ public class IndexedStreamCatalog implements StreamCatalog {
     private CompletableFuture<Void> provisionNativePartition(
             StreamIdentifier id, IndexedStreamConfigStore.ProvisioningClaim claim,
             int partIdx) {
-        String allocationKey = nativePartitionAllocationKey(id, partIdx);
+        String allocationKey = partitionAllocationKey(id, partIdx);
         return allocateNativePartition(
             id, partIdx, allocationKey, claim,
             () -> streamConfigStore.verifyProvisioningOwnership(id, claim),
@@ -610,7 +610,7 @@ public class IndexedStreamCatalog implements StreamCatalog {
     private CompletableFuture<Void> expandPartition(
             StreamIdentifier id, IndexedStreamConfigStore.ExpansionClaim claim,
             int partitionIndex) {
-        String allocationKey = nativePartitionAllocationKey(id, partitionIndex);
+        String allocationKey = partitionAllocationKey(id, partitionIndex);
         return allocateNativePartition(
             id, partitionIndex, allocationKey, expansionCleanupClaim(claim),
             () -> streamConfigStore.verifyExpansion(id, claim),
@@ -1085,10 +1085,9 @@ public class IndexedStreamCatalog implements StreamCatalog {
         return () -> streamConfigStore.verifyNativeCleanupContext(id, context);
     }
 
-    private static String nativePartitionAllocationKey(
+    private String partitionAllocationKey(
             StreamIdentifier id, int partitionIndex) {
-        return "lakestream-native/" + id.fullName()
-            + "/partition-" + partitionIndex;
+        return catalogPaths.compactedReaderName(id, partitionIndex);
     }
 
     private CompletableFuture<Long> allocateNativeKeyedStreamId(
@@ -2530,7 +2529,7 @@ public class IndexedStreamCatalog implements StreamCatalog {
     }
 
     private String dropMappingKey(StreamIdentifier id, int partitionIndex) {
-        return nativePartitionAllocationKey(id, partitionIndex);
+        return partitionAllocationKey(id, partitionIndex);
     }
 
     private CompletableFuture<PartitionTombstone> tombstoneDroppedPartition(

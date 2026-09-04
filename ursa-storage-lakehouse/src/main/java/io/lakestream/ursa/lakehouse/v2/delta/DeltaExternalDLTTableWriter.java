@@ -15,7 +15,7 @@ import io.lakestream.ursa.lakehouse.delta.ExternalDeltaTable;
 import io.lakestream.ursa.lakehouse.delta.ExternalDeltaTableFactory;
 import io.lakestream.ursa.lakehouse.delta.GenericRow;
 import io.lakestream.ursa.lakehouse.delta.ParquetRowWriter;
-import io.lakestream.ursa.lakehouse.utils.TopicName;
+import io.lakestream.ursa.lakehouse.utils.StreamTableNaming;
 import io.lakestream.ursa.lakehouse.v2.IWriteResult;
 import io.lakestream.ursa.lakehouse.v2.LakehouseRecordWriter;
 import io.lakestream.ursa.lakehouse.v2.LakehouseWriterMetrics;
@@ -50,7 +50,9 @@ public class DeltaExternalDLTTableWriter implements LakehouseRecordWriter<Failur
         this.topic = topic;
         this.config = config;
         this.metrics = LakehouseWriterMetrics.getInstance(provider);
-        String dltTopic = TopicName.get(topic).getPartitionedTopicName() + config.getDltSuffix();
+        var mainIdentifier = StreamTableNaming.resolveForWriter(topic, config.getProperties());
+        String dltTopic = StreamTableNaming.qualifiedName(
+                StreamTableNaming.deadLetterTable(mainIdentifier, config.getDltSuffix()));
         this.deltaTable = ExternalDeltaTableFactory.getDeltaTable(config, dltTopic);
     }
 
