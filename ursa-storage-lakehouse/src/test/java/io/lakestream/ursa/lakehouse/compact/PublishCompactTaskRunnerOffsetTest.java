@@ -45,6 +45,8 @@ import org.mockito.InOrder;
 class PublishCompactTaskRunnerOffsetTest {
 
     private static final String TOPIC = "default/test-partition-0";
+    /** Logical source topic resolved from {@link #TOPIC} when the stream carries no Kafka metadata. */
+    private static final String SCHEMA_TOPIC = "test";
     private static final long STREAM_ID = 42L;
     private static final Attributes TOPIC_ATTRIBUTES =
             Attributes.of(AttributeKey.stringKey("topic"), TOPIC);
@@ -73,7 +75,7 @@ class PublishCompactTaskRunnerOffsetTest {
         when(metrics.getPublishedTaskBytes()).thenReturn(publishedTaskBytes);
 
         SchemaRegistry schemaRegistry = mock(SchemaRegistry.class);
-        when(schemaRegistry.fetchLatest(TOPIC)).thenReturn(new SchemaMetadata(1, 1, "AVRO", null, "{}"));
+        when(schemaRegistry.fetchLatest(SCHEMA_TOPIC)).thenReturn(new SchemaMetadata(1, 1, "AVRO", null, "{}"));
         runner = new PublishCompactTaskRunner(
                 storageApi,
                 taskManager,

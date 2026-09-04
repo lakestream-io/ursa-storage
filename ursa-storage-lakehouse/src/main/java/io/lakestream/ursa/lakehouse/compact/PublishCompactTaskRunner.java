@@ -18,6 +18,7 @@ import io.lakestream.ursa.lakehouse.exception.SchemaNotFoundException;
 import io.lakestream.ursa.lakehouse.exception.TopicNotFoundException;
 import io.lakestream.ursa.lakehouse.schema.SchemaRegistry;
 import io.lakestream.ursa.lakehouse.utils.TopicName;
+import io.lakestream.ursa.materialization.serde.kafka.KafkaSourceMetadata;
 import io.lakestream.ursa.storage.StorageApi;
 import io.lakestream.ursa.storage.impl.StorageConfig;
 import io.lakestream.ursa.storage.impl.compaction.StartStopRunner;
@@ -124,7 +125,9 @@ public class PublishCompactTaskRunner implements Runnable, StartStopRunner {
     public void publishStreamCompactTask(String topic, TopicMetadata topicMetadata)
             throws IOException, ExecutionException, InterruptedException {
         long streamId = topicMetadata.streamId();
-        SchemaStatus schemaStatus = checkSchemaExist(topic, schemaCacheTopics, schemaRegistry);
+        // The schema subject is keyed by the logical source topic, never by the UUID-qualified stream name.
+        String schemaTopic = KafkaSourceMetadata.topicName(topic, topicMetadata.properties());
+        SchemaStatus schemaStatus = checkSchemaExist(schemaTopic, schemaCacheTopics, schemaRegistry);
         if (schemaStatus != SchemaStatus.SUPPORTED) {
             if (retryableTopicQuarantineInMs <= 0) {
                 return;
@@ -214,8 +217,7 @@ public class PublishCompactTaskRunner implements Runnable, StartStopRunner {
         }
         // We have data to compaction, check if the schema is NOT_FOUND
         if (schemaStatus == SchemaStatus.NOT_FOUND) {
-            String partitionedTopicName = TopicName.get(topic).getPartitionedTopicName();
-            schemaCacheTopics.add(partitionedTopicName);
+            schemaCacheTopics.add(schemaTopic);
         }
 
         Long endOffset = pair.getLeft();
@@ -264,15 +266,20 @@ public class PublishCompactTaskRunner implements Runnable, StartStopRunner {
         compactionMetrics.getCompactionLag().set(Math.subtractExact(latestOffset, publishedOffset), attributes);
     }
 
-    public static SchemaStatus checkSchemaExist(String topic,
+    /**
+     * Checks whether the schema registered for a logical source topic can be materialized.
+     *
+     * @param schemaTopic the logical source topic resolved from the stream properties, shared by every
+     *                    partition of the stream; it is also the key of {@code schemaCacheTopics}
+     */
+    public static SchemaStatus checkSchemaExist(String schemaTopic,
                                            Set<String> schemaCacheTopics,
                                            SchemaRegistry schemaRegistry) {
-        String partitionedTopicName = TopicName.get(topic).getPartitionedTopicName();
-        if (schemaCacheTopics.contains(partitionedTopicName)) {
+        if (schemaCacheTopics.contains(schemaTopic)) {
             return SchemaStatus.SUPPORTED;
         }
         try {
-            SchemaMetadata schemaMetadata = schemaRegistry.fetchLatest(topic);
+            SchemaMetadata schemaMetadata = schemaRegistry.fetchLatest(schemaTopic);
             switch (schemaMetadata.getSchemaType()) {
                 case "AVRO":
                 case "JSON":
@@ -281,14 +288,14 @@ public class PublishCompactTaskRunner implements Runnable, StartStopRunner {
                 default:
                     return SchemaStatus.NOT_SUPPORTED;
             }
-            schemaCacheTopics.add(partitionedTopicName);
+            schemaCacheTopics.add(schemaTopic);
             return SchemaStatus.SUPPORTED;
         } catch (FetchSchemaFailedException e) {
             return SchemaStatus.FETCH_FAILED;
         } catch (SchemaNotFoundException ex) {
             return SchemaStatus.NOT_FOUND;
         } catch (Exception ee) {
-            log.warn("Unexpected error when fetch schema for topic {} ", topic, ee);
+            log.warn("Unexpected error when fetch schema for topic {} ", schemaTopic, ee);
             return SchemaStatus.INVALID;
         }
     }
