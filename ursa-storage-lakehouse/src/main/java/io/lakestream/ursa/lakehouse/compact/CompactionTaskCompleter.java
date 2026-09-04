@@ -5,6 +5,8 @@
 package io.lakestream.ursa.lakehouse.compact;
 
 import static io.lakestream.ursa.lakehouse.v2.AbstractLakehouseWriter.BATCH_MESSAGE_COUNT;
+import static io.lakestream.ursa.lakehouse.v2.AbstractLakehouseWriter.LAST_BATCH_ID_IN_FILE;
+import static io.lakestream.ursa.lakehouse.v2.AbstractLakehouseWriter.LAST_ENTRY_ID_IN_FILE;
 
 import io.lakestream.ursa.compaction.CompactTaskManager;
 import io.lakestream.ursa.compaction.task.CompactStreamTask;
@@ -24,6 +26,7 @@ import java.util.Optional;
 import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.iceberg.io.WriteResult;
 
 /**
@@ -35,16 +38,48 @@ import org.apache.iceberg.io.WriteResult;
  * <p>Extracted from {@code LakehouseCompactionWorker.completeCompaction} so every materialization
  * dispatch reuses the exact same task-completion and persistence logic (rather than committing per
  * task, which would bypass the group-commit runner).
+ *
+ * <p>Every managed (stream-backed table) Parquet file is always recorded as a {@link ManagedWriteResult}
+ * so the commit runner can publish a {@code ManagedTableFileIndex} in the compacted entry index. Both
+ * compacted-object readers ({@code LakehouseKafkaReaderV2} and the Kafka-only
+ * {@code KafkaLakehouseReader}) require that index to locate the Parquet file for an offset; a compacted
+ * range without it is unreadable.
  */
+@Slf4j
 public class CompactionTaskCompleter {
 
-    private final CompactTaskManager compactTaskManager;
-    private final boolean managedTableSchemaEvolutionEnabled;
+    /**
+     * Historical property that used to gate {@code ManagedTableFileIndex} emission. It is now a no-op:
+     * the index is always written because no reader can consume a compacted range without it.
+     */
+    public static final String MANAGED_TABLE_SCHEMA_EVOLUTION_ENABLED = "managedTableSchemaEvolutionEnabled";
 
+    private final CompactTaskManager compactTaskManager;
+
+    public CompactionTaskCompleter(CompactTaskManager compactTaskManager) {
+        this.compactTaskManager = compactTaskManager;
+    }
+
+    /**
+     * @deprecated the {@code managedTableSchemaEvolutionEnabled} flag no longer has any effect; use
+     *     {@link #CompactionTaskCompleter(CompactTaskManager)}.
+     */
+    @Deprecated
     public CompactionTaskCompleter(CompactTaskManager compactTaskManager,
                                    boolean managedTableSchemaEvolutionEnabled) {
-        this.compactTaskManager = compactTaskManager;
-        this.managedTableSchemaEvolutionEnabled = managedTableSchemaEvolutionEnabled;
+        this(compactTaskManager);
+    }
+
+    /**
+     * Logs a warning when the deprecated {@code managedTableSchemaEvolutionEnabled} property is present
+     * so operators know it can be removed from their configuration.
+     */
+    public static void warnIfDeprecatedFlagConfigured(Object configuredValue) {
+        if (configuredValue != null) {
+            log.warn("Property '{}' (={}) is deprecated and ignored: the ManagedTableFileIndex is now always "
+                     + "written for compacted stream-backed tables. Remove it from the configuration.",
+                MANAGED_TABLE_SCHEMA_EVOLUTION_ENABLED, configuredValue);
+        }
     }
 
     /**
@@ -97,9 +132,6 @@ public class CompactionTaskCompleter {
         task.setStats(stat.getStats());
         task.setPartitionValues(Collections.emptyMap());
 
-        if (!managedTableSchemaEvolutionEnabled) {
-            return;
-        }
         TreeSet<ManagedWriteResult> managedWriteResults = new TreeSet<>();
         for (IWriteResult writeResult : writeResults) {
             if (writeResult instanceof ParquetWriteResult pwr) {
@@ -108,8 +140,8 @@ public class CompactionTaskCompleter {
                 var fileSize = pwr.getDataFileSize();
                 var messageCount = (AtomicLong) pwr.getExtraMetadata().get(BATCH_MESSAGE_COUNT);
                 var messageCountIntValue = Math.toIntExact(messageCount.get());
-                long lastEntryId = (long) pwr.getExtraMetadata().getOrDefault("lastEntryIdInFile", -1L);
-                long lastBatchId = (long) pwr.getExtraMetadata().getOrDefault("lastBatchIdInFile", -1L);
+                long lastEntryId = (long) pwr.getExtraMetadata().getOrDefault(LAST_ENTRY_ID_IN_FILE, -1L);
+                long lastBatchId = (long) pwr.getExtraMetadata().getOrDefault(LAST_BATCH_ID_IN_FILE, -1L);
                 var mwr = ManagedWriteResult.builder()
                     .filePath(filePath)
                     .fullFilePath(fileFullPath)
