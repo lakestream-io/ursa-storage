@@ -90,11 +90,15 @@ The compaction orchestrator uses these implementation-class properties:
 - Keep lines at or below 120 characters.
 - Manage dependency versions through the repository BOMs.
 - Fix real SpotBugs findings rather than adding broad exclusions.
+- Confluent Community License artifacts (`kafka-json-schema-*`, `kafka-protobuf-*`) are test scope
+  only; the enforcer rule fails the build otherwise. JSON Schema / Protobuf decoding uses
+  `ursa-storage-materialization`'s `serde.kafka.schema` package instead.
 
 ## Documentation
 
 - [Build locally](docs/developer/build.md)
 - [Contributing](docs/developer/contribute.md)
+- [Third-party license notes](docs/developer/third-party-licenses.md)
 - [Concepts](docs/concepts.md)
 - [Module map](docs/agent/module-map.md)
 - [Table materialization](docs/user/table-materialization.md)

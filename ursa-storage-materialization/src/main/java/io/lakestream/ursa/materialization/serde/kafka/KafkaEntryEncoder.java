@@ -5,7 +5,6 @@
 package io.lakestream.ursa.materialization.serde.kafka;
 
 import io.confluent.kafka.schemaregistry.client.SchemaMetadata;
-import io.confluent.kafka.schemaregistry.protobuf.MessageIndexes;
 import io.lakestream.api.EntryHeader;
 import io.lakestream.ursa.exception.ExceptionCode;
 import io.lakestream.ursa.exception.ExceptionWithCode;
@@ -20,6 +19,7 @@ import io.lakestream.ursa.materialization.serde.SchemaKey;
 import io.lakestream.ursa.materialization.serde.SchemaService;
 import io.lakestream.ursa.materialization.serde.TableSchemaService;
 import io.lakestream.ursa.materialization.serde.exception.FatalException;
+import io.lakestream.ursa.materialization.serde.kafka.schema.SchemaRegistryWireFormat;
 import io.lakestream.ursa.materialization.util.KafkaMessage;
 import io.lakestream.ursa.materialization.util.PBRecordReader;
 import io.lakestream.ursa.storage.Entry;
@@ -186,16 +186,14 @@ public abstract class KafkaEntryEncoder<T> {
 
     private static List<Integer> parseMessageIndexes(byte[] data) {
         ByteBuffer message = ByteBuffer.wrap(data);
-        message.get();
-        message.getInt();
-        return MessageIndexes.readFrom(message).indexes();
+        SchemaRegistryWireFormat.readSchemaId(message);
+        return SchemaRegistryWireFormat.readMessageIndexes(message);
     }
 
     private static int getSchemaId(byte[] payload) {
-        ByteBuffer buffer = ByteBuffer.wrap(payload);
-        if (buffer.remaining() < 5 || buffer.get() != 0) {
+        if (!SchemaRegistryWireFormat.hasHeader(payload)) {
             return KafkaSchemaService.PRIMITIVE_SCHEMA_ID;
         }
-        return buffer.getInt();
+        return SchemaRegistryWireFormat.readSchemaId(ByteBuffer.wrap(payload));
     }
 }

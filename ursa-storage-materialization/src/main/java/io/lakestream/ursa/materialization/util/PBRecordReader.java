@@ -6,8 +6,7 @@ package io.lakestream.ursa.materialization.util;
 
 import com.google.protobuf.Descriptors;
 import com.google.protobuf.DynamicMessage;
-import io.confluent.kafka.schemaregistry.protobuf.MessageIndexes;
-import io.confluent.kafka.schemaregistry.protobuf.ProtobufSchema;
+import io.lakestream.ursa.materialization.serde.kafka.schema.ProtobufSchemaDescriptors;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
@@ -171,12 +170,10 @@ public class PBRecordReader {
     }
 
     public static Schema convertPbSchemaToAvro(String schemas, List<Integer> messageIndexes) {
-        var pbSchema = new ProtobufSchema(schemas);
-        var name = pbSchema.toMessageName(new MessageIndexes(messageIndexes));
-        pbSchema = pbSchema.copy(name);
+        var descriptor = ProtobufSchemaDescriptors.messageByIndexes(schemas, messageIndexes);
         // Use ProtobufDataExtend to handle uint32 to long conversion
         // The avro default implementation is to map uint32 to int, which is not compatible with Lakehouse
-        var schema = ProtobufDataExtend.get().getSchema(pbSchema.toDescriptor());
+        var schema = ProtobufDataExtend.get().getSchema(descriptor);
         schema = makeMapEntriesNullable(schema);
         return schema;
     }
@@ -187,7 +184,7 @@ public class PBRecordReader {
      * definitions, making it safe to use for schema evolution across versions.
      */
     public static String resolveMessageName(String schemaStr, List<Integer> messageIndexes) {
-        return new ProtobufSchema(schemaStr).toMessageName(new MessageIndexes(messageIndexes));
+        return ProtobufSchemaDescriptors.messageNameByIndexes(schemaStr, messageIndexes);
     }
 
     /**
@@ -208,8 +205,8 @@ public class PBRecordReader {
      * is stable across versions but positional indexes may differ due to serializer reordering.
      */
     public static Schema convertPbSchemaToAvroByName(String schemaStr, String messageName) {
-        var pbSchema = new ProtobufSchema(schemaStr).copy(messageName);
-        var schema = ProtobufDataExtend.get().getSchema(pbSchema.toDescriptor());
+        var descriptor = ProtobufSchemaDescriptors.messageByName(schemaStr, messageName);
+        var schema = ProtobufDataExtend.get().getSchema(descriptor);
         return makeMapEntriesNullable(schema);
     }
 }

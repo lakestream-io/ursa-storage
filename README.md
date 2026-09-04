@@ -82,3 +82,8 @@ See [Contributing Guide](docs/developer/contribute.md) for information on how to
 ## License
 
 Ursa Storage is licensed under the [Apache License, Version 2.0](LICENSE).
+
+The binary distribution contains only Apache 2.0 and other permissively licensed third-party jars.
+JSON Schema and Protobuf records are decoded without the Confluent Community License provider
+artifacts; see [Third-party license notes](docs/developer/third-party-licenses.md) for details and
+the build guard rails.

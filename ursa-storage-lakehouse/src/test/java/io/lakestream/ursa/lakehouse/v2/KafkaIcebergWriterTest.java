@@ -7,17 +7,26 @@ package io.lakestream.ursa.lakehouse.v2;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.fail;
 
+import com.google.protobuf.Timestamp;
 import io.confluent.kafka.schemaregistry.annotations.Schema;
+import io.confluent.kafka.schemaregistry.client.CachedSchemaRegistryClient;
+import io.confluent.kafka.schemaregistry.json.JsonSchemaProvider;
+import io.confluent.kafka.schemaregistry.protobuf.ProtobufSchemaProvider;
 import io.confluent.kafka.serializers.KafkaAvroSerializer;
 import io.confluent.kafka.serializers.KafkaAvroSerializerConfig;
+import io.confluent.kafka.serializers.json.KafkaJsonSchemaSerializer;
+import io.confluent.kafka.serializers.protobuf.KafkaProtobufSerializer;
 import io.lakestream.api.EntryHeader;
+import io.lakestream.ursa.kafka.serde.protobuf.test.NestedTestProto.ComplexType;
+import io.lakestream.ursa.kafka.serde.protobuf.test.NestedTestProto.NestedMessage;
+import io.lakestream.ursa.kafka.serde.protobuf.test.NestedTestProto.Status;
+import io.lakestream.ursa.kafka.serde.protobuf.test.NestedTestProto.UserId;
 import io.lakestream.ursa.lakehouse.v2.serde.iceberg.KafkaEntryToIcebergRecordEncoder;
 import io.lakestream.ursa.materialization.serde.EntryEncoderContext;
 import io.lakestream.ursa.materialization.serde.GenericEntry;
 import io.lakestream.ursa.materialization.serde.MaterializationRecord;
 import io.lakestream.ursa.materialization.serde.ResultConsumer;
 import io.lakestream.ursa.materialization.serde.kafka.KafkaSchemaService;
-import io.lakestream.ursa.materialization.util.kafka.json.KafkaJsonSchemaSerializer;
 import io.lakestream.ursa.storage.Entry;
 import io.lakestream.ursa.test.containers.util.KafkaStandalone;
 import io.netty.buffer.Unpooled;
@@ -137,9 +146,13 @@ public class KafkaIcebergWriterTest {
         var topic = "json-topic-" + RandomStringUtils.secure().nextAlphabetic(4);
         var numberOfMessages = 5;
 
+        // The producer-side (Confluent Community License, test-only) serializer needs its own client with the
+        // Confluent JSON Schema provider; the materialization path under test uses the Apache-2.0 providers.
+        var producerRegistryClient = new CachedSchemaRegistryClient(kafkaStandalone.getSchemaRegistryUrl(), 100,
+                List.of(new JsonSchemaProvider()), Map.of());
         @Cleanup
         var serializer = new KafkaJsonSchemaSerializer<Object>(
-                kafkaStandalone.getSchemaRegistryClient(),
+                producerRegistryClient,
                 Map.of("schema.registry.url", "unused", "auto.register.schemas", true));
         List<ProducedMessage<JsonValue>> messages = new ArrayList<>();
         for (int i = 0; i < numberOfMessages; i++) {
@@ -249,6 +262,58 @@ public class KafkaIcebergWriterTest {
             var expectedNested = (GenericRecord) expected.get("nested");
             var actualNested = (Record) actual.getField("nested");
             assertEquals(expectedNested.get("enabled"), actualNested.getField("enabled"));
+        }
+    }
+
+    @Test
+    void testProtobufIntegration() throws Exception {
+        var topic = "protobuf-topic-" + RandomStringUtils.secure().nextAlphabetic(4);
+        var numberOfMessages = 5;
+
+        // Producer side: Confluent's (Community License, test-only) serializer with its own registry client. It
+        // registers the .proto text and writes message indexes; NestedMessage is the fourth message type in the
+        // file, so the payload addresses it as [3]. The materialization path decodes it with the Apache-2.0 stack.
+        var producerRegistryClient = new CachedSchemaRegistryClient(kafkaStandalone.getSchemaRegistryUrl(), 100,
+                List.of(new ProtobufSchemaProvider()), Map.of());
+        @Cleanup
+        var serializer = new KafkaProtobufSerializer<NestedMessage>(producerRegistryClient,
+                Map.of("schema.registry.url", "unused", "auto.register.schemas", true));
+        List<ProducedMessage<NestedMessage>> messages = new ArrayList<>();
+        for (int i = 0; i < numberOfMessages; i++) {
+            var value = NestedMessage.newBuilder()
+                    .setUserId(UserId.newBuilder().setKafkaUserId("user-" + i))
+                    .setIsActive(i % 2 == 0)
+                    .addExperimentsActive("exp-" + i)
+                    .addExperimentsActive("exp-" + (i + 1))
+                    .setUpdatedAt(Timestamp.newBuilder().setSeconds(1_700_000_000L + i))
+                    .setStatus(i % 2 == 0 ? Status.ACTIVE : Status.INACTIVE)
+                    .setComplexType(ComplexType.newBuilder().setOneId("one-" + i).setIsActive(true))
+                    .putMapType("k" + i, "v" + i)
+                    .setInner(NestedMessage.InnerMessage.newBuilder().setId("inner-" + i).addIds(i))
+                    .build();
+            byte[] key = ("key-" + i).getBytes(StandardCharsets.UTF_8);
+            messages.add(new ProducedMessage<>(value, key, serializer.serialize(topic, value), i));
+        }
+
+        var result = encodeEntries(topic, messages);
+
+        assertEquals(numberOfMessages, result.size());
+        for (int i = 0; i < result.size(); i++) {
+            var expected = messages.get(i).content();
+            var actual = result.get(i).record();
+
+            assertEquals(expected.getIsActive(), actual.getField("is_active"));
+            assertEquals(expected.getExperimentsActiveList(), actual.getField("experiments_active"));
+            assertEquals(expected.getStatus().name(), actual.getField("status"));
+
+            var userId = (Record) actual.getField("user_id");
+            assertEquals(expected.getUserId().getKafkaUserId(), userId.getField("kafka_user_id"));
+            var complexType = (Record) actual.getField("complex_type");
+            assertEquals(expected.getComplexType().getOneId(), complexType.getField("one_id"));
+            assertEquals(expected.getComplexType().getIsActive(), complexType.getField("is_active"));
+            var inner = (Record) actual.getField("inner");
+            assertEquals(expected.getInner().getId(), inner.getField("id"));
+            assertEquals(expected.getInner().getIdsList(), inner.getField("ids"));
         }
     }
 

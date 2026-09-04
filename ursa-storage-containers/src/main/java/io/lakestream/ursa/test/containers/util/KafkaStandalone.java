@@ -4,13 +4,9 @@
  */
 package io.lakestream.ursa.test.containers.util;
 
-import io.confluent.kafka.schemaregistry.SchemaProvider;
-import io.confluent.kafka.schemaregistry.avro.AvroSchemaProvider;
 import io.confluent.kafka.schemaregistry.client.CachedSchemaRegistryClient;
 import io.confluent.kafka.schemaregistry.client.SchemaRegistryClient;
-import io.confluent.kafka.schemaregistry.json.JsonSchemaProvider;
-import io.confluent.kafka.schemaregistry.protobuf.ProtobufSchemaProvider;
-import java.util.List;
+import io.lakestream.ursa.materialization.serde.kafka.schema.RawSchemaProvider;
 import java.util.Map;
 import java.util.Properties;
 import lombok.extern.slf4j.Slf4j;
@@ -140,12 +136,7 @@ public class KafkaStandalone extends GenericContainer<KafkaStandalone> {
             log.warn("Schema Registry is not enabled for this KafkaStandalone instance.");
             return null;
         }
-        JsonSchemaProvider jsonSchemaProvider = new JsonSchemaProvider();
-        AvroSchemaProvider avroSchemaProvider = new AvroSchemaProvider();
-        ProtobufSchemaProvider protobufSchemaProvider = new ProtobufSchemaProvider();
-        List<SchemaProvider> schemaProviders = List.of(jsonSchemaProvider, avroSchemaProvider,
-            protobufSchemaProvider);
-        return new CachedSchemaRegistryClient(url, 100, schemaProviders, Map.of());
+        return new CachedSchemaRegistryClient(url, 100, RawSchemaProvider.defaultProviders(), Map.of());
     }
     /**
      * Inner class defining the Schema Registry Service.

@@ -112,8 +112,11 @@
     <protobuf-java.version>3.25.8</protobuf-java.version>
     <avro.version>1.12.0</avro.version>
     <aircompressor.version>0.27</aircompressor.version>
-    <wire-schema-jvm.version>5.1.0</wire-schema-jvm.version>
+    <wire-schema-jvm.version>5.2.0</wire-schema-jvm.version>
     <wire-runtime-jvm.version>5.5.0</wire-runtime-jvm.version>
+    <!-- Apache-2.0 .proto text parser; keep its protobuf-java line aligned with protobuf-java.version. -->
+    <apicurio.version>2.6.13.Final</apicurio.version>
+    <maven-enforcer-plugin.version>3.5.0</maven-enforcer-plugin.version>
     <zstd-jni.version>1.5.6-10</zstd-jni.version>
 
     <!-- Maven plugins -->
@@ -379,11 +382,40 @@
         <version>${aircompressor.version}</version>
       </dependency>
 
-      <!-- Confluent Schema Registry 7.9.4 is compiled against the Wire 5.1 schema API. -->
+      <!-- Apicurio protobuf-schema-utilities 2.6.x is compiled against the Wire 5.2 schema API. -->
       <dependency>
         <groupId>com.squareup.wire</groupId>
         <artifactId>wire-schema-jvm</artifactId>
         <version>${wire-schema-jvm.version}</version>
+      </dependency>
+
+      <!--
+        Apache-2.0 replacement for the Confluent Community License kafka-protobuf-provider: parses .proto
+        text into protobuf descriptors. Only the JVM Wire artifacts managed above are kept; the
+        Kotlin-multiplatform umbrella artifacts and the unused icu4j dependency are excluded.
+      -->
+      <dependency>
+        <groupId>io.apicurio</groupId>
+        <artifactId>apicurio-registry-protobuf-schema-utilities</artifactId>
+        <version>${apicurio.version}</version>
+        <exclusions>
+          <exclusion>
+            <groupId>com.squareup.wire</groupId>
+            <artifactId>wire-schema</artifactId>
+          </exclusion>
+          <exclusion>
+            <groupId>com.ibm.icu</groupId>
+            <artifactId>icu4j</artifactId>
+          </exclusion>
+          <exclusion>
+            <groupId>com.google.protobuf</groupId>
+            <artifactId>protobuf-java</artifactId>
+          </exclusion>
+          <exclusion>
+            <groupId>com.google.protobuf</groupId>
+            <artifactId>protobuf-java-util</artifactId>
+          </exclusion>
+        </exclusions>
       </dependency>
 
       <dependency>
@@ -2343,6 +2375,39 @@
     <plugins>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-enforcer-plugin</artifactId>
+        <version>${maven-enforcer-plugin.version}</version>
+        <executions>
+          <execution>
+            <id>ban-non-apache-runtime-dependencies</id>
+            <goals>
+              <goal>enforce</goal>
+            </goals>
+            <configuration>
+              <rules>
+                <!--
+                  The Confluent JSON Schema and Protobuf providers/serializers are Confluent Community
+                  License artifacts. They may only appear in test scope; the distribution must stay free
+                  of them. See docs/developer/third-party-licenses.md.
+                -->
+                <bannedDependencies>
+                  <excludes>
+                    <exclude>io.confluent:kafka-json-schema-*:*:*:compile</exclude>
+                    <exclude>io.confluent:kafka-json-schema-*:*:*:runtime</exclude>
+                    <exclude>io.confluent:kafka-json-schema-*:*:*:provided</exclude>
+                    <exclude>io.confluent:kafka-protobuf-*:*:*:compile</exclude>
+                    <exclude>io.confluent:kafka-protobuf-*:*:*:runtime</exclude>
+                    <exclude>io.confluent:kafka-protobuf-*:*:*:provided</exclude>
+                  </excludes>
+                  <message>Confluent Community License artifacts are only allowed in test scope.</message>
+                </bannedDependencies>
+              </rules>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-compiler-plugin</artifactId>
         <version>${maven-compiler-plugin.version}</version>
         <configuration>
@@ -2445,19 +2510,26 @@
         <version>${license-maven-plugin.version}</version>
         <configuration>
           <header>resources/license.template</header>
+          <!--
+            Test fixtures ported verbatim from the Confluent Schema Registry protobuf-serializer module keep
+            Confluent's Apache-2.0 attribution instead of the repository header; see
+            docs/developer/third-party-licenses.md.
+          -->
+          <validHeaders>
+            <validHeader>resources/license-confluent-apache.template</validHeader>
+          </validHeaders>
           <excludes>
             <exclude>LICENSE</exclude>
             <exclude>NOTICE</exclude>
             <exclude>.trivyignore</exclude>
             <exclude>resources/license.template</exclude>
+            <exclude>resources/license-confluent-apache.template</exclude>
             <exclude>**/build/**</exclude>
             <exclude>**/ahc.properties</exclude>
             <exclude>**/.claude/**</exclude>
             <exclude>**/.idea/**</exclude>
             <exclude>**/.github/**</exclude>
-            <!-- Preserve upstream headers on sources copied from Confluent Schema Registry. -->
-            <exclude>**/materialization/util/kafka/json/**</exclude>
-            <exclude>**/materialization/util/kafka/protobuf/**</exclude>
+            <!-- Preserve upstream headers on tests ported from Confluent Schema Registry. -->
             <exclude>**/kafka/serde/json/KafkaJsonSchemaSerializerTest.java</exclude>
             <exclude>**/kafka/serde/protobuf/KafkaProtobufSerializerTest.java</exclude>
             <exclude>**/data/**</exclude>

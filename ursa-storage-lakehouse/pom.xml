@@ -453,10 +453,18 @@
       <groupId>com.google.api-client</groupId>
       <artifactId>google-api-client</artifactId>
     </dependency>
+    <!--
+      Confluent Community License serializers are used only to produce test payloads and by the upstream
+      serializer round-trip tests. They must stay in test scope (enforced by the root maven-enforcer rule).
+      kafka-protobuf-serializer also brings kafka-protobuf-types, whose bundled confluent/meta.proto and
+      confluent/type/decimal.proto are extracted by protobuf-maven-plugin so the src/test/proto fixtures can
+      import them; no copy of those files is kept in this repository.
+    -->
     <dependency>
       <groupId>io.yokota</groupId>
       <artifactId>mbknor-jackson-jsonschema-java8</artifactId>
       <version>1.0.39.3</version>
+      <scope>test</scope>
     </dependency>
 
     <dependency>
@@ -468,21 +476,9 @@
 
     <dependency>
       <groupId>io.confluent</groupId>
-      <artifactId>kafka-json-schema-provider</artifactId>
-      <version>${schema.registry.version}</version>
-    </dependency>
-
-    <dependency>
-      <groupId>io.confluent</groupId>
       <artifactId>kafka-protobuf-serializer</artifactId>
       <version>${schema.registry.version}</version>
       <scope>test</scope>
-    </dependency>
-
-    <dependency>
-      <groupId>io.confluent</groupId>
-      <artifactId>kafka-protobuf-provider</artifactId>
-      <version>${schema.registry.version}</version>
     </dependency>
 
     <dependency>

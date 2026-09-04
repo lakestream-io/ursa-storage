@@ -9,8 +9,11 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.fail;
 
 import io.confluent.kafka.schemaregistry.annotations.Schema;
+import io.confluent.kafka.schemaregistry.client.CachedSchemaRegistryClient;
+import io.confluent.kafka.schemaregistry.json.JsonSchemaProvider;
 import io.confluent.kafka.serializers.KafkaAvroSerializer;
 import io.confluent.kafka.serializers.KafkaAvroSerializerConfig;
+import io.confluent.kafka.serializers.json.KafkaJsonSchemaSerializer;
 import io.delta.kernel.data.ColumnVector;
 import io.delta.kernel.data.MapValue;
 import io.delta.kernel.data.Row;
@@ -22,7 +25,6 @@ import io.lakestream.ursa.materialization.serde.GenericEntry;
 import io.lakestream.ursa.materialization.serde.MaterializationRecord;
 import io.lakestream.ursa.materialization.serde.ResultConsumer;
 import io.lakestream.ursa.materialization.serde.kafka.KafkaSchemaService;
-import io.lakestream.ursa.materialization.util.kafka.json.KafkaJsonSchemaSerializer;
 import io.lakestream.ursa.storage.Entry;
 import io.lakestream.ursa.test.containers.util.KafkaStandalone;
 import io.netty.buffer.Unpooled;
@@ -137,9 +139,13 @@ public class KafkaDeltaWriterTest {
         var topic = "json-topic-" + RandomStringUtils.secure().nextAlphabetic(4);
         var numberOfMessages = 5;
 
+        // The producer-side (Confluent Community License, test-only) serializer needs its own client with the
+        // Confluent JSON Schema provider; the materialization path under test uses the Apache-2.0 providers.
+        var producerRegistryClient = new CachedSchemaRegistryClient(kafkaStandalone.getSchemaRegistryUrl(), 100,
+                List.of(new JsonSchemaProvider()), Map.of());
         @Cleanup
         var serializer = new KafkaJsonSchemaSerializer<Object>(
-                kafkaStandalone.getSchemaRegistryClient(),
+                producerRegistryClient,
                 Map.of("schema.registry.url", "unused", "auto.register.schemas", true));
         List<ProducedMessage<JsonValue>> messages = new ArrayList<>();
         for (int i = 0; i < numberOfMessages; i++) {
