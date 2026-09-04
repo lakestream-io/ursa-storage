@@ -13,7 +13,6 @@ import io.confluent.kafka.schemaregistry.client.rest.RestService;
 import io.confluent.kafka.schemaregistry.client.rest.exceptions.RestClientException;
 import io.lakestream.ursa.lakehouse.exception.FetchSchemaFailedException;
 import io.lakestream.ursa.lakehouse.exception.SchemaNotFoundException;
-import io.lakestream.ursa.lakehouse.utils.TopicName;
 import io.lakestream.ursa.materialization.serde.kafka.schema.RawSchemaProvider;
 import io.lakestream.ursa.storage.impl.StorageConfig;
 import java.io.IOException;
@@ -72,9 +71,9 @@ public class KafkaSchemaRegistry implements SchemaRegistry {
     }
 
     @Override
-    public SchemaMetadata fetchLatest(String topic)
+    public SchemaMetadata fetchLatest(String logicalTopic)
             throws FetchSchemaFailedException, SchemaNotFoundException {
-        String subject = TopicName.get(TopicName.get(topic).getPartitionedTopicName()).getLocalName() + "-value";
+        String subject = valueSubject(logicalTopic);
         try {
             return schemaRegistryClient.getLatestSchemaMetadata(subject);
         } catch (RestClientException e) {
@@ -85,6 +84,20 @@ public class KafkaSchemaRegistry implements SchemaRegistry {
         } catch (IOException e) {
             throw new FetchSchemaFailedException("Failed to fetch schema for " + subject, e);
         }
+    }
+
+    /**
+     * Builds the TopicNameStrategy value subject for a logical Kafka topic. The topic must already be the
+     * logical source name; the UUID-qualified storage name would produce a subject that never exists.
+     * A namespace prefix is tolerated for streams created without Kafka lifecycle metadata.
+     */
+    static String valueSubject(String logicalTopic) {
+        if (logicalTopic == null || logicalTopic.isBlank()) {
+            throw new IllegalArgumentException("Logical topic must not be blank");
+        }
+        int slash = logicalTopic.lastIndexOf('/');
+        String localName = slash < 0 ? logicalTopic : logicalTopic.substring(slash + 1);
+        return localName + "-value";
     }
 
     public static Map<String, String> configs(Properties properties) {
