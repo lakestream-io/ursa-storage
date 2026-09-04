@@ -12,8 +12,8 @@ This artifact contains the compacted-object reader used by the Ursa Kafka integr
 the legacy WASB connector, which Hadoop 3.5 no longer provides. Azure deployments must use an
 HNS-enabled storage account and configure `AZUREDFS`.
 
-Kafka compaction writes this format with a `ManagedTableFileIndex` in the Lakestream
-`EntryIndex`. The reader uses that index to select a Parquet file, seeks its companion
+Kafka compaction always writes this format with a `ManagedTableFileIndex` in the Lakestream
+`EntryIndex`; no compactor property gates it. The reader uses that index to select a Parquet file, seeks its companion
 `.index` file by Kafka offset, and returns owned `LogEntry` buffers. Callers must close every
 returned entry exactly once.
 

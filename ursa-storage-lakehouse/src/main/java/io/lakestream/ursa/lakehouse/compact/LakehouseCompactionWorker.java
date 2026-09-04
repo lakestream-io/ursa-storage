@@ -43,7 +43,6 @@ public class LakehouseCompactionWorker implements CompactionTaskProcessor {
     private final CompactTaskManager compactTaskManager;
     private final CompactionMetrics compactionMetrics;
     private final AtomicDouble avgEntrySize = new AtomicDouble(1024);
-    private final boolean managedTableSchemaEvolutionEnabled;
     private final boolean skipMarkerMessages;
     private final long readTimeoutSeconds;
     private final long maxWaitForTxnResolutionSeconds;
@@ -66,8 +65,6 @@ public class LakehouseCompactionWorker implements CompactionTaskProcessor {
         this.entryReaderFactory = entryReaderFactory;
         this.compactTaskManager = compactTaskManager;
         this.compactionMetrics = metrics;
-        this.managedTableSchemaEvolutionEnabled = Boolean.parseBoolean(storageConfig
-            .getProperties().getOrDefault("managedTableSchemaEvolutionEnabled", "false").toString());
         this.skipMarkerMessages = Boolean.parseBoolean(storageConfig.getProperties()
             .getOrDefault("skipMarkerMessages", "false").toString());
         this.readTimeoutSeconds = Long.parseLong(storageConfig.getProperties()
@@ -76,8 +73,7 @@ public class LakehouseCompactionWorker implements CompactionTaskProcessor {
         this.maxWaitForTxnResolutionSeconds = Long.parseLong(storageConfig.getProperties()
             .getOrDefault("walReadMaxWaitForTxnResolutionSeconds",
                 String.valueOf(EntryReaderOptions.DEFAULT_MAX_WAIT_FOR_TXN_RESOLUTION_SECONDS)).toString());
-        this.taskCompleter =
-            new CompactionTaskCompleter(compactTaskManager, managedTableSchemaEvolutionEnabled);
+        this.taskCompleter = new CompactionTaskCompleter(compactTaskManager);
     }
 
     public void doCompact(CompactStreamTask task) throws Exception {

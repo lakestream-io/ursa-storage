@@ -495,8 +495,7 @@ public class LakehouseMaterializationService implements MaterializationService {
             retireInlineCommittedTask(task);
             return;
         }
-        CompactionTaskCompleter completer =
-                new CompactionTaskCompleter(compactTaskManager, managedTableSchemaEvolutionEnabled());
+        CompactionTaskCompleter completer = new CompactionTaskCompleter(compactTaskManager);
         try {
             completer.completeCompaction(sourceTask, managedResults, externalResults, dltResults);
         } catch (MaterializationException e) {
@@ -547,11 +546,6 @@ public class LakehouseMaterializationService implements MaterializationService {
             throw new MaterializationException(ExceptionCode.LAKEHOUSE_COMMIT_ERROR,
                     "Failed to retire inline-committed task " + sourceTask.getTaskName(), e);
         }
-    }
-
-    private boolean managedTableSchemaEvolutionEnabled() {
-        return config != null && Boolean.parseBoolean(
-                config.additionalProperties().getOrDefault("managedTableSchemaEvolutionEnabled", "false"));
     }
 
     /** Test seam: inject a stub {@link EntryReaderProvider} so the read loop runs without storage. */
